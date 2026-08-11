@@ -29,7 +29,7 @@ from itertools import pairwise
 
 import pytest
 
-from afm import build_afm_design, fit_afm, load_student_step
+from leapfit import build_afm_design, fit_afm, load_student_step
 
 WF3990_DIR = os.environ.get(
     "AFM_WF3990_DIR", "results/wf3990_results_2024_1206-10-runs")

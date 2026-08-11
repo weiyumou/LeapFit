@@ -1,4 +1,11 @@
-"""The AFM fitter: LearnSphere's objective, sparse and instrumented.
+"""The shared logistic-family fitter: LearnSphere's objective, sparse and instrumented.
+
+Every additive model in this package — AFM today, PFA next — is a penalized
+logistic regression over a labelled :class:`~leapfit.design.Design`. They differ
+only in which columns the design holds, so the solver, the fit statistics, and
+the optimality certificate live here once and the algorithm modules stay thin.
+Models that are *not* logistic (BKT's EM over an HMM, IRT's nonlinear
+likelihood) get their own fitters and share only :mod:`leapfit.data`.
 
 The optimization problem is PyAFM's, term for term
 (``AnalysisPyAfm/program/custom_logistic.py``). Minimize over ``w``::
@@ -53,8 +60,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.optimize import minimize
 
-from afm.data import StepData
-from afm.design import Design, Separated, coefficient_frame
+from leapfit.design import Design, Separated, coefficient_frame
 
 DEFAULT_METHOD = "TNC"  # PyAFM's choice
 GRADIENT_TOL_SCALE = 3e-3  # see AFMFit.gradient_tolerance
@@ -94,8 +100,13 @@ def _expit(z: np.ndarray) -> np.ndarray:
 
 
 @dataclass
-class AFMFit:
-    """A fitted AFM: coefficients, fit statistics, and optimizer diagnostics."""
+class LogisticFit:
+    """A fitted logistic model: coefficients, fit statistics, and diagnostics.
+
+    Algorithm modules subclass this to add their own reporting view — see
+    :class:`leapfit.afm.AFMFit` — but everything that does not depend on what
+    the columns *mean* is here.
+    """
 
     weights: np.ndarray
     design: Design
@@ -109,6 +120,7 @@ class AFMFit:
     message: str
     max_free_gradient: float = float("nan")
     separated: Separated = field(default_factory=Separated)
+    label: str = "logistic"  # what summary() calls the model
 
     @property
     def is_optimal(self) -> bool:
@@ -183,83 +195,10 @@ class AFMFit:
             return {}
         return dict(zip(block.columns, self.weights[self.design.slices()[name]]))
 
-    def centred_students(self, data: StepData) -> tuple[pd.Series, float]:
-        """Student effects at the sum-to-zero point, and the shift applied.
-
-        Reference coding leaves ``beta_k`` meaning "for the reference student",
-        which is an arbitrary choice. Moving to ``mean(theta) = 0`` makes it
-        "for the average student" instead. This is a slide along the flat
-        direction of :meth:`~afm.design.Design.identify`, so every fitted value
-        is unchanged — the caller must add the same shift to the KC intercepts.
-
-        Only valid when each row carries exactly one KC: with two KCs on a row,
-        subtracting the shift from every KC intercept would remove it twice.
-        """
-        if not self.design.recentring_is_valid():
-            raise ValueError(
-                "Sum-to-zero recentring needs exactly one KC per row; this design "
-                f"has {self.design.kc_per_row()} KCs per row (multi-KC), where the "
-                "shift does not cancel."
-            )
-        fitted = self._block_values("student")
-        # Columns dropped as the reference level sit at zero by construction.
-        full = pd.Series({s: fitted.get(s, 0.0) for s in data.student_names})
-        shift = float(full.mean())
-        return full - shift, shift
-
-    def kc_values(self, data: StepData, *, centre: bool = True) -> pd.DataFrame:
-        """KC parameters in DataShop's model-values layout.
-
-        Column names match what DataShop exports and what the existing
-        ``refine-datashop-kc`` command reads back (``KC Name``, ``Slope``,
-        ``Intercept (probability) at Opportunity 1``), so a local fit is a
-        drop-in replacement for a downloaded KC-values file.
-
-        Every KC in ``data`` gets a row, including ones whose columns were
-        aliased away. **A KC that no student ever practises twice reports
-        ``Slope = NaN``, not 0.** Its learning rate is not estimable — there is
-        no second opportunity to estimate it from — and printing ``0.000``
-        would invite it into an RQ-3-style screen that reads zero as "students
-        did not learn".
-
-        :param centre: report intercepts for the *average* student (sum-to-zero)
-            rather than for the arbitrary reference student left by
-            identification. Silently skipped on multi-KC designs, where the
-            recentring identity does not hold.
-        """
-        intercepts = self._block_values("kc_intercept")
-        slopes = self._block_values("kc_slope")
-
-        shift = 0.0
-        if centre and self.design.recentring_is_valid():
-            _, shift = self.centred_students(data)
-
-        steps: dict[str, set[str]] = {}
-        for labels, item in zip(data.kcs, data.items):
-            for label in labels:
-                steps.setdefault(label, set()).add(item)
-
-        by_block = self.separated.by_block()
-        diverging = set(by_block.get("kc_intercept", ())) | set(by_block.get("kc_slope", ()))
-
-        names = data.kc_names
-        beta = np.array([intercepts.get(n, np.nan) + shift for n in names])
-        return pd.DataFrame({
-            "KC Name": names,
-            "Intercept (logit)": beta,
-            "Intercept (probability) at Opportunity 1": _expit(np.nan_to_num(beta)) * np.where(np.isnan(beta), np.nan, 1.0),
-            "Slope": [slopes.get(n, np.nan) for n in names],
-            "Number of Unique Steps": [len(steps.get(n, ())) for n in names],
-            # Kept as a flag rather than blanked: unlike a never-repeated KC,
-            # a separated one *is* informative — every attempt went the same
-            # way — but its estimate is wherever the optimizer stopped.
-            "Separated": [n in diverging for n in names],
-        }).sort_values("KC Name", ignore_index=True)
-
     def summary(self) -> str:
         flag = "" if self.is_optimal else "  *** NOT AT THE OPTIMUM ***"
         lines = [
-            f"AFM | n = {self.n_obs:,} | params = {self.n_params:,}",
+            f"{self.label} | n = {self.n_obs:,} | params = {self.n_params:,}",
             (f"  log-likelihood {self.ll:12.4f}   "
              f"(unpenalized {self.ll_unpenalized:.4f}, ridge {self.penalty:.4f})"),
             f"  AIC            {self.aic:12.4f}",
@@ -275,11 +214,17 @@ class AFMFit:
         return "\n".join(lines)
 
 
-def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
-            max_fun: int | None = None, tol: float | None = None,
-            warn_not_converged: bool = True,
-            warn_separated: bool = True) -> AFMFit:
-    """Fit AFM by penalized maximum likelihood under box constraints.
+def fit_logistic(design: Design, y, *, method: str = DEFAULT_METHOD,
+                 max_fun: int | None = None, tol: float | None = None,
+                 warn_not_converged: bool = True, warn_separated: bool = True,
+                 result_type: type[LogisticFit] = LogisticFit,
+                 label: str = "logistic", stacklevel: int = 2) -> LogisticFit:
+    """Fit any :class:`~leapfit.design.Design` by penalized maximum likelihood
+    under box constraints.
+
+    Algorithm-agnostic: what is being modelled is entirely a property of the
+    blocks in ``design``. :func:`leapfit.afm.fit_afm` is this function with
+    ``result_type=AFMFit``.
 
     :param method: ``"TNC"`` reproduces LearnSphere. ``"L-BFGS-B"`` accepts
         the same bounds and usually converges tighter in fewer evaluations,
@@ -288,9 +233,14 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
         default, which is what every published AFM fit effectively used (see
         the module docstring on the reference's inert ``maxiter``).
     :param warn_separated: warn when some coefficient has no finite MLE (see
-        :meth:`~afm.design.Design.separated`). The check itself always runs and
-        its result is on the fit; this only controls the warning, which
+        :meth:`~leapfit.design.Design.separated`). The check itself always runs
+        and its result is on the fit; this only controls the warning, which
         cross-validation silences because it would fire once per fold.
+    :param result_type: the :class:`LogisticFit` subclass to construct, so a
+        model family can attach its own reporting view to the same solve.
+    :param stacklevel: how many frames up to attribute warnings to. Thin
+        wrappers such as :func:`leapfit.afm.fit_afm` pass ``3`` so the warning
+        points at the user's call, not at the wrapper.
     """
     X = design.matrix
     y = np.asarray(y, dtype=float)
@@ -318,7 +268,7 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
     free = (w > lower + 1e-9) & (w < upper - 1e-9)
     max_free_grad = float(np.abs(grad[free]).max()) if free.any() else 0.0
 
-    fit = AFMFit(
+    fit = result_type(
         weights=w, design=design, n_obs=X.shape[0], n_params=design.n_params,
         ll=-penalized_nll,
         ll_unpenalized=-(penalized_nll - penalty),
@@ -328,6 +278,7 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
         message=str(result.message),
         max_free_gradient=max_free_grad,
         separated=design.separated(y),
+        label=label,
     )
 
     if warn_separated and len(fit.separated):
@@ -338,7 +289,7 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
             "so the likelihood keeps improving as they run to +/-inf. Their reported "
             "values reflect where the optimizer stopped, and AIC/BIC count them as "
             "estimated parameters. Merge or drop the affected levels, or penalize them.",
-            RuntimeWarning, stacklevel=2,
+            RuntimeWarning, stacklevel=stacklevel,
         )
     if warn_not_converged and not fit.is_optimal:
         warnings.warn(
@@ -347,6 +298,6 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
             f"after {fit.n_iter} iterations ({fit.message}). Fit statistics for this "
             f"{fit.n_params:,}-parameter model are not the optimum; raise max_fun or "
             "try method='L-BFGS-B'.",
-            RuntimeWarning, stacklevel=2,
+            RuntimeWarning, stacklevel=stacklevel,
         )
     return fit

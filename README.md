@@ -1,28 +1,40 @@
-# A local AFM, matched to LearnSphere
+# leapfit — LearnSphere-grounded student models
 
-LearnSphere fits vanilla AFM from an uploaded Q-matrix and nothing else. Every
-model this project is heading toward — a congruity-weighted practice term,
-hierarchical shrinkage over KC granularity, kernel-smoothed item parameters —
-is a change to the design matrix or the penalty, so all of them need a fitter
-we control. This is that fitter, built to reproduce the reference exactly so
-that "AFM" stays a trustworthy baseline column.
+LearnSphere fits student models inside a workflow GUI, from components that do
+not say which model they fit and that carry real defects — four things named
+"AFM" that fit four different models, an iteration cap that has never taken
+effect, a parameter count that omits a fitted parameter. `leapfit` reimplements
+them locally, **validated against LearnSphere's own output** where that output
+exists, so a baseline column in a paper is something you can inspect rather than
+something you downloaded.
+
+**One input format.** Every model reads the same six columns of a DataShop
+student-step export, so switching model families never means reshaping data.
+
+Today that is AFM. The roadmap is PFA, BKT, and 1PL/2PL IRT — see
+[Status](#status) for what is grounded against what.
 
 ```bash
-python run_afm.py ds5426_student_step.txt --list-models
-
-python run_afm.py ds5426_student_step.txt \
-    --kc-model Single-KC --kc-model LOs-new --kc-model KCluster \
-    --cv item_blocked --seeds 0:50 --out results/afm-e22.csv
+uv sync                         # or: uv pip install -e ".[dev]"
+uv run pytest tests/test_afm.py # 68 tests, ~3s, no data required
 ```
 
 ```python
-from afm import load_student_step, build_afm_design, fit_afm, cross_validate
+from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
 
 data   = load_student_step("ds5426_student_step.txt", kc_model="LOs-new")
 design = build_afm_design(data)                 # analysis default
 fit    = fit_afm(design, data.y)
 print(fit.summary())
 print(cross_validate(design, data, scheme="item_blocked").summary())
+```
+
+```bash
+leapfit-afm ds5426_student_step.txt --list-models
+
+leapfit-afm ds5426_student_step.txt \
+    --kc-model Single-KC --kc-model LOs-new --kc-model KCluster \
+    --cv item_blocked --seeds 0:50 --out results/afm-e22.csv
 ```
 
 ## What the input file must contain
@@ -135,7 +147,7 @@ Detection is a lower bound and visibly so: the largest coefficient *not* flagged
 is 307, which is a group of columns separating the data only in combination.
 That is the LP case this deliberately does not attempt.
 
-`fit_afm` warns, `fit.summary()` reports it, `run_afm.py` adds an `n_separated`
+`fit_afm` warns, `fit.summary()` reports it, `leapfit-afm` adds an `n_separated`
 column, and `kc_values()` carries a `Separated` flag — flagged rather than
 blanked, because unlike a never-repeated KC the datum is real and strong; it is
 the *estimate* that does not exist.
@@ -313,14 +325,25 @@ published depends on it; the data description may.
 
 ## Layout and the extension seam
 
+Shared infrastructure first, then one module per model family. The split is what
+makes the roadmap cheap: a new *logistic* model is a new set of blocks and
+nothing else — solver, identification, separation check, and cross-validation
+all come for free.
+
 ```
-afm/data.py      DataShop student-step rollup -> StepData (parsing rules)
-afm/design.py    Block / Design: columns carrying their own penalty and bounds
-afm/model.py     fit_afm: the objective, AIC/BIC, DataShop-format KC values
-afm/crossval.py  fold schemes and the two conventions
-run_afm.py       CLI: one row per KC model
-tests/test_afm.py
+leapfit/data.py      the export -> StepData (parsing rules, practice order)   shared
+leapfit/design.py    Block / Design: columns carrying their own penalty+bounds shared
+leapfit/fit.py       fit_logistic: objective, AIC/BIC, KKT certificate         shared
+leapfit/crossval.py  fold schemes and both RMSE conventions                    shared
+leapfit/afm.py       build_afm_design, AFMFit.kc_values                        AFM
+leapfit/cli.py       leapfit-afm: one row per KC model
+tests/test_afm.py                    68 tests, no data
+tests/test_learnsphere_equivalence.py 8 tests, needs wf3990 artifacts
 ```
+
+`fit_afm` is four lines: `fit_logistic(..., result_type=AFMFit)`. PFA will be the
+same call with two count blocks instead of one opportunity block. BKT and IRT are
+not logistic, so they get their own fitters and share only `leapfit.data`.
 
 `Design` is a list of labelled `Block`s, each carrying its own per-column ridge
 and bounds. That is deliberately where the next models attach:
@@ -336,15 +359,33 @@ and bounds. That is deliberately where the next models attach:
 
 ## Status
 
-Validated end to end against `wf3990` on E-learning 22 — parsing, parameter
-counting, fitted AIC/BIC, identification, and the opportunity ordering. The
-equivalence suite requires the run artifacts and skips without them:
+| model | state | grounded against |
+|---|---|---|
+| **AFM** | shipped, validated | LearnSphere `AnalysisFastAfmAndCv` via workflow `wf3990` output |
+| PFA | planned | `AnalysisPfaStepBased` — audited first, see `learnsphere-issue-pfa.md` |
+| BKT | planned | Yudelson's `standard-bkt` C++, which builds and runs locally |
+| IRT 1PL/2PL | planned | **not LearnSphere** — no IRT component exists in the repo; `mirt` instead |
+
+AFM is validated end to end against `wf3990` on E-learning 22 — parsing,
+parameter counting, fitted AIC/BIC, identification, and the opportunity
+ordering. The equivalence suite needs the run artifacts and skips without them:
 
 ```bash
-python -m pytest tests/test_afm.py -q            # 68 tests, ~3s, no data
-AFM_WF3990_DIR=/path/to/wf3990 python -m pytest tests/ -q   # 76 tests
+uv run pytest tests/test_afm.py                          # 68 tests, ~3s, no data
+AFM_WF3990_DIR=/path/to/wf3990 uv run pytest tests/      # 76 tests, ~50s
 ```
 
 Runs on any DataShop student-step export carrying the six columns above; the
 portability tests build a six-column file from scratch and fit it, so that claim
 is checked rather than asserted. Not yet run against E-learning 23.
+
+Tested on Python 3.12 with numpy 2.5, pandas 3.0, scipy 1.18.
+
+### Defects found in the reference
+
+Auditing LearnSphere closely enough to reproduce it turned up bugs worth
+reporting back. Drafts live at the repository root:
+
+- `learnsphere-issue-afm.md` — four components named "AFM" fitting different
+  models; an inert `maxiter`; an uncounted fitted intercept in AIC/BIC.
+- `learnsphere-issue-pfa.md` — see the document.

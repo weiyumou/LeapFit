@@ -35,9 +35,9 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from afm.data import StepData
-from afm.design import Design
-from afm.model import DEFAULT_METHOD, fit_afm
+from leapfit.data import StepData
+from leapfit.design import Design
+from leapfit.fit import DEFAULT_METHOD, fit_logistic
 
 SCHEMES = ("unstratified", "response_stratified", "student_blocked", "item_blocked")
 CONVENTIONS = ("per_fold", "pooled")
@@ -164,7 +164,7 @@ def cross_validate(design: Design, data: StepData, *, scheme: str = "item_blocke
             raise ValueError(f"Fold {f} is degenerate: {len(train_idx)} train / {len(test_idx)} test")
 
         train_design, test_design = design.take(train_idx), design.take(test_idx)
-        fit = fit_afm(train_design, y[train_idx], method=method,
+        fit = fit_logistic(train_design, y[train_idx], method=method,
                       max_fun=max_fun, warn_not_converged=False,
                       warn_separated=False)
         pred = fit.predict_proba(test_design)
@@ -254,7 +254,7 @@ def paired_cross_validate(models: dict[str, Design], data: StepData, *,
         for f, test_idx in enumerate(make_folds(data, scheme, n_folds, seed, convention)):
             train_idx = np.setdiff1d(all_rows, test_idx)
             for name, design in models.items():
-                fit = fit_afm(design.take(train_idx), y[train_idx], method=method,
+                fit = fit_logistic(design.take(train_idx), y[train_idx], method=method,
                               max_fun=max_fun, warn_not_converged=False,
                               warn_separated=False)
                 pred = fit.predict_proba(design.take(test_idx))

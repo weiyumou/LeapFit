@@ -23,7 +23,7 @@ import pytest
 from scipy import sparse
 from scipy.optimize import minimize
 
-from afm import (
+from leapfit import (
     Block,
     build_afm_design,
     congruity_block,
@@ -35,7 +35,7 @@ from afm import (
     paired_contrasts,
     paired_cross_validate,
 )
-from afm.model import _expit, _gradient, _objective
+from leapfit.fit import _expit, _gradient, _objective
 
 # --------------------------------------------------------------------------
 # Published EDM 2025 model-fit tables (main.tex Tables 8 and 9).
@@ -607,7 +607,7 @@ def test_recentring_students_leaves_predictions_unchanged():
     np.testing.assert_allclose(cen - raw, shift, rtol=0, atol=1e-12)
 
     # theta_i + beta_k is invariant, which is what predictions depend on.
-    fitted = {s: v for s, v in zip(data.student_names, theta)}
+    fitted = dict(zip(data.student_names, theta))
     before = fit._block_values("student")
     for s in data.student_names:
         assert fitted[s] + shift == pytest.approx(before.get(s, 0.0), abs=1e-12)

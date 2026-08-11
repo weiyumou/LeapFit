@@ -1,0 +1,89 @@
+"""leapfit — LearnSphere-grounded student models over DataShop student-step data.
+
+LearnSphere fits these models inside a workflow GUI, from components that are
+undocumented about which model they fit and that carry real defects (see the
+issue drafts at the repository root). This package reimplements them locally,
+validated against LearnSphere's own output where that output exists, so a
+baseline column in a paper is something you can inspect rather than something
+you downloaded.
+
+**One input format.** Every model here reads the same six columns of a DataShop
+student-step export — ``Anon Student Id``, ``Problem Name``, ``Step Name``,
+``First Attempt``, ``KC (<model>)``, ``Opportunity (<model>)`` — so switching
+model families never means reshaping data.
+
+    from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
+
+    data   = load_student_step("ds5426_student_step.txt", kc_model="LOs-new")
+    design = build_afm_design(data)                 # analysis default
+    fit    = fit_afm(design, data.y)
+    print(fit.summary())
+    print(cross_validate(design, data, scheme="item_blocked").summary())
+
+Layout — shared infrastructure, then one module per model family:
+
+    leapfit.data      the export -> StepData (parsing rules, practice order)
+    leapfit.design    Block / Design: columns carrying their own penalty+bounds
+    leapfit.fit       the penalized-logistic solver and its KKT certificate
+    leapfit.crossval  fold schemes and both RMSE conventions
+    leapfit.afm       Additive Factors Model
+"""
+
+__version__ = "0.1.0"
+
+from leapfit.afm import (
+    STUDENT_L2,
+    AFMFit,
+    build_afm_design,
+    congruity_block,
+    fit_afm,
+)
+from leapfit.crossval import (
+    CONVENTIONS,
+    SCHEMES,
+    CVResult,
+    cross_validate,
+    make_folds,
+    paired_contrasts,
+    paired_cross_validate,
+    repeated_cross_validate,
+)
+from leapfit.data import (
+    FIRST_ATTEMPT_VALUES,
+    StepData,
+    from_frame,
+    list_kc_models,
+    load_student_step,
+)
+from leapfit.design import Aliased, Block, Design, Separated, coefficient_frame
+from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
+
+__all__ = [
+    "CONVENTIONS",
+    "DEFAULT_METHOD",
+    "FIRST_ATTEMPT_VALUES",
+    "SCHEMES",
+    "STUDENT_L2",
+    "AFMFit",
+    "Aliased",
+    "Block",
+    "CVResult",
+    "Design",
+    "LogisticFit",
+    "Separated",
+    "StepData",
+    "__version__",
+    "build_afm_design",
+    "coefficient_frame",
+    "congruity_block",
+    "cross_validate",
+    "fit_afm",
+    "fit_logistic",
+    "from_frame",
+    "list_kc_models",
+    "load_student_step",
+    "make_folds",
+    "paired_contrasts",
+    "paired_cross_validate",
+    "repeated_cross_validate",
+]

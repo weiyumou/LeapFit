@@ -5,11 +5,13 @@ Reproduces the shape of the EDM 2025 model-fit tables (AIC, BIC, held-out
 RMSE) locally, so KC models can be compared without a round trip through
 DataShop or LearnSphere.
 
-    python run_afm.py ds5426_student_step.txt --list-models
+    leapfit-afm ds5426_student_step.txt --list-models
 
-    python run_afm.py ds5426_student_step.txt \\
+    leapfit-afm ds5426_student_step.txt \\
         --kc-model Single-KC --kc-model LOs-new --kc-model KCluster \\
         --cv item_blocked --seeds 0:50 --out results/afm-e22.csv
+
+``python run_afm.py ...`` still works from a source checkout.
 
 With ``--seeds`` the CV is repeated over each seed and the table reports the
 mean and standard deviation. The standard deviation describes how much the
@@ -25,7 +27,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from afm import (
+from leapfit import (
     CONVENTIONS,
     SCHEMES,
     build_afm_design,

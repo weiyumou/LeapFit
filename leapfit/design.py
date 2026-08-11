@@ -1,22 +1,28 @@
 """Design matrices as labelled, individually-penalized blocks.
 
-AFM's linear predictor is a concatenation of three column blocks::
+The additive models in this package are all a concatenation of column blocks.
+AFM's is three (:func:`leapfit.afm.build_afm_design`)::
 
     logit P(Y_ij = 1) = theta_i + sum_k q_jk * beta_k + sum_k q_jk * gamma_k * T_ik
                         \\_____/   \\______________/   \\___________________________/
                          student        kc_intercept              kc_slope
 
-LearnSphere treats each block differently — students are ridge-penalized at
-1.0, KC parameters are unpenalized, and slopes are bounded below at zero — so
-a plain matrix is not enough to describe the model. A :class:`Block` carries
-its columns *together with* the per-column penalty and bounds that belong to
-them, and :class:`Design` concatenates blocks while keeping the coefficient
-labels attached.
+and PFA's replaces the last block with prior-success and prior-failure counts.
+Nothing in this module knows which of those it is holding.
+
+Blocks exist because a plain matrix cannot describe the model. LearnSphere
+treats each group differently — students ridge-penalized at 1.0, KC parameters
+unpenalized, slopes sometimes bounded below at zero — so a :class:`Block`
+carries its columns *together with* the per-column penalty and bounds that
+belong to them, and :class:`Design` concatenates blocks while keeping the
+coefficient labels attached.
 
 This is deliberately the extension point for everything downstream:
 
+* **A new model family** is a new set of blocks and nothing else; the solver,
+  the identification pass, and the separation check all come for free.
 * **A congruity-weighted practice term** is one more :class:`Block` holding a
-  single column of accumulated congruity — nothing else changes.
+  single column of accumulated congruity.
 * **Hierarchical shrinkage** is a reparameterization, not new machinery:
   write ``beta_k = beta_parent(k) + b_k`` as an unpenalized parent block plus
   a ridge-penalized deviation block, and the ridge weight *is* the prior
@@ -31,10 +37,6 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from scipy import sparse
-
-from afm.data import StepData
-
-STUDENT_L2 = 1.0  # LearnSphere's ridge on student intercepts (PyAFM: l2 = 1.0)
 
 
 @dataclass(frozen=True)
@@ -328,7 +330,7 @@ class Design:
         A student is dropped rather than a KC because the KC intercepts are
         the reported output — learning curves and the RQ-3 screen — and a KC
         missing from that table would be worse than an arbitrary reference
-        student. Use :meth:`~afm.model.AFMFit.recentre_students` to move the
+        student. Use :meth:`~leapfit.afm.AFMFit.centred_students` to move the
         fit to the reference-free sum-to-zero point afterwards.
 
         :param check: verify numerically that the result is full rank, and
@@ -406,115 +408,6 @@ class Design:
         one KC per row.
         """
         return self.kc_per_row() == 1.0
-
-
-def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
-                     student_l2: float | None = None, bound_slopes: bool = False,
-                     identify: bool | None = None,
-                     recompute_opportunities: bool = False) -> Design:
-    """Assemble the AFM design from parsed student-step data.
-
-    Two settings, because reproduction and analysis want opposite defaults.
-
-    **Analysis (default).** No ridge, aliased columns removed, so
-    ``n_params == rank(X)`` and the reported log-likelihood is a likelihood.
-    Use this for anything new.
-
-    **``learnsphere_compat=True``.** Student ridge at 1.0, no identification,
-    ``n_params = n_students + 2 * n_KCs``. Reproduces the published baseline
-    and nothing else — treat it as a fixture, not a model.
-
-    :param student_l2: ridge on student intercepts. Defaults to 0.0, or 1.0
-        under ``learnsphere_compat``. LearnSphere uses this penalty to pick a
-        point on the flat direction described in :meth:`Design.identify`; it
-        costs only ~2.4 nats on E-learning-22, which is the tell that it is an
-        identification device rather than regularization. Identifying the
-        design properly does the same job without contaminating the likelihood.
-    :param bound_slopes: constrain learning rates to be non-negative.
-
-        The two LearnSphere AFMs disagree, and the default follows the one that
-        produced the published numbers. ``AnalysisPyAfm`` bounds slopes at
-        ``(0, None)``; the ``wf3990`` DataShop workflow
-        (``AnalysisFastAfmAndCv``) does not, and 3,790 of its 29,700 fitted
-        slopes are negative. Bounding also puts the MLE on the boundary for
-        every non-learning KC, where likelihood-ratio statistics are no longer
-        chi-squared — which would break the nested tests this package exists
-        to support. If non-negativity is wanted, impose it as a prior on the
-        slope, not as a wall.
-
-        A consequence worth keeping straight: because real fits admit negative
-        slopes, the EDM 2025 RQ-3 screen (``gamma <= 0.001``) selects KCs where
-        students did not learn *or got worse*.
-    :param identify: drop aliased columns. Defaults to ``not learnsphere_compat``.
-    :param recompute_opportunities: derive ``T`` from
-        :meth:`~afm.data.StepData.practice_order` instead of reading DataShop's
-        ``Opportunity`` column.
-
-        The column is not always right. It follows the export's *row* order,
-        and on ds5426 that order contains 12 within-student inversions of
-        ``First Transaction Time`` — an attempt at 01:44:41 listed before one at
-        01:44:36 — which mis-numbers 28 rows (0.07%). Recomputing uses the
-        timestamps, which is what "prior practice" actually means. Off by
-        default because the column is what LearnSphere's published fits used.
-    """
-    if student_l2 is None:
-        student_l2 = STUDENT_L2 if learnsphere_compat else 0.0
-    if identify is None:
-        identify = not learnsphere_compat
-
-    students = data.student_names
-    kcs = data.kc_names
-    s_index = {s: i for i, s in enumerate(students)}
-    k_index = {k: i for i, k in enumerate(kcs)}
-    n = len(data)
-
-    rows = np.arange(n)
-    student_mat = sparse.csr_matrix(
-        (np.ones(n), (rows, [s_index[s] for s in data.students])),
-        shape=(n, len(students)),
-    )
-
-    opportunities = (data.recomputed_opportunities() if recompute_opportunities
-                     else data.opportunities)
-    q_rows, q_cols, q_vals, t_vals = [], [], [], []
-    for i, (labels, counts) in enumerate(zip(data.kcs, opportunities)):
-        for label, count in zip(labels, counts):
-            q_rows.append(i)
-            q_cols.append(k_index[label])
-            q_vals.append(1.0)
-            t_vals.append(float(count))
-
-    shape = (n, len(kcs))
-    kc_mat = sparse.csr_matrix((q_vals, (q_rows, q_cols)), shape=shape)
-    opp_mat = sparse.csr_matrix((t_vals, (q_rows, q_cols)), shape=shape)
-    opp_mat.eliminate_zeros()  # a T=0 entry is a structural zero, not a datum
-
-    design = Design((
-        Block.build("student", student_mat, students, l2=student_l2),
-        Block.build("kc_intercept", kc_mat, kcs),
-        Block.build("kc_slope", opp_mat, kcs,
-                    lower=0.0 if bound_slopes else -np.inf),
-    ))
-    return design.identify() if identify else design
-
-
-def congruity_block(data: StepData, accumulated: np.ndarray,
-                    *, name: str = "congruity", columns: list[str] | None = None) -> Block:
-    """Wrap precomputed congruity accumulators as an unpenalized design block.
-
-    ``accumulated`` is ``(n_obs,)`` or ``(n_obs, p)`` — one column per
-    accumulator you want a separate coefficient for (e.g. cross-KC and
-    within-KC congruity, or a plain off-KC attempt count alongside them, which
-    is what identifies the transfer-neutral congruity level).
-    """
-    acc = np.asarray(accumulated, dtype=float)
-    if acc.ndim == 1:
-        acc = acc[:, None]
-    if acc.shape[0] != len(data):
-        raise ValueError(f"Expected {len(data)} rows, got {acc.shape[0]}")
-    labels = columns or ([name] if acc.shape[1] == 1
-                         else [f"{name}_{i}" for i in range(acc.shape[1])])
-    return Block.build(name, acc, labels)
 
 
 def coefficient_frame(design: Design, weights: np.ndarray) -> pd.DataFrame:
