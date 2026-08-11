@@ -66,6 +66,7 @@ class StepData:
     kcs: list[tuple[str, ...]]          # (n_obs,) KC labels per observation
     opportunities: list[tuple[int, ...]]  # (n_obs,) zero-based counts
     kc_model: str
+    times: list[str] | None = None      # (n_obs,) First Transaction Time, if present
     skipped_no_kc: int = 0
     duplicate_kc_rows: int = 0
 
@@ -79,6 +80,55 @@ class StepData:
     @property
     def kc_names(self) -> list[str]:
         return sorted({kc for row in self.kcs for kc in row})
+
+    def practice_order(self) -> dict[str, np.ndarray]:
+        """Each student's row indices, in the order they practised.
+
+        **One canonical ordering, used by everything.** The opportunity counts
+        in the AFM design and any accumulator built over a student's history
+        (congruity-weighted practice, spacing gaps) must agree on what "before"
+        means, or a coefficient on one is measured against a different history
+        than the other.
+
+        Ordered by ``First Transaction Time`` where the export provides it,
+        with the file's own row order breaking ties — the same tie-break
+        DataShop's ``Opportunity`` columns use. Falls back to pure row order
+        when no time column is present.
+        """
+        order: dict[str, list[int]] = {}
+        for i, s in enumerate(self.students):
+            order.setdefault(s, []).append(i)
+        if self.times is None:
+            return {s: np.asarray(v, dtype=int) for s, v in order.items()}
+        return {
+            s: np.asarray(sorted(v, key=lambda i: (self.times[i], i)), dtype=int)
+            for s, v in order.items()
+        }
+
+    def recomputed_opportunities(self) -> list[tuple[int, ...]]:
+        """Opportunity counts derived from :meth:`practice_order`.
+
+        DataShop ships its own ``Opportunity`` columns and we use them by
+        default, but ``AnalysisFastAfmAndCv`` ignores them and recomputes
+        exactly this way. Use :meth:`opportunity_disagreements` to see whether
+        the two differ on your export before it matters.
+        """
+        out: list[list[int]] = [[] for _ in range(len(self))]
+        for rows in self.practice_order().values():
+            seen: dict[str, int] = {}
+            for i in rows:
+                counts = []
+                for kc in self.kcs[i]:
+                    counts.append(seen.get(kc, 0))
+                    seen[kc] = seen.get(kc, 0) + 1
+                out[i] = counts
+        return [tuple(v) for v in out]
+
+    def opportunity_disagreements(self) -> np.ndarray:
+        """Row indices where the file's counts differ from the recomputed ones."""
+        mine = self.recomputed_opportunities()
+        return np.array([i for i, (a, b) in enumerate(zip(self.opportunities, mine))
+                         if tuple(a) != tuple(b)], dtype=int)
 
     def summary(self) -> str:
         return (
@@ -108,6 +158,7 @@ def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
     kc_col, opp_col = f"KC ({kc_model})", f"Opportunity ({kc_model})"
     required = ["Anon Student Id", "Problem Name", "Step Name", "First Attempt",
                 kc_col, opp_col]
+    time_col = "First Transaction Time" if "First Transaction Time" in df.columns else None
     if missing := [c for c in required if c not in df.columns]:
         available = sorted(m.group("name") for c in df.columns if (m := KC_COLUMN.match(c)))
         raise KeyError(
@@ -115,13 +166,16 @@ def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
         )
 
     cols = {c: df[c].astype(str).to_list() for c in required}
+    time_values = df[time_col].astype(str).to_list() if time_col else None
 
-    y, students, items, kcs, opps = [], [], [], [], []
+    y, students, items, kcs, opps, times = [], [], [], [], [], []
     skipped = duplicates = 0
 
+    n_rows = len(cols[kc_col])
     rows = zip(cols[kc_col], cols[opp_col], cols["First Attempt"],
-               cols["Anon Student Id"], cols["Problem Name"], cols["Step Name"])
-    for row_no, (kc_cell, opp_cell, attempt, student, problem, step) in enumerate(rows, start=2):
+               cols["Anon Student Id"], cols["Problem Name"], cols["Step Name"],
+               time_values if time_values is not None else [None] * n_rows)
+    for row_no, (kc_cell, opp_cell, attempt, student, problem, step, when) in enumerate(rows, start=2):
         labels = [k for k in kc_cell.split(MULTI_SEP) if k]
         if not labels:
             skipped += 1
@@ -145,6 +199,7 @@ def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
         y.append(1 if attempt == CORRECT else 0)
         students.append(student)
         items.append(f"{problem}{ITEM_SEP}{step}")
+        times.append(when)
 
     if not y:
         raise ValueError(f"No observations carry a KC under model '{kc_model}'")
@@ -157,5 +212,6 @@ def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
     return StepData(
         y=np.asarray(y, dtype=np.int8),
         students=students, items=items, kcs=kcs, opportunities=opps,
-        kc_model=kc_model, skipped_no_kc=skipped, duplicate_kc_rows=duplicates,
+        kc_model=kc_model, times=(times if time_col else None),
+        skipped_no_kc=skipped, duplicate_kc_rows=duplicates,
     )

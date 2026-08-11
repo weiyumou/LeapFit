@@ -67,7 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-fun", type=int, default=None,
                    help="function-evaluation budget; default = solver default, "
                         "which is what published fits effectively used")
-    p.add_argument("--student-l2", type=float, default=1.0)
+    p.add_argument("--learnsphere-compat", action="store_true",
+                   help="reproduce the published baseline: student ridge 1.0, no "
+                        "identification, nPars = students + 2*KCs")
+    p.add_argument("--recompute-opportunities", action="store_true",
+                   help="derive T from First Transaction Time instead of DataShop's "
+                        "Opportunity column (see README)")
+    p.add_argument("--student-l2", type=float, default=None)
     p.add_argument("--out", help="write the table to this CSV")
     p.add_argument("--kc-values", metavar="DIR",
                    help="also write per-KC parameters (DataShop layout) into DIR")
@@ -95,7 +101,10 @@ def main(argv: list[str] | None = None) -> int:
 
     for name in wanted:
         data = load_student_step(args.export, kc_model=name)
-        design = build_afm_design(data, student_l2=args.student_l2)
+        design = build_afm_design(
+            data, learnsphere_compat=args.learnsphere_compat,
+            student_l2=args.student_l2,
+            recompute_opportunities=args.recompute_opportunities)
         print(f"\n=== {name} ===\n{data.summary()}", file=sys.stderr)
 
         fit = fit_afm(design, data.y, method=args.method, max_fun=args.max_fun)
@@ -107,10 +116,11 @@ def main(argv: list[str] | None = None) -> int:
             "n_students": len(data.student_names),
             "n_obs": len(data),
             "n_params": design.n_params,
+            "n_aliased": len(design.aliased),
             "log_likelihood": fit.ll,
             "aic": fit.aic,
             "bic": fit.bic,
-            "converged": fit.converged,
+            "is_optimal": fit.is_optimal,
         }
 
         if args.cv != "none":

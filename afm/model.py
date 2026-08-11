@@ -57,6 +57,7 @@ from afm.data import StepData
 from afm.design import Design, coefficient_frame
 
 DEFAULT_METHOD = "TNC"  # PyAFM's choice
+GRADIENT_TOL_SCALE = 3e-3  # see AFMFit.gradient_tolerance
 
 # The option name each solver reads for its evaluation/iteration budget. TNC
 # ignores 'maxiter' entirely, which is how the reference's stated cap of 1000
@@ -106,6 +107,34 @@ class AFMFit:
     converged: bool
     n_iter: int
     message: str
+    max_free_gradient: float = float("nan")
+
+    @property
+    def is_optimal(self) -> bool:
+        """Whether the fit satisfies the KKT conditions of its convex problem.
+
+        The objective is convex, so a stationary point that respects the bounds
+        *is* the global optimum — this is a certificate, not a heuristic, and
+        it is independent of whatever the optimizer reported about itself. It
+        is worth checking: LearnSphere's own AFM stops 1,618 nats short of the
+        optimum on E-learning-22's ``Unique-step`` model while reporting no
+        error at all.
+        """
+        return bool(np.isfinite(self.max_free_gradient)
+                    and self.max_free_gradient < self.gradient_tolerance)
+
+    @property
+    def gradient_tolerance(self) -> float:
+        """Threshold bounding the *likelihood* left on the table, not the gradient.
+
+        Near the optimum the shortfall is ``g^2 / (2H)``, and a logistic
+        Hessian diagonal is ``sum_n p(1-p) x^2 <= n/4``. Taking
+        ``g = GRADIENT_TOL_SCALE * sqrt(n)`` bounds the shortfall at
+        ``2 * GRADIENT_TOL_SCALE^2`` nats — about 2e-5 — **independently of
+        sample size**, which is what makes one constant usable from a 40-row
+        test to a 42,000-row course.
+        """
+        return GRADIENT_TOL_SCALE * max(1.0, self.n_obs) ** 0.5
 
     @property
     def aic(self) -> float:
@@ -146,42 +175,94 @@ class AFMFit:
     def block(self, name: str) -> np.ndarray:
         return self.weights[self.design.slices()[name]]
 
-    def kc_values(self, data: StepData) -> pd.DataFrame:
+    def _block_values(self, name: str) -> dict[str, float]:
+        """Fitted value per column label for one block, aliased columns absent."""
+        block = next((b for b in self.design.blocks if b.name == name), None)
+        if block is None:
+            return {}
+        return dict(zip(block.columns, self.weights[self.design.slices()[name]]))
+
+    def centred_students(self, data: StepData) -> tuple[pd.Series, float]:
+        """Student effects at the sum-to-zero point, and the shift applied.
+
+        Reference coding leaves ``beta_k`` meaning "for the reference student",
+        which is an arbitrary choice. Moving to ``mean(theta) = 0`` makes it
+        "for the average student" instead. This is a slide along the flat
+        direction of :meth:`~afm.design.Design.identify`, so every fitted value
+        is unchanged — the caller must add the same shift to the KC intercepts.
+
+        Only valid when each row carries exactly one KC: with two KCs on a row,
+        subtracting the shift from every KC intercept would remove it twice.
+        """
+        if not self.design.recentring_is_valid():
+            raise ValueError(
+                "Sum-to-zero recentring needs exactly one KC per row; this design "
+                f"has {self.design.kc_per_row()} KCs per row (multi-KC), where the "
+                "shift does not cancel."
+            )
+        fitted = self._block_values("student")
+        # Columns dropped as the reference level sit at zero by construction.
+        full = pd.Series({s: fitted.get(s, 0.0) for s in data.student_names})
+        shift = float(full.mean())
+        return full - shift, shift
+
+    def kc_values(self, data: StepData, *, centre: bool = True) -> pd.DataFrame:
         """KC parameters in DataShop's model-values layout.
 
         Column names match what DataShop exports and what the existing
         ``refine-datashop-kc`` command reads back (``KC Name``, ``Slope``,
         ``Intercept (probability) at Opportunity 1``), so a local fit is a
         drop-in replacement for a downloaded KC-values file.
+
+        Every KC in ``data`` gets a row, including ones whose columns were
+        aliased away. **A KC that no student ever practises twice reports
+        ``Slope = NaN``, not 0.** Its learning rate is not estimable — there is
+        no second opportunity to estimate it from — and printing ``0.000``
+        would invite it into an RQ-3-style screen that reads zero as "students
+        did not learn".
+
+        :param centre: report intercepts for the *average* student (sum-to-zero)
+            rather than for the arbitrary reference student left by
+            identification. Silently skipped on multi-KC designs, where the
+            recentring identity does not hold.
         """
-        slices = self.design.slices()
-        names = self.design.blocks[[b.name for b in self.design.blocks].index("kc_intercept")].columns
-        intercepts = self.weights[slices["kc_intercept"]]
-        slopes = self.weights[slices["kc_slope"]]
+        intercepts = self._block_values("kc_intercept")
+        slopes = self._block_values("kc_slope")
+
+        shift = 0.0
+        if centre and self.design.recentring_is_valid():
+            _, shift = self.centred_students(data)
 
         steps: dict[str, set[str]] = {}
         for labels, item in zip(data.kcs, data.items):
             for label in labels:
                 steps.setdefault(label, set()).add(item)
 
+        names = data.kc_names
+        beta = np.array([intercepts.get(n, np.nan) + shift for n in names])
         return pd.DataFrame({
             "KC Name": names,
-            "Intercept (logit)": intercepts,
-            "Intercept (probability) at Opportunity 1": _expit(np.asarray(intercepts)),
-            "Slope": slopes,
+            "Intercept (logit)": beta,
+            "Intercept (probability) at Opportunity 1": _expit(np.nan_to_num(beta)) * np.where(np.isnan(beta), np.nan, 1.0),
+            "Slope": [slopes.get(n, np.nan) for n in names],
             "Number of Unique Steps": [len(steps.get(n, ())) for n in names],
         }).sort_values("KC Name", ignore_index=True)
 
     def summary(self) -> str:
-        flag = "" if self.converged else "  *** DID NOT CONVERGE ***"
-        return (
-            f"AFM | n = {self.n_obs:,} | params = {self.n_params:,}\n"
-            f"  log-likelihood {self.ll:12.4f}   (unpenalized {self.ll_unpenalized:.4f}, "
-            f"ridge penalty {self.penalty:.4f})\n"
-            f"  AIC            {self.aic:12.4f}\n"
-            f"  BIC            {self.bic:12.4f}\n"
-            f"  optimizer      {self.n_iter} iterations — {self.message}{flag}"
-        )
+        flag = "" if self.is_optimal else "  *** NOT AT THE OPTIMUM ***"
+        lines = [
+            f"AFM | n = {self.n_obs:,} | params = {self.n_params:,}",
+            (f"  log-likelihood {self.ll:12.4f}   "
+             f"(unpenalized {self.ll_unpenalized:.4f}, ridge {self.penalty:.4f})"),
+            f"  AIC            {self.aic:12.4f}",
+            f"  BIC            {self.bic:12.4f}",
+            (f"  optimality     max|grad| {self.max_free_gradient:.3g} "
+             f"(tol {self.gradient_tolerance:.3g}){flag}"),
+            f"  optimizer      {self.n_iter} iterations — {self.message}",
+        ]
+        if len(self.design.aliased):
+            lines.append(f"  identification {self.design.aliased.summary()}")
+        return "\n".join(lines)
 
 
 def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
@@ -216,6 +297,12 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
     penalty = 0.5 * float(np.dot(l2, w * w))
     penalized_nll = float(result.fun)
 
+    grad = _gradient(w, X, y, l2)
+    lower = np.array([-np.inf if b[0] is None else b[0] for b in design.bounds])
+    upper = np.array([np.inf if b[1] is None else b[1] for b in design.bounds])
+    free = (w > lower + 1e-9) & (w < upper - 1e-9)
+    max_free_grad = float(np.abs(grad[free]).max()) if free.any() else 0.0
+
     fit = AFMFit(
         weights=w, design=design, n_obs=X.shape[0], n_params=design.n_params,
         ll=-penalized_nll,
@@ -224,13 +311,16 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
         converged=bool(result.success),
         n_iter=int(getattr(result, "nit", -1)),
         message=str(result.message),
+        max_free_gradient=max_free_grad,
     )
 
-    if warn_not_converged and not fit.converged:
+    if warn_not_converged and not fit.is_optimal:
         warnings.warn(
-            f"AFM did not converge after {fit.n_iter} iterations ({fit.message}). "
-            f"Fit statistics for a {fit.n_params:,}-parameter model are unreliable; "
-            "raise max_fun or try method='L-BFGS-B'.",
+            f"AFM is not at a stationary point: max |gradient| on free coefficients "
+            f"is {fit.max_free_gradient:.3g} (tolerance {fit.gradient_tolerance:.3g}) "
+            f"after {fit.n_iter} iterations ({fit.message}). Fit statistics for this "
+            f"{fit.n_params:,}-parameter model are not the optimum; raise max_fun or "
+            "try method='L-BFGS-B'.",
             RuntimeWarning, stacklevel=2,
         )
     return fit

@@ -19,11 +19,60 @@ python run_afm.py ds5426_student_step.txt \
 from afm import load_student_step, build_afm_design, fit_afm, cross_validate
 
 data   = load_student_step("ds5426_student_step.txt", kc_model="LOs-new")
-design = build_afm_design(data)
+design = build_afm_design(data)                 # analysis default
 fit    = fit_afm(design, data.y)
 print(fit.summary())
 print(cross_validate(design, data, scheme="item_blocked").summary())
 ```
+
+## Two settings, because reproduction and analysis want opposite defaults
+
+| | `build_afm_design(data)` — **default** | `learnsphere_compat=True` |
+|---|---|---|
+| purpose | the baseline in new work | reproduce the published table |
+| student ridge | none | 1.0 |
+| identification | aliased columns dropped | none |
+| `nPars` | `rank(X)` | `n_students + 2·n_KCs` |
+| slope bound | free | free |
+
+Compat is a **fixture, not a model** — its only job is to hit LearnSphere's
+numbers, which `tests/test_learnsphere_equivalence.py` checks against wf3990's
+own `model_values.xml`. Everything scientific runs in the default.
+
+### Why the default drops the ridge
+
+With one student and one KC per row, the student columns and the KC-intercept
+columns both sum to the all-ones vector, so the design is rank-deficient: you
+can add any constant to every student, subtract it from every KC intercept, and
+every prediction is unchanged. LearnSphere's ridge on students picks one point
+on that flat line — it costs 2.4 nats out of 21,000, which is the tell that it
+is an **identification device, not regularization**. The cost is a "log
+likelihood" that isn't one, and a parameter count that overstates the model.
+
+`Design.identify()` removes the redundancy directly instead, and finds a second
+kind the ridge cannot touch: **a KC that no student ever practises twice has
+`T ≡ 0`, so its slope column is identically zero and `γ_k` is not estimable at
+all.** E-learning 22:
+
+| KC model | columns | rank | phantom parameters |
+|---|---|---|---|
+| `Single-KC` | 41 | 40 | 1 |
+| `LOs-new` | 241 | 239 | 2 |
+| `pmi` (KCluster) | 275 | 274 | 1 |
+| `concept` | 781 | 767 | 14 |
+| `Unique-step` | 3769 | 2810 | **959** |
+
+BIC charges `log(42,176) = 10.65` per parameter, so `Unique-step`'s published
+BIC carries **10,213 nats of penalty for parameters that do not exist** — 25% of
+its total. The overcount scales with granularity, because fine-grained models
+are the ones with singleton KCs, which matters for any argument about how BIC
+penalizes granularity. It does not reorder the published table.
+
+Consequences, all pinned by tests: a dropped student becomes the reference
+level, so `kc_values()` reports intercepts at the **sum-to-zero** point (the
+average student) rather than an arbitrary one; and a KC with no second
+opportunity reports `Slope = NaN`, not `0.0`, so it cannot be mistaken for
+"students did not learn" by a `γ ≤ 0.001` screen.
 
 ## The reference
 
@@ -47,9 +96,14 @@ two defects found along the way.
 
 One further quirk of `AnalysisFastAfmAndCv`: it **recomputes opportunity counts
 internally** (`df_to_sparse_afm`, a per-student `np.cumsum` over the Q-matrix) and
-never reads the `Opportunity (...)` columns of its input. Ours reads the columns,
-per PyAFM. On ds5426 the two agree on 99.93% of rows — they differ only where the
-file's row order and the timestamp order disagree.
+never reads the `Opportunity (...)` columns of its input. Ours reads the columns
+by default, per PyAFM; pass `recompute_opportunities=True` for the other
+convention. They agree on 99.93% of ds5426's rows. The 0.07% that differ are not
+ties: **the export's row order contains 12 within-student inversions of
+`First Transaction Time`** — an attempt at 01:44:41 listed before one at
+01:44:36 — and DataShop's column follows row order, so 28 rows carry the wrong
+opportunity number. Recomputing fixes them and moves the log-likelihood by less
+than 1 nat.
 
 **The EDM 2025 numbers use LearnSphere's parameter-counting convention**
 (`nPars = n_students + 2·n_KCs`, no intercept column). Verified without touching
@@ -76,6 +130,7 @@ to the parameter count breaks the build rather than the comparability.
 | response | `First Attempt == "correct"`; `hint` and `incorrect` are both failures |
 | multi-KC | `KC (model)` and `Opportunity (model)` split on `~~`, aligned **by position** |
 | opportunity | DataShop's 1-based count **minus 1**, so a first encounter enters as `T = 0` |
+| ordering | one canonical practice sequence (`StepData.practice_order`), shared by `T` and any accumulator built over a student's history |
 | item label | `Problem Name ## Step Name` (the unit of item-blocked CV) |
 | design | `[student one-hot | KC indicator | KC × T]`, **no intercept column** |
 | penalty | ridge 1.0 on student intercepts only; KC intercepts and slopes unpenalized |
@@ -209,10 +264,18 @@ and bounds. That is deliberately where the next models attach:
 
 ## Status
 
-Validated end to end against `wf3990` on E-learning 22: parsing, parameter
-counting, and fitted AIC/BIC (see above). Not yet checked against
+Validated end to end against `wf3990` on E-learning 22 — parsing, parameter
+counting, fitted AIC/BIC, identification, and the opportunity ordering. The
+equivalence suite requires the run artifacts and skips without them:
+
+```bash
+python -m pytest tests/ -q                       # 61 tests
+AFM_WF3990_DIR=/path/to/wf3990 python -m pytest tests/ -q
+```
+
+`tests/test_afm.py` (53 tests, ~2s) needs no data. Not yet checked against
 E-learning 23.
 
 ```bash
-python -m pytest tests/ -q      # 37 tests, ~2s, no data required
+python -m pytest tests/test_afm.py -q   # 53 tests, ~2s, no data required
 ```

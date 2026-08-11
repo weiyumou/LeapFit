@@ -21,6 +21,7 @@ from scipy import sparse
 from scipy.optimize import minimize
 
 from afm import (
+    Block,
     build_afm_design,
     congruity_block,
     cross_validate,
@@ -28,6 +29,8 @@ from afm import (
     from_frame,
     list_kc_models,
     make_folds,
+    paired_contrasts,
+    paired_cross_validate,
 )
 from afm.model import _expit, _gradient, _objective
 
@@ -96,9 +99,9 @@ def test_nparams_matches_learnsphere_workflow_output():
 
 
 def test_design_n_params_matches_published_convention():
+    """compat mode must keep LearnSphere's count, phantom parameters included."""
     data = _synthetic(n_students=39, n_kcs=5, n_items=20, seed=0)
-    design = build_afm_design(data)
-    assert design.n_params == 39 + 2 * 5
+    assert build_afm_design(data, learnsphere_compat=True).n_params == 39 + 2 * 5
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +188,7 @@ def test_list_kc_models(tmp_path):
 
 def test_penalty_and_bounds_follow_pyafm():
     data = _synthetic(n_students=4, n_kcs=3, n_items=12, seed=1)
-    design = build_afm_design(data, bound_slopes=True)
+    design = build_afm_design(data, learnsphere_compat=True, bound_slopes=True)
     slices = design.slices()
 
     l2, bounds = design.l2, design.bounds
@@ -217,7 +220,7 @@ def test_slope_column_holds_the_opportunity_count():
         "Anon Student Id": "s1", "Problem Name": "p", "Step Name": "st",
         "First Attempt": "correct", "kc": "A", "opp": "7",
     }])
-    design = build_afm_design(from_frame(df, "M"))
+    design = build_afm_design(from_frame(df, "M"), identify=False)
     slope_block = design.blocks[2].matrix.toarray()
     assert slope_block[0, 0] == 6.0
 
@@ -277,7 +280,7 @@ def test_end_to_end_agreement_with_the_reference_recipe():
     zero, ``w0 = 0``, TNC with ``maxiter=1000`` — and drive scipy directly.
     """
     data = _synthetic(n_students=8, n_kcs=4, n_items=16, seed=23, n_reps=5)
-    design = build_afm_design(data)
+    design = build_afm_design(data, learnsphere_compat=True)
     y = np.asarray(data.y, dtype=float)
 
     n_students, n_kcs = len(data.student_names), len(data.kc_names)
@@ -404,7 +407,8 @@ def test_slopes_never_go_negative():
 
 def test_ll_includes_the_ridge_penalty():
     data = _synthetic(n_students=10, n_kcs=3, n_items=20, seed=9)
-    fit = fit_afm(build_afm_design(data), data.y, method="L-BFGS-B")
+    fit = fit_afm(build_afm_design(data, learnsphere_compat=True), data.y,
+                  method="L-BFGS-B")
     assert fit.penalty > 0
     assert fit.ll == pytest.approx(fit.ll_unpenalized - fit.penalty)
     assert fit.aic == pytest.approx(-2 * fit.ll + 2 * fit.n_params)
@@ -508,10 +512,245 @@ def test_item_blocked_cv_reports_unseen_columns():
 
 
 def test_student_blocked_cv_flags_unseen_students():
+    """Held-out students have no intercept in training — except the reference.
+
+    Under identification one student is the reference level and has no column
+    at all, so rows belonging to that student touch nothing unseen. Every other
+    held-out student's rows do.
+    """
     data = _synthetic(n_students=12, n_kcs=3, n_items=20, seed=21, n_reps=6)
-    result = cross_validate(build_afm_design(data), data, scheme="student_blocked",
-                            n_folds=3, seed=5, method="L-BFGS-B")
+    result = cross_validate(build_afm_design(data, learnsphere_compat=True), data,
+                            scheme="student_blocked", n_folds=3, seed=5,
+                            method="L-BFGS-B")
     assert all(f.unseen_column_fraction == pytest.approx(1.0) for f in result.folds)
+
+    identified = cross_validate(build_afm_design(data), data,
+                                scheme="student_blocked", n_folds=3, seed=5,
+                                method="L-BFGS-B")
+    assert all(f.unseen_column_fraction > 0.0 for f in identified.folds)
+
+
+# --------------------------------------------------------------------------
+# Identification: the new machinery must be a no-op on everything observable
+# --------------------------------------------------------------------------
+
+def test_identify_drops_a_reference_student():
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=30, n_reps=5)
+    full = build_afm_design(data, identify=False)
+    ident = full.identify()
+    assert ident.n_params == full.n_params - 1
+    assert len(ident.aliased) == 1
+    assert ident.aliased.columns[0].startswith("student:")
+    assert ident.n_params == ident.rank(), "identified design must be full rank"
+
+
+def test_identify_drops_slope_columns_for_never_repeated_kcs():
+    """A KC nobody practises twice has T == 0 always: no estimable slope."""
+    data = _synthetic(n_students=8, n_kcs=12, n_items=12, seed=31, n_reps=1)
+    design = build_afm_design(data)
+    dropped = design.aliased.by_block()
+    assert len(dropped.get("kc_slope", [])) == 12, dropped
+    assert design.n_params == design.rank()
+
+
+def test_aliased_columns_carry_no_information():
+    """Re-inserting zeros for the dropped columns reproduces the same likelihood.
+
+    This is the equivalence that licenses dropping them: the identified fit is
+    a point of the full design, with the aliased coefficients at zero, and it
+    attains exactly the full design's optimum.
+    """
+    data = _synthetic(n_students=8, n_kcs=4, n_items=16, seed=32, n_reps=6)
+    full = build_afm_design(data, identify=False)
+    ident = full.identify()
+    fit = fit_afm(ident, data.y, method="L-BFGS-B", max_fun=200_000,
+                  warn_not_converged=False)
+
+    keep = [c not in set(ident.aliased.columns) for c in full.columns]
+    w_full = np.zeros(full.n_params)
+    w_full[np.flatnonzero(keep)] = fit.weights
+
+    y = np.asarray(data.y, float)
+    zero = np.zeros(full.n_params)
+    assert (-_objective(w_full, full.matrix, y, zero)
+            == pytest.approx(fit.ll_unpenalized, rel=1e-12))
+    np.testing.assert_allclose(_expit(full.matrix @ w_full),
+                               fit.predict_proba(ident), rtol=0, atol=1e-12)
+
+
+def test_identification_does_not_change_the_maximised_likelihood():
+    """Same optimum as the unidentified design, just without the phantom column."""
+    data = _synthetic(n_students=8, n_kcs=4, n_items=16, seed=33, n_reps=6)
+    full = fit_afm(build_afm_design(data, identify=False, student_l2=0.0), data.y,
+                   method="L-BFGS-B", max_fun=200_000, warn_not_converged=False)
+    ident = fit_afm(build_afm_design(data), data.y,
+                    method="L-BFGS-B", max_fun=200_000, warn_not_converged=False)
+    assert ident.ll_unpenalized == pytest.approx(full.ll_unpenalized, abs=1e-4)
+    assert ident.n_params == full.n_params - 1
+
+
+def test_recentring_students_leaves_predictions_unchanged():
+    data = _synthetic(n_students=8, n_kcs=4, n_items=16, seed=34, n_reps=6)
+    design = build_afm_design(data)
+    fit = fit_afm(design, data.y, method="L-BFGS-B", max_fun=200_000,
+                  warn_not_converged=False)
+
+    theta, shift = fit.centred_students(data)
+    assert theta.mean() == pytest.approx(0.0, abs=1e-12)
+    assert len(theta) == len(data.student_names), "reference student must reappear"
+
+    raw = fit.kc_values(data, centre=False)["Intercept (logit)"].to_numpy()
+    cen = fit.kc_values(data, centre=True)["Intercept (logit)"].to_numpy()
+    np.testing.assert_allclose(cen - raw, shift, rtol=0, atol=1e-12)
+
+    # theta_i + beta_k is invariant, which is what predictions depend on.
+    fitted = {s: v for s, v in zip(data.student_names, theta)}
+    before = fit._block_values("student")
+    for s in data.student_names:
+        assert fitted[s] + shift == pytest.approx(before.get(s, 0.0), abs=1e-12)
+
+
+def _multi_kc_data():
+    """Two KCs per row, but *varying* pairs so the KC columns stay distinct."""
+    pairs = [("A", "B"), ("B", "C"), ("A", "C")]
+    rows = []
+    for i in range(8):
+        for j in range(9):
+            a, b = pairs[j % 3]
+            rows.append({"Anon Student Id": f"s{i}", "Problem Name": "p",
+                         "Step Name": f"st{j}",
+                         "First Attempt": "correct" if (i + j) % 3 else "incorrect",
+                         "kc": f"{a}~~{b}", "opp": f"{j // 3 + 1}~~{j // 3 + 1}"})
+    return from_frame(_rollup_frame(rows), "M")
+
+
+def test_sum_redundancy_is_detected_for_any_constant_kcs_per_row():
+    """The student/KC dependency exists whenever every row has the same m KCs.
+
+    Sum of student columns = 1; sum of KC columns = m * 1. Checking only for
+    m == 1 would miss it on every multi-KC export.
+    """
+    design = build_afm_design(_multi_kc_data(), identify=False)
+    assert design.kc_per_row() == 2.0
+    assert design._has_sum_redundancy()
+    assert design.rank() == design.n_params - 1
+    assert build_afm_design(_multi_kc_data()).n_params == design.n_params - 1
+
+
+def test_recentring_refuses_on_multi_kc_designs():
+    data = _multi_kc_data()
+    fit = fit_afm(build_afm_design(data), data.y, method="L-BFGS-B",
+                  max_fun=200_000, warn_not_converged=False)
+    assert not fit.design.recentring_is_valid()
+    with pytest.raises(ValueError, match="multi-KC"):
+        fit.centred_students(data)
+    # ...and kc_values silently reports uncentred rather than raising.
+    assert len(fit.kc_values(data)) == 3
+
+
+def test_never_repeated_kc_reports_slope_as_undefined_not_zero():
+    data = _synthetic(n_students=8, n_kcs=12, n_items=12, seed=35, n_reps=1)
+    fit = fit_afm(build_afm_design(data), data.y, method="L-BFGS-B",
+                  warn_not_converged=False)
+    values = fit.kc_values(data)
+    assert len(values) == 12, "every KC still gets a row"
+    assert values["Slope"].isna().all(), (
+        "a KC with no second opportunity has no estimable learning rate; "
+        "reporting 0.0 would feed a gamma<=0.001 screen a false positive"
+    )
+
+
+def test_identify_raises_on_a_collinear_extra_block():
+    """The guard that protects congruity and hierarchical blocks added later."""
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
+    design = build_afm_design(data, identify=False)
+    kc_block = next(b for b in design.blocks if b.name == "kc_intercept")
+    duplicate = Block.build("copy", kc_block.matrix.copy(),
+                            [f"dup_{c}" for c in kc_block.columns])
+    with pytest.raises(ValueError, match="rank-deficient"):
+        design.with_blocks(duplicate).identify()
+
+
+def test_compat_preserves_the_learnsphere_parameter_count():
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=37, n_reps=5)
+    compat = build_afm_design(data, learnsphere_compat=True)
+    assert compat.n_params == 6 + 2 * 3
+    assert len(compat.aliased) == 0
+    assert np.all(compat.l2[compat.slices()["student"]] == 1.0)
+
+
+# --------------------------------------------------------------------------
+# Optimality certificate
+# --------------------------------------------------------------------------
+
+def test_optimality_certificate_detects_a_starved_solver():
+    data = _synthetic(n_students=20, n_kcs=6, n_items=24, seed=38, n_reps=8)
+    design = build_afm_design(data)
+    starved = fit_afm(design, data.y, method="TNC", max_fun=2, warn_not_converged=False)
+    solved = fit_afm(design, data.y, method="TNC", max_fun=200_000,
+                     warn_not_converged=False)
+    assert not starved.is_optimal and solved.is_optimal
+    assert solved.ll > starved.ll
+
+
+def test_fit_warns_when_not_at_the_optimum():
+    data = _synthetic(n_students=20, n_kcs=6, n_items=24, seed=39, n_reps=8)
+    with pytest.warns(RuntimeWarning, match="not at a stationary point"):
+        fit_afm(build_afm_design(data), data.y, method="TNC", max_fun=2)
+
+
+# --------------------------------------------------------------------------
+# Canonical practice ordering
+# --------------------------------------------------------------------------
+
+def test_practice_order_uses_time_then_row_order():
+    df = pd.DataFrame([
+        {"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "b",
+         "First Transaction Time": "2022-01-01 00:00:09", "First Attempt": "correct",
+         "KC (M)": "A", "Opportunity (M)": "2"},
+        {"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
+         "First Transaction Time": "2022-01-01 00:00:01", "First Attempt": "correct",
+         "KC (M)": "A", "Opportunity (M)": "1"},
+    ])
+    data = from_frame(df, "M")
+    np.testing.assert_array_equal(data.practice_order()["s1"], [1, 0])
+    assert data.recomputed_opportunities() == [(1,), (0,)]
+    # The file's own column is row-ordered, so here the two disagree.
+    assert data.opportunities == [(1,), (0,)]
+
+
+def test_recomputed_opportunities_match_the_file_when_order_agrees():
+    data = _synthetic(n_students=5, n_kcs=3, n_items=9, seed=40, n_reps=4)
+    assert data.times is None, "synthetic rollups carry no time column"
+    assert data.recomputed_opportunities() == data.opportunities
+    assert len(data.opportunity_disagreements()) == 0
+
+
+# --------------------------------------------------------------------------
+# Paired cross-validation
+# --------------------------------------------------------------------------
+
+def test_paired_cv_scores_every_model_on_identical_folds():
+    data = _synthetic(n_students=16, n_kcs=4, n_items=20, seed=41, n_reps=6)
+    models = {"afm": build_afm_design(data),
+              "compat": build_afm_design(data, learnsphere_compat=True)}
+    folds = paired_cross_validate(models, data, n_folds=3, seeds=(0, 1),
+                                  method="L-BFGS-B")
+    assert len(folds) == 3 * 2 * 2
+    sizes = folds.pivot_table(index=["seed", "fold"], columns="model", values="n_test")
+    np.testing.assert_array_equal(sizes["afm"].to_numpy(), sizes["compat"].to_numpy())
+
+    contrasts = paired_contrasts(folds, baseline="compat")
+    assert list(contrasts["model"]) == ["afm"]
+    assert contrasts["n_folds"].iloc[0] == 6
+
+
+def test_paired_cv_rejects_designs_over_different_rows():
+    a = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=42, n_reps=4)
+    b = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=43, n_reps=5)
+    with pytest.raises(ValueError, match="different numbers of rows"):
+        paired_cross_validate({"a": build_afm_design(a), "b": build_afm_design(b)},
+                              a, n_folds=2)
 
 
 # --------------------------------------------------------------------------

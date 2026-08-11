@@ -22,16 +22,19 @@ from afm.crossval import (
     CVResult,
     cross_validate,
     make_folds,
+    paired_contrasts,
+    paired_cross_validate,
     repeated_cross_validate,
 )
 from afm.data import StepData, from_frame, list_kc_models, load_student_step
-from afm.design import Block, Design, build_afm_design, congruity_block
+from afm.design import Aliased, Block, Design, build_afm_design, congruity_block
 from afm.model import AFMFit, fit_afm
 
 __all__ = [
     "CONVENTIONS",
     "SCHEMES",
     "AFMFit",
+    "Aliased",
     "Block",
     "CVResult",
     "Design",
@@ -44,5 +47,7 @@ __all__ = [
     "list_kc_models",
     "load_student_step",
     "make_folds",
+    "paired_contrasts",
+    "paired_cross_validate",
     "repeated_cross_validate",
 ]

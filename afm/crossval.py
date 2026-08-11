@@ -211,3 +211,80 @@ def repeated_cross_validate(design: Design, data: StepData, *, seeds,
             "all_converged": all(f.converged for f in result.folds),
         })
     return pd.DataFrame(rows)
+
+
+def paired_cross_validate(models: dict[str, Design], data: StepData, *,
+                          scheme: str = "item_blocked", n_folds: int = 3,
+                          seeds=(0,), convention: str = "pooled",
+                          method: str = DEFAULT_METHOD,
+                          max_fun: int | None = None) -> pd.DataFrame:
+    """Score several designs on **identical** folds, for paired comparison.
+
+    Every KC model built from one export covers the same rows, so seed ``s``
+    can produce the same split for all of them. Scoring them on shared folds
+    turns model comparison into a *paired* contrast — each fold contributes one
+    difference per model pair — instead of two independent means.
+
+    That matters because the usual protocol (repeat CV over 50 seeds, average,
+    t-test the two averages) treats non-independent resamples as independent
+    samples, which has no valid variance estimator. Differences taken within a
+    fold sidestep it: the fold is held fixed, so the partition is no longer a
+    source of between-model variance at all. It is also far more powerful,
+    since fold-to-fold variation is usually much larger than the gap between
+    two KC models.
+
+    Returns one row per (seed, fold, model). Pivot on ``model`` and difference
+    the columns to get the paired contrasts.
+    """
+    sizes = {name: d.n_obs for name, d in models.items()}
+    if len(set(sizes.values())) > 1:
+        raise ValueError(
+            f"Designs cover different numbers of rows {sizes}; folds cannot be "
+            "shared, so the comparison would not be paired."
+        )
+    if next(iter(sizes.values())) != len(data):
+        raise ValueError(f"Designs have {next(iter(sizes.values()))} rows, data has {len(data)}")
+
+    y = np.asarray(data.y, dtype=float)
+    all_rows = np.arange(len(data))
+    records = []
+
+    for seed in seeds:
+        for f, test_idx in enumerate(make_folds(data, scheme, n_folds, seed, convention)):
+            train_idx = np.setdiff1d(all_rows, test_idx)
+            for name, design in models.items():
+                fit = fit_afm(design.take(train_idx), y[train_idx], method=method,
+                              max_fun=max_fun, warn_not_converged=False)
+                pred = fit.predict_proba(design.take(test_idx))
+                records.append({
+                    "seed": seed, "fold": f, "model": name,
+                    "n_test": len(test_idx),
+                    "rmse": float(np.sqrt(np.mean((y[test_idx] - pred) ** 2))),
+                    "sse": float(np.sum((y[test_idx] - pred) ** 2)),
+                    "is_optimal": fit.is_optimal,
+                })
+    return pd.DataFrame(records)
+
+
+def paired_contrasts(folds: pd.DataFrame, baseline: str) -> pd.DataFrame:
+    """Per-model mean RMSE difference against ``baseline``, paired by fold.
+
+    Negative ``mean_diff`` means the model beats the baseline. The reported
+    interval is over folds, which describes how consistently it wins; with a
+    handful of folds it is a description, not an inferential claim.
+    """
+    wide = folds.pivot_table(index=["seed", "fold"], columns="model", values="rmse")
+    if baseline not in wide.columns:
+        raise KeyError(f"baseline {baseline!r} not among {list(wide.columns)}")
+    out = []
+    for name in wide.columns:
+        if name == baseline:
+            continue
+        diff = wide[name] - wide[baseline]
+        out.append({
+            "model": name, "baseline": baseline,
+            "mean_diff": diff.mean(), "sd_diff": diff.std(ddof=1),
+            "n_folds": int(diff.notna().sum()),
+            "folds_better": int((diff < 0).sum()),
+        })
+    return pd.DataFrame(out).sort_values("mean_diff", ignore_index=True)
