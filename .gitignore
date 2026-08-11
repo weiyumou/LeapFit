@@ -239,3 +239,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# uv lockfile: leapfit is a library — CI and users resolve against the
+# declared floors, not a pinned graph.
+uv.lock

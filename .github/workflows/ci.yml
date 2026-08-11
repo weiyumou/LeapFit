@@ -19,15 +19,22 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv pip install --system -e ".[dev]"
+      # Into a project venv, not --system: the runner's OS Python is Debian's
+      # externally-managed interpreter (PEP 668), which uv rightly refuses to
+      # touch — and --system would bypass the matrix interpreter anyway.
+      - run: uv sync --extra dev
+      # The first CI run silently executed every matrix job on the OS's 3.12;
+      # assert the interpreter so a version mismatch can never pass quietly.
+      - name: Interpreter matches the matrix
+        run: uv run python -c "import sys; v = '${{ matrix.python-version }}'; assert f'{sys.version_info[0]}.{sys.version_info[1]}' == v, sys.version"
       - name: Lint
-        run: ruff check .
+        run: uv run ruff check .
       # Runs the whole suite deliberately. The LearnSphere equivalence tests
       # need run artifacts that are not in the repository and must SKIP rather
       # than fail or error — a bare clone staying green is the thing being
       # checked here, and it is easy to break with a stray import.
       - name: Test suite (equivalence tests skip without artifacts)
-        run: pytest tests/ -q --no-header -rs
+        run: uv run pytest tests/ -q --no-header -rs
 
   package:
     name: wheel installs and works

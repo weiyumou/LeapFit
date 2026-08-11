@@ -24,7 +24,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 76 pass in ~3s; 8 skip without validation artifacts
+uv run pytest          # 84 pass in ~3s; 8 skip without validation artifacts
 ```
 
 ## Quickstart
@@ -132,8 +132,8 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 76 pass, 8 skip, ~3s
-AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # 84 pass, ~50s
+uv run pytest                                       # 84 pass, 8 skip, ~3s
+AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # 92 pass, ~50s
 ```
 
 ## License
