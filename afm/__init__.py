@@ -26,18 +26,33 @@ from afm.crossval import (
     paired_cross_validate,
     repeated_cross_validate,
 )
-from afm.data import StepData, from_frame, list_kc_models, load_student_step
-from afm.design import Aliased, Block, Design, build_afm_design, congruity_block
+from afm.data import (
+    FIRST_ATTEMPT_VALUES,
+    StepData,
+    from_frame,
+    list_kc_models,
+    load_student_step,
+)
+from afm.design import (
+    Aliased,
+    Block,
+    Design,
+    Separated,
+    build_afm_design,
+    congruity_block,
+)
 from afm.model import AFMFit, fit_afm
 
 __all__ = [
     "CONVENTIONS",
+    "FIRST_ATTEMPT_VALUES",
     "SCHEMES",
     "AFMFit",
     "Aliased",
     "Block",
     "CVResult",
     "Design",
+    "Separated",
     "StepData",
     "build_afm_design",
     "congruity_block",

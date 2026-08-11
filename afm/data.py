@@ -24,6 +24,15 @@ The rules, in the reference's own order:
 5. The item label — the unit of item-blocked cross-validation — is
    ``Problem Name ## Step Name``.
 
+DIVERGENCE (unrecognized outcome labels): the reference compares ``First
+Attempt`` to the literal ``"correct"``, so any export writing ``"Correct"``, or
+any non-DataShop file coding the outcome as ``1``/``0``, silently yields a
+response vector of all zeros — a fit that converges, reports a plausible AIC,
+and means nothing. We fold case and whitespace first, then require every
+surviving value to be either a declared success or one of DataShop's documented
+failure labels, and raise naming the offenders. Pass ``success_values`` to read
+a different vocabulary deliberately.
+
 DIVERGENCE (length mismatch): the reference indexes ``kc_opps[i]`` after
 filtering both lists independently, so a row whose KC and opportunity fields
 disagree in length either raises IndexError or silently misaligns skills with
@@ -39,6 +48,7 @@ see whether it happened.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -49,6 +59,11 @@ KC_COLUMN = re.compile(r"^KC \((?P<name>.+)\)$")
 CORRECT = "correct"
 MULTI_SEP = "~~"
 ITEM_SEP = "##"
+
+#: The values DataShop documents for ``First Attempt``. Everything that is not
+#: a declared success counts as a failure, but a value outside this vocabulary
+#: means the column is not what we think it is — see the module docstring.
+FIRST_ATTEMPT_VALUES = frozenset({"correct", "incorrect", "hint", "unknown"})
 
 
 @dataclass(frozen=True)
@@ -153,8 +168,21 @@ def load_student_step(path: str, kc_model: str, **kwargs) -> StepData:
     return from_frame(df, kc_model, **kwargs)
 
 
-def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
-    """Build :class:`StepData` from an already-loaded student-step table."""
+def from_frame(df: pd.DataFrame, kc_model: str, *,
+               success_values: tuple[str, ...] = (CORRECT,),
+               failure_values: tuple[str, ...] = tuple(FIRST_ATTEMPT_VALUES),
+               ) -> StepData:
+    """Build :class:`StepData` from an already-loaded student-step table.
+
+    :param success_values: ``First Attempt`` values that count as a success,
+        matched after folding case and stripping whitespace.
+    :param failure_values: values that count as a failure. Anything in neither
+        list raises rather than being silently scored as a failure, so a column
+        that is not the one we think it is fails loudly. A file with its own
+        vocabulary needs both lists — ``success_values=("1",),
+        failure_values=("0",)`` — which keeps the guard meaningful instead of
+        disabling it whenever the default is overridden.
+    """
     kc_col, opp_col = f"KC ({kc_model})", f"Opportunity ({kc_model})"
     required = ["Anon Student Id", "Problem Name", "Step Name", "First Attempt",
                 kc_col, opp_col]
@@ -168,7 +196,10 @@ def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
     cols = {c: df[c].astype(str).to_list() for c in required}
     time_values = df[time_col].astype(str).to_list() if time_col else None
 
+    successes = {v.strip().lower() for v in success_values}
+    failures = {v.strip().lower() for v in failure_values}
     y, students, items, kcs, opps, times = [], [], [], [], [], []
+    outcomes: dict[str, int] = {}
     skipped = duplicates = 0
 
     n_rows = len(cols[kc_col])
@@ -188,21 +219,55 @@ def from_frame(df: pd.DataFrame, kc_model: str) -> StepData:
                 f"value(s) for model '{kc_model}'. KCs={labels!r} opportunities={counts!r}"
             )
 
+        try:
+            numbers = [int(c) - 1 for c in counts]
+        except ValueError as exc:
+            raise ValueError(
+                f"Row {row_no}: non-integer opportunity value in "
+                f"'Opportunity ({kc_model})' = {opp_cell!r}. Opportunity counts must "
+                f"be whole numbers, one per KC in {labels!r}."
+            ) from exc
+
         # Positional zip, last-wins on a repeated KC — the reference's dict
         # comprehension semantics, preserved deliberately (see module docstring).
-        paired = dict(zip(labels, (int(c) - 1 for c in counts)))
+        paired = dict(zip(labels, numbers))
         if len(paired) != len(labels):
             duplicates += 1
 
+        outcome = attempt.strip().lower()
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
         kcs.append(tuple(paired))
         opps.append(tuple(paired.values()))
-        y.append(1 if attempt == CORRECT else 0)
+        y.append(1 if outcome in successes else 0)
         students.append(student)
         items.append(f"{problem}{ITEM_SEP}{step}")
         times.append(when)
 
     if not y:
         raise ValueError(f"No observations carry a KC under model '{kc_model}'")
+    if unexpected := {v: n for v, n in outcomes.items()
+                      if v not in successes and v not in failures}:
+        listed = ", ".join(f"{v!r} ({n:,} rows)" for v, n in sorted(unexpected.items()))
+        raise ValueError(
+            f"Unrecognized 'First Attempt' value(s): {listed}. Successes are "
+            f"{sorted(successes)} and failures are {sorted(failures)}; anything "
+            "else would be scored as a failure without warning. Pass "
+            "success_values=(...) and failure_values=(...) if this file uses a "
+            "different vocabulary."
+        )
+    if len(set(y)) == 1:
+        # Not an error — a hard unit really can be all-incorrect — but it is
+        # also the signature of a success vocabulary that does not match the
+        # file, so name the vocabulary rather than leaving it to be diagnosed
+        # from a degenerate fit.
+        warnings.warn(
+            f"Every observation is a {'success' if y[0] else 'failure'}. "
+            f"'First Attempt' holds {sorted(outcomes)} and successes are "
+            f"{sorted(successes)}; check that pairing before reading the fit, "
+            "because a constant response makes every coefficient unbounded.",
+            RuntimeWarning, stacklevel=2,
+        )
     if any(t < 0 for row in opps for t in row):
         raise ValueError(
             "Negative opportunity count after the reference's -1 adjustment; "

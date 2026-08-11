@@ -25,6 +25,38 @@ print(fit.summary())
 print(cross_validate(design, data, scheme="item_blocked").summary())
 ```
 
+## What the input file must contain
+
+Six columns. Everything else in a DataShop student-step export is ignored.
+
+| column | used for |
+|---|---|
+| `Anon Student Id` | the student block; the unit of student-blocked CV |
+| `Problem Name` | half of the item label |
+| `Step Name` | the other half — items are `Problem Name ## Step Name`, the unit of item-blocked CV |
+| `First Attempt` | the response: `correct` is a success, `incorrect` / `hint` / `unknown` are failures |
+| `KC (<model>)` | the Q-matrix row, `~~`-separated for multi-KC steps |
+| `Opportunity (<model>)` | prior practice `T`, `~~`-separated and aligned by position, numbered from 1 |
+
+One optional column changes behaviour:
+
+| column | effect if present |
+|---|---|
+| `First Transaction Time` | defines the canonical practice order, so `recompute_opportunities=True` can correct `Opportunity`. Absent, practice order falls back to file row order — which is what DataShop numbers by anyway |
+
+A file may carry any number of KC models; `list_kc_models(path)` enumerates
+them and each is fitted independently. A missing required column raises and
+names it. Values outside DataShop's `First Attempt` vocabulary raise rather
+than being scored as failures — a file writing `1`/`0` needs
+`success_values=("1",), failure_values=("0",)`, stated explicitly, because the
+alternative is an all-zero response that fits, converges, and reports a
+plausible AIC.
+
+Practical ceiling: identification runs a dense `p × p` eigendecomposition, so
+it is 0.3 s at 1,600 parameters, 22 s at 6,000, and 108 s at 10,000. Above
+roughly 10,000 parameters pass `identify=False` and count parameters yourself.
+Parsing and fitting are sparse and scale with the number of observations.
+
 ## Two settings, because reproduction and analysis want opposite defaults
 
 | | `build_afm_design(data)` — **default** | `learnsphere_compat=True` |
@@ -73,6 +105,40 @@ level, so `kc_values()` reports intercepts at the **sum-to-zero** point (the
 average student) rather than an arbitrary one; and a KC with no second
 opportunity reports `Slope = NaN`, not `0.0`, so it cannot be mistaken for
 "students did not learn" by a `γ ≤ 0.001` screen.
+
+### A third kind of non-parameter: separation
+
+Identification is about the design; this one is about the design *and the
+responses*. A KC every student always gets right has an intercept whose MLE is
+`+∞` — raising it always improves the fit and touches nothing else — so no
+finite estimate exists. `Design.separated(y)` reports these exactly (the
+single-column case; full detection is an LP), respecting ridge and bounds,
+which both remove the divergence. E-learning 22:
+
+| KC model | KCs | separated | intercepts | slopes |
+|---|---|---|---|---|
+| `Single-KC` | 1 | 0 | 0 | 0 |
+| `LOs-new` | 101 | 1 | 0 | 1 |
+| `pmi` (KCluster) | 118 | 2 | 0 | 2 |
+| `concept` | 371 | 42 | 1 | 41 |
+| `Unique-step` | 1865 | **746** | 253 | 493 |
+
+The **likelihood** is fine: the gradient certificate still holds, so the
+reported value is essentially the supremum and AIC is not distorted through that
+channel. Two other things are wrong. First, 746 of `Unique-step`'s 2,810
+remaining parameters are quantities that were never estimated, and BIC charges
+10.65 nats for each. Second, their printed values are artefacts of where TNC
+stopped: across those 746 the magnitude runs from 0.96 to 647 with a median of
+23.5 — a spread that carries no information about the KCs.
+
+Detection is a lower bound and visibly so: the largest coefficient *not* flagged
+is 307, which is a group of columns separating the data only in combination.
+That is the LP case this deliberately does not attempt.
+
+`fit_afm` warns, `fit.summary()` reports it, `run_afm.py` adds an `n_separated`
+column, and `kc_values()` carries a `Separated` flag — flagged rather than
+blanked, because unlike a never-repeated KC the datum is real and strong; it is
+the *estimate* that does not exist.
 
 ## The reference
 
@@ -127,7 +193,7 @@ to the parameter count breaks the build rather than the comparability.
 | | rule |
 |---|---|
 | observation | one row of the student-step rollup; **rows with no KC are dropped**, so they leave `N` too |
-| response | `First Attempt == "correct"`; `hint` and `incorrect` are both failures |
+| response | `First Attempt == "correct"`; `hint`, `incorrect` and `unknown` are failures. Matched case-insensitively, and an unrecognized value raises — see [What the input file must contain](#what-the-input-file-must-contain) |
 | multi-KC | `KC (model)` and `Opportunity (model)` split on `~~`, aligned **by position** |
 | opportunity | DataShop's 1-based count **minus 1**, so a first encounter enters as `T = 0` |
 | ordering | one canonical practice sequence (`StepData.practice_order`), shared by `T` and any accumulator built over a student's history |
@@ -225,7 +291,13 @@ second. Both are here and the choice is explicit.
   indistinguishable from a bad KC model in the fit statistics.
 - **Malformed rows raise.** A row whose KC and opportunity fields differ in
   length silently misaligns skills with counts in the reference; here it errors
-  with the row number.
+  with the row number, as does a non-integer opportunity value.
+- **Outcome labels are validated.** The reference compares `First Attempt` to
+  the literal `"correct"`, so an export writing `"Correct"` yields an all-zero
+  response, a converged fit, and a plausible AIC. Case is folded first (a no-op
+  on real DataShop files) and unrecognized values raise.
+- **Separation is detected and reported.** See above; the reference reports
+  diverging coefficients as ordinary estimates.
 - **`unseen_column_fraction` per fold.** Blocking by item or student leaves some
   design columns with no training rows; their coefficients stay at 0 and those
   predictions fall back to the student intercept. That is the reference's
@@ -269,13 +341,10 @@ counting, fitted AIC/BIC, identification, and the opportunity ordering. The
 equivalence suite requires the run artifacts and skips without them:
 
 ```bash
-python -m pytest tests/ -q                       # 61 tests
-AFM_WF3990_DIR=/path/to/wf3990 python -m pytest tests/ -q
+python -m pytest tests/test_afm.py -q            # 68 tests, ~3s, no data
+AFM_WF3990_DIR=/path/to/wf3990 python -m pytest tests/ -q   # 76 tests
 ```
 
-`tests/test_afm.py` (53 tests, ~2s) needs no data. Not yet checked against
-E-learning 23.
-
-```bash
-python -m pytest tests/test_afm.py -q   # 53 tests, ~2s, no data required
-```
+Runs on any DataShop student-step export carrying the six columns above; the
+portability tests build a six-column file from scratch and fit it, so that claim
+is checked rather than asserted. Not yet run against E-learning 23.

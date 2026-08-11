@@ -14,6 +14,9 @@ reproducible — which is exactly the failure we cannot afford.
 
 from __future__ import annotations
 
+import re
+from itertools import pairwise
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -751,6 +754,236 @@ def test_paired_cv_rejects_designs_over_different_rows():
     with pytest.raises(ValueError, match="different numbers of rows"):
         paired_cross_validate({"a": build_afm_design(a), "b": build_afm_design(b)},
                               a, n_folds=2)
+
+
+# --------------------------------------------------------------------------
+# Portability: what the reader requires, and what it refuses
+# --------------------------------------------------------------------------
+
+MINIMAL_COLUMNS = ["Anon Student Id", "Problem Name", "Step Name",
+                   "First Attempt", "KC (M)", "Opportunity (M)"]
+
+
+def _minimal_frame(n_students=6, n_steps=4, n_reps=3, attempt=str):
+    """A rollup carrying *only* the columns the reader declares it needs."""
+    rows = []
+    for s in range(n_students):
+        seen: dict[str, int] = {}
+        for _ in range(n_reps):
+            for step in range(n_steps):
+                kc = f"kc{step % 2}"
+                seen[kc] = seen.get(kc, 0) + 1
+                rows.append({
+                    "Anon Student Id": f"S{s}", "Problem Name": "p",
+                    "Step Name": f"st{step}",
+                    "First Attempt": attempt("correct" if (s + step) % 3 else "incorrect"),
+                    "kc": kc, "opp": str(seen[kc]),
+                })
+    return _rollup_frame(rows)
+
+
+def test_the_minimal_column_set_is_enough_to_fit_and_cross_validate():
+    """Six columns, no timestamps, no DataShop metadata."""
+    df = _minimal_frame()
+    assert list(df.columns) == MINIMAL_COLUMNS
+
+    data = from_frame(df, "M")
+    assert data.times is None
+    design = build_afm_design(data)
+    fit = fit_afm(design, data.y)
+    assert fit.is_optimal
+    assert cross_validate(design, data, scheme="item_blocked", n_folds=2).rmse > 0
+
+
+def test_every_declared_column_is_actually_required():
+    """Each of the six is load-bearing — dropping any one raises by name."""
+    df = _minimal_frame()
+    for column in MINIMAL_COLUMNS:
+        with pytest.raises(KeyError, match=re.escape(column)):
+            from_frame(df.drop(columns=[column]), "M")
+
+
+def test_opportunities_can_be_recomputed_without_a_time_column():
+    """practice_order falls back to row order, which is what DataShop numbers by."""
+    data = from_frame(_minimal_frame(), "M")
+    assert data.times is None
+    assert data.recomputed_opportunities() == data.opportunities
+    assert len(data.opportunity_disagreements()) == 0
+
+
+def test_outcome_labels_are_matched_case_insensitively():
+    """'Correct' must not silently score as a failure.
+
+    Matching the literal string is the reference's rule, and under it an export
+    that capitalizes the column yields an all-zero response, a converged fit,
+    and a plausible AIC — wrong with no symptom. Folding case is a no-op on
+    real DataShop files, which are lowercase.
+    """
+    lower = from_frame(_minimal_frame(), "M")
+    upper = from_frame(_minimal_frame(attempt=str.capitalize), "M")
+    spaced = from_frame(_minimal_frame(attempt=lambda v: f"  {v.upper()} "), "M")
+    assert lower.y.mean() > 0
+    assert np.array_equal(lower.y, upper.y)
+    assert np.array_equal(lower.y, spaced.y)
+
+
+def test_unknown_outcome_vocabulary_raises_instead_of_scoring_zero():
+    df = _minimal_frame()
+    df["First Attempt"] = np.where(df["First Attempt"] == "correct", "1", "0")
+    with pytest.raises(ValueError, match="Unrecognized 'First Attempt'"):
+        from_frame(df, "M")
+    # Declaring only the successes is not enough — '0' is still unaccounted for,
+    # so the guard stays armed rather than switching off on any override.
+    with pytest.raises(ValueError, match="Unrecognized 'First Attempt'"):
+        from_frame(df, "M", success_values=("1",))
+    data = from_frame(df, "M", success_values=("1",), failure_values=("0",))
+    assert 0 < data.y.mean() < 1
+
+
+def test_documented_datashop_failure_labels_are_accepted_silently():
+    df = _minimal_frame()
+    df.loc[df.index % 5 == 0, "First Attempt"] = "hint"
+    df.loc[df.index % 7 == 0, "First Attempt"] = "unknown"
+    data = from_frame(df, "M")
+    assert 0 < data.y.mean() < 1
+
+
+def test_a_malformed_opportunity_value_names_the_row():
+    df = _minimal_frame()
+    df.loc[5, "Opportunity (M)"] = "."
+    with pytest.raises(ValueError, match=r"Row 7: non-integer opportunity"):
+        from_frame(df, "M")
+
+
+def test_a_constant_response_warns_and_names_the_vocabulary():
+    df = _minimal_frame()
+    df["First Attempt"] = "incorrect"
+    with pytest.warns(RuntimeWarning, match="Every observation is a failure"):
+        from_frame(df, "M")
+
+
+# --------------------------------------------------------------------------
+# Separation: coefficients with no finite MLE
+# --------------------------------------------------------------------------
+
+def _separated_frame(always_correct="kc0"):
+    rows = []
+    rng = np.random.default_rng(3)
+    for s in range(10):
+        seen: dict[str, int] = {}
+        for _ in range(4):
+            for step in range(4):
+                kc = f"kc{step}"
+                seen[kc] = seen.get(kc, 0) + 1
+                ok = True if kc == always_correct else bool(rng.random() < 0.6)
+                rows.append({
+                    "Anon Student Id": f"S{s}", "Problem Name": "p",
+                    "Step Name": f"st{step}",
+                    "First Attempt": "correct" if ok else "incorrect",
+                    "kc": kc, "opp": str(seen[kc]),
+                })
+    return _rollup_frame(rows)
+
+
+def test_an_always_correct_kc_is_reported_as_separated():
+    data = from_frame(_separated_frame(), "M")
+    design = build_afm_design(data)
+    sep = design.separated(data.y)
+    assert "kc_intercept:kc0" in sep.columns
+    assert sep.directions[sep.columns.index("kc_intercept:kc0")] == 1
+    assert "kc_intercept:kc1" not in sep.columns
+
+
+def test_a_separated_coefficient_has_no_maximum():
+    """Checked against the objective itself, not against solver behaviour.
+
+    The claim ``Design.separated`` makes is that the likelihood improves
+    without bound along that coordinate. Walk the coefficient by hand and watch
+    the negative log-likelihood fall monotonically, while the same walk along an
+    identified coefficient turns around at an interior minimum. This is the
+    definition of "no maximizer", and it holds whatever the optimizer does —
+    which matters, because TNC halts a diverging coefficient around 19 on its
+    own gradient criterion, so a test that watched the fitted number grow would
+    be testing the solver instead.
+    """
+    data = from_frame(_separated_frame(), "M")
+    design = build_afm_design(data)
+    fit = fit_afm(design, data.y, warn_not_converged=False, warn_separated=False)
+    X, y, l2 = design.matrix, np.asarray(data.y, dtype=float), design.l2
+
+    def walk(name):
+        j = design.columns.index(name)
+        out = []
+        for value in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
+            w = fit.weights.copy()
+            w[j] = value
+            out.append(_objective(w, X, y, l2))
+        return out
+
+    diverging = walk("kc_intercept:kc0")
+    identified = walk("kc_intercept:kc1")
+    assert all(a > b for a, b in pairwise(diverging)), (
+        "a separated coefficient must keep improving the fit as it grows")
+    assert identified[-1] > min(identified), (
+        "an identified coefficient must have an interior optimum")
+
+
+def test_a_ridge_removes_the_separation():
+    """A penalty supplies the missing curvature, so the MLE exists again."""
+    data = from_frame(_separated_frame(), "M")
+    assert len(build_afm_design(data, student_l2=0.0).separated(data.y)) > 0
+    penalized = build_afm_design(data, identify=False, student_l2=1.0)
+    kc_blocks = [b.name for b in penalized.blocks]
+    assert "kc_intercept" in kc_blocks  # unpenalized, so it is still flagged
+    assert not any(c.startswith("student:")
+                   for c in penalized.separated(data.y).columns)
+
+
+def test_a_lower_bound_absorbs_a_downward_divergence():
+    """bound_slopes rests an all-failure slope on 0 instead of sending it to -inf."""
+    rows = []
+    for s in range(8):
+        for r in range(4):
+            rows.append({
+                "Anon Student Id": f"S{s}", "Problem Name": "p", "Step Name": "st0",
+                "First Attempt": "incorrect", "kc": "kc0", "opp": str(r + 1)})
+            rows.append({
+                "Anon Student Id": f"S{s}", "Problem Name": "p", "Step Name": "st1",
+                "First Attempt": "correct" if r % 2 else "incorrect",
+                "kc": "kc1", "opp": str(r + 1)})
+    data = from_frame(_rollup_frame(rows), "M")
+
+    free = build_afm_design(data)
+    bounded = build_afm_design(data, bound_slopes=True)
+    assert "kc_slope:kc0" in free.separated(data.y).columns
+    assert "kc_slope:kc0" not in bounded.separated(data.y).columns
+
+
+def test_separated_columns_are_flagged_in_the_kc_values_table():
+    """Flagged, not blanked — unlike a never-repeated KC, the datum exists."""
+    data = from_frame(_separated_frame(), "M")
+    fit = fit_afm(build_afm_design(data), data.y, warn_not_converged=False,
+                  warn_separated=False)
+    values = fit.kc_values(data).set_index("KC Name")
+    assert bool(values.loc["kc0", "Separated"])
+    assert not bool(values.loc["kc1", "Separated"])
+    assert np.isfinite(values.loc["kc0", "Intercept (logit)"])
+
+
+def test_fitting_a_separated_design_warns():
+    data = from_frame(_separated_frame(), "M")
+    design = build_afm_design(data)
+    with pytest.warns(RuntimeWarning, match="no finite maximum-likelihood"):
+        fit_afm(design, data.y, warn_not_converged=False)
+
+
+def test_a_well_behaved_design_reports_no_separation():
+    data, _ = _synthetic(20, 5, 20, seed=7, return_truth=True)
+    design = build_afm_design(data)
+    assert len(design.separated(data.y)) == 0
+    fit = fit_afm(design, data.y)
+    assert len(fit.separated) == 0
+    assert "separation" not in fit.summary()
 
 
 # --------------------------------------------------------------------------

@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             "n_obs": len(data),
             "n_params": design.n_params,
             "n_aliased": len(design.aliased),
+            "n_separated": len(fit.separated),
             "log_likelihood": fit.ll,
             "aic": fit.aic,
             "bic": fit.bic,

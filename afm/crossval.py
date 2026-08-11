@@ -165,7 +165,8 @@ def cross_validate(design: Design, data: StepData, *, scheme: str = "item_blocke
 
         train_design, test_design = design.take(train_idx), design.take(test_idx)
         fit = fit_afm(train_design, y[train_idx], method=method,
-                      max_fun=max_fun, warn_not_converged=False)
+                      max_fun=max_fun, warn_not_converged=False,
+                      warn_separated=False)
         pred = fit.predict_proba(test_design)
 
         trained = np.asarray((train_design.matrix != 0).sum(axis=0)).ravel() > 0
@@ -254,7 +255,8 @@ def paired_cross_validate(models: dict[str, Design], data: StepData, *,
             train_idx = np.setdiff1d(all_rows, test_idx)
             for name, design in models.items():
                 fit = fit_afm(design.take(train_idx), y[train_idx], method=method,
-                              max_fun=max_fun, warn_not_converged=False)
+                              max_fun=max_fun, warn_not_converged=False,
+                              warn_separated=False)
                 pred = fit.predict_proba(design.take(test_idx))
                 records.append({
                     "seed": seed, "fold": f, "model": name,

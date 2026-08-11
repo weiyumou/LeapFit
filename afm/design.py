@@ -113,6 +113,46 @@ class Aliased:
 
 
 @dataclass(frozen=True)
+class Separated:
+    """Columns whose maximum-likelihood estimate runs off to infinity.
+
+    Distinct from :class:`Aliased`, and the difference matters. An aliased
+    column carries *no* information, so dropping it costs nothing. A separated
+    column carries the strongest information there is — every observation it
+    touches came out the same way — and precisely for that reason no finite
+    coefficient maximizes the likelihood. The optimizer stops somewhere out on
+    the plateau and returns whatever it reached, so the printed estimate is an
+    artefact of the evaluation budget rather than a property of the data.
+
+    ``directions`` parallel ``columns``: ``+1`` where the estimate diverges to
+    ``+inf``, ``-1`` to ``-inf``.
+    """
+
+    columns: tuple[str, ...] = ()
+    directions: tuple[int, ...] = ()
+
+    def __len__(self) -> int:
+        return len(self.columns)
+
+    def by_block(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for full in self.columns:
+            block, _, col = full.partition(":")
+            out.setdefault(block, []).append(col)
+        return out
+
+    def summary(self) -> str:
+        if not self.columns:
+            return "no separated columns"
+        counts = {b: len(v) for b, v in self.by_block().items()}
+        detail = ", ".join(f"{n} from {b}" for n, b in
+                           ((n, b) for b, n in sorted(counts.items())))
+        up = sum(d > 0 for d in self.directions)
+        return (f"{len(self)} column(s) with no finite MLE ({detail}); "
+                f"{up} diverge to +inf, {len(self) - up} to -inf")
+
+
+@dataclass(frozen=True)
 class Design:
     """A concatenation of blocks, with row subsetting for cross-validation."""
 
@@ -216,6 +256,57 @@ class Design:
         if tol is None:
             tol = max(self.n_obs, gram.shape[0]) * np.finfo(float).eps * max(ev.max(), 0.0)
         return int((ev > tol).sum())
+
+    def separated(self, y) -> Separated:
+        """Columns whose coefficient has no finite maximizer, given ``y``.
+
+        A sign-homogeneous, unpenalized column whose active rows are *all*
+        successes can be pushed up forever: raising its coefficient strictly
+        increases the fitted probability of exactly those rows, all of which
+        want a higher probability, and touches nothing else. The likelihood is
+        therefore strictly increasing in that coefficient with no maximizer —
+        an exact argument, not a numerical threshold. All-failure columns are
+        the mirror image.
+
+        Three things make a column safe and are checked: a nonzero ridge
+        (which supplies the missing curvature), a finite bound in the diverging
+        direction (the estimate rests on the bound instead), and mixed signs
+        within the column (where the argument does not apply).
+
+        This is a *lower bound* on the separated set. Detecting every case —
+        including groups of columns that separate the data only in combination
+        — is a linear-programming problem; this catches the single-column form,
+        which is what fine-grained KC models actually produce.
+        """
+        y = np.asarray(y, dtype=float)
+        if y.shape[0] != self.n_obs:
+            raise ValueError(f"{self.n_obs} design rows but {y.shape[0]} responses")
+
+        X = self.matrix
+        active = (X != 0)
+        n_active = np.asarray(active.sum(axis=0)).ravel()
+        n_success = np.asarray(active.astype(float).T @ y).ravel()
+
+        nonneg = np.asarray((X < 0).sum(axis=0)).ravel() == 0
+        nonpos = np.asarray((X > 0).sum(axis=0)).ravel() == 0
+
+        lower = np.concatenate([b.lower for b in self.blocks])
+        upper = np.concatenate([b.upper for b in self.blocks])
+        can_rise, can_fall = np.isposinf(upper), np.isneginf(lower)
+
+        live = (n_active > 0) & (self.l2 <= 0.0)
+        all_success = live & (n_success == n_active)
+        all_failure = live & (n_success == 0.0)
+
+        rises = ((all_success & nonneg) | (all_failure & nonpos)) & can_rise
+        falls = ((all_failure & nonneg) | (all_success & nonpos)) & can_fall
+
+        idx = np.flatnonzero(rises | falls)
+        columns = self.columns
+        return Separated(
+            tuple(columns[j] for j in idx),
+            tuple(1 if rises[j] else -1 for j in idx),
+        )
 
     def identify(self, *, prefer_drop: str = "student", check: bool = True) -> Design:
         """Drop columns that are not estimable, so ``n_params == rank(X)``.

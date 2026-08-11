@@ -46,7 +46,7 @@ behaviour so published numbers stay comparable, and route an explicit
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -54,7 +54,7 @@ from scipy import sparse
 from scipy.optimize import minimize
 
 from afm.data import StepData
-from afm.design import Design, coefficient_frame
+from afm.design import Design, Separated, coefficient_frame
 
 DEFAULT_METHOD = "TNC"  # PyAFM's choice
 GRADIENT_TOL_SCALE = 3e-3  # see AFMFit.gradient_tolerance
@@ -108,6 +108,7 @@ class AFMFit:
     n_iter: int
     message: str
     max_free_gradient: float = float("nan")
+    separated: Separated = field(default_factory=Separated)
 
     @property
     def is_optimal(self) -> bool:
@@ -238,6 +239,9 @@ class AFMFit:
             for label in labels:
                 steps.setdefault(label, set()).add(item)
 
+        by_block = self.separated.by_block()
+        diverging = set(by_block.get("kc_intercept", ())) | set(by_block.get("kc_slope", ()))
+
         names = data.kc_names
         beta = np.array([intercepts.get(n, np.nan) + shift for n in names])
         return pd.DataFrame({
@@ -246,6 +250,10 @@ class AFMFit:
             "Intercept (probability) at Opportunity 1": _expit(np.nan_to_num(beta)) * np.where(np.isnan(beta), np.nan, 1.0),
             "Slope": [slopes.get(n, np.nan) for n in names],
             "Number of Unique Steps": [len(steps.get(n, ())) for n in names],
+            # Kept as a flag rather than blanked: unlike a never-repeated KC,
+            # a separated one *is* informative — every attempt went the same
+            # way — but its estimate is wherever the optimizer stopped.
+            "Separated": [n in diverging for n in names],
         }).sort_values("KC Name", ignore_index=True)
 
     def summary(self) -> str:
@@ -262,12 +270,15 @@ class AFMFit:
         ]
         if len(self.design.aliased):
             lines.append(f"  identification {self.design.aliased.summary()}")
+        if len(self.separated):
+            lines.append(f"  separation     {self.separated.summary()}")
         return "\n".join(lines)
 
 
 def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
             max_fun: int | None = None, tol: float | None = None,
-            warn_not_converged: bool = True) -> AFMFit:
+            warn_not_converged: bool = True,
+            warn_separated: bool = True) -> AFMFit:
     """Fit AFM by penalized maximum likelihood under box constraints.
 
     :param method: ``"TNC"`` reproduces LearnSphere. ``"L-BFGS-B"`` accepts
@@ -276,6 +287,10 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
     :param max_fun: budget in function evaluations. ``None`` uses the solver's
         default, which is what every published AFM fit effectively used (see
         the module docstring on the reference's inert ``maxiter``).
+    :param warn_separated: warn when some coefficient has no finite MLE (see
+        :meth:`~afm.design.Design.separated`). The check itself always runs and
+        its result is on the fit; this only controls the warning, which
+        cross-validation silences because it would fire once per fold.
     """
     X = design.matrix
     y = np.asarray(y, dtype=float)
@@ -312,8 +327,19 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
         n_iter=int(getattr(result, "nit", -1)),
         message=str(result.message),
         max_free_gradient=max_free_grad,
+        separated=design.separated(y),
     )
 
+    if warn_separated and len(fit.separated):
+        blocks = ", ".join(f"{len(v)} in {k}" for k, v in fit.separated.by_block().items())
+        warnings.warn(
+            f"{len(fit.separated)} coefficient(s) have no finite maximum-likelihood "
+            f"estimate ({blocks}): every observation they touch has the same outcome, "
+            "so the likelihood keeps improving as they run to +/-inf. Their reported "
+            "values reflect where the optimizer stopped, and AIC/BIC count them as "
+            "estimated parameters. Merge or drop the affected levels, or penalize them.",
+            RuntimeWarning, stacklevel=2,
+        )
     if warn_not_converged and not fit.is_optimal:
         warnings.warn(
             f"AFM is not at a stationary point: max |gradient| on free coefficients "
