@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -84,6 +84,15 @@ class StepData:
     times: list[str] | None = None      # (n_obs,) First Transaction Time, if present
     skipped_no_kc: int = 0
     duplicate_kc_rows: int = 0
+
+    #: The table these observations were parsed from, unmodified, and the
+    #: *position* in it of each observation. Rows with no KC exist in ``source``
+    #: but not here, so ``source_rows`` is what lets predictions be written back
+    #: into the file against the right rows — the alignment LearnSphere's
+    #: components attempt by re-reading and re-sorting the input, which is
+    #: exactly where its step-based PFA component breaks.
+    source: pd.DataFrame | None = field(default=None, repr=False)
+    source_rows: np.ndarray | None = field(default=None, repr=False)
 
     def __len__(self) -> int:
         return len(self.y)
@@ -198,7 +207,7 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
 
     successes = {v.strip().lower() for v in success_values}
     failures = {v.strip().lower() for v in failure_values}
-    y, students, items, kcs, opps, times = [], [], [], [], [], []
+    y, students, items, kcs, opps, times, src = [], [], [], [], [], [], []
     outcomes: dict[str, int] = {}
     skipped = duplicates = 0
 
@@ -243,6 +252,7 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
         students.append(student)
         items.append(f"{problem}{ITEM_SEP}{step}")
         times.append(when)
+        src.append(row_no - 2)  # enumerate starts at 2; this is the 0-based position
 
     if not y:
         raise ValueError(f"No observations carry a KC under model '{kc_model}'")
@@ -279,4 +289,5 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
         students=students, items=items, kcs=kcs, opportunities=opps,
         kc_model=kc_model, times=(times if time_col else None),
         skipped_no_kc=skipped, duplicate_kc_rows=duplicates,
+        source=df, source_rows=np.asarray(src, dtype=int),
     )

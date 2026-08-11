@@ -105,6 +105,12 @@ producing compatible files from your own data.
   student-blocked, and item-blocked schemes; both per-fold and pooled RMSE
   conventions; seeded repeats; and `paired_cross_validate` to score several KC
   models on identical folds for a properly paired comparison.
+- **Student-step in, student-step out.** `fit.annotate(data)` — or
+  `leapfit-afm ... --predictions out.txt` — returns your input file unchanged
+  except for one appended `Predicted Error Rate (<model>)` column per fitted KC
+  model, following DataShop's convention (error rate = `1 − P(correct)`, blank
+  for rows without a KC), so learning-curve tooling that reads DataShop exports
+  can consume the result directly.
 - **A compatibility switch.** `build_afm_design(data, learnsphere_compat=True)`
   reproduces LearnSphere's exact conventions (ridge, parameter counting) when
   you need to match a published table; the default is the statistically clean

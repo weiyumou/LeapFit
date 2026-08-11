@@ -60,6 +60,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.optimize import minimize
 
+from leapfit.data import StepData
 from leapfit.design import Design, Separated, coefficient_frame
 
 DEFAULT_METHOD = "TNC"  # PyAFM's choice
@@ -173,6 +174,49 @@ class LogisticFit:
                 "coefficients — the KC sets probably differ between fit and predict."
             )
         return _expit(X @ self.weights)
+
+    def annotate(self, data: StepData, *, into: pd.DataFrame | None = None) -> pd.DataFrame:
+        """The source table plus a ``Predicted Error Rate (<model>)`` column.
+
+        Student-step in, student-step out: this returns the exact table the
+        data was parsed from with one column added (or overwritten in place if
+        the file already carries it, as DataShop exports can), following
+        DataShop's conventions — the value is the predicted **error** rate
+        ``1 - P(correct)``, and rows that entered no fit because they carry no
+        KC stay blank (``NaN``, written as an empty cell by ``to_csv``).
+
+        Predictions are in-sample: the fitted model evaluated on the rows it
+        was fitted to, which is what LearnSphere's components write back too.
+        For held-out predictions use :mod:`leapfit.crossval`.
+
+        :param into: add the column to this existing table (mutated and
+            returned) instead of a fresh copy of ``data.source`` — how one file
+            fitted under several KC models accumulates one column per model.
+        """
+        if data.source is None or data.source_rows is None:
+            raise ValueError(
+                "This StepData does not carry its source table, so there is "
+                "nothing to annotate. Build it with load_student_step() or "
+                "from_frame() rather than constructing StepData directly."
+            )
+        if self.design.n_obs != len(data):
+            raise ValueError(
+                f"The fit covers {self.design.n_obs} rows but the data has "
+                f"{len(data)} — a fit on a subset (e.g. a CV training split) "
+                "cannot annotate the full table."
+            )
+
+        out = data.source.copy() if into is None else into
+        if len(out) != len(data.source):
+            raise ValueError(
+                f"'into' has {len(out)} rows but the source table has "
+                f"{len(data.source)}; the frames cannot describe the same file."
+            )
+
+        values = np.full(len(data.source), np.nan)
+        values[data.source_rows] = 1.0 - self.predict_proba(self.design)
+        out[f"Predicted Error Rate ({data.kc_model})"] = values
+        return out
 
     def brier(self, design, y) -> float:
         """Mean squared error on the probability scale (PyAFM's score)."""

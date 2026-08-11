@@ -25,12 +25,14 @@ from scipy.optimize import minimize
 
 from leapfit import (
     Block,
+    StepData,
     build_afm_design,
     congruity_block,
     cross_validate,
     fit_afm,
     from_frame,
     list_kc_models,
+    load_student_step,
     make_folds,
     paired_contrasts,
     paired_cross_validate,
@@ -984,6 +986,141 @@ def test_a_well_behaved_design_reports_no_separation():
     fit = fit_afm(design, data.y)
     assert len(fit.separated) == 0
     assert "separation" not in fit.summary()
+
+
+# --------------------------------------------------------------------------
+# Annotation: student-step in, student-step out
+# --------------------------------------------------------------------------
+
+def _fitted(df, model="M"):
+    data = from_frame(df, model)
+    fit = fit_afm(build_afm_design(data), data.y, warn_not_converged=False,
+                  warn_separated=False)
+    return data, fit
+
+
+def test_annotate_appends_the_datashop_prediction_column():
+    df = _minimal_frame()
+    data, fit = _fitted(df)
+    out = fit.annotate(data)
+
+    assert list(out.columns) == [*df.columns, "Predicted Error Rate (M)"]
+    pd.testing.assert_frame_equal(out[df.columns.tolist()], df)  # originals untouched
+    expected = 1.0 - fit.predict_proba(fit.design)
+    np.testing.assert_allclose(out["Predicted Error Rate (M)"].to_numpy(), expected)
+    assert df.shape[1] == len(MINIMAL_COLUMNS), "source frame must not be mutated"
+
+
+def test_annotate_leaves_rows_without_a_kc_blank():
+    """The rows that entered no fit get NaN, everything else the fit's 1 - p.
+
+    This is the alignment the reference attempts by re-reading and re-sorting
+    its input file; recording source positions at parse time makes it exact.
+    """
+    df = _minimal_frame()
+    dropped = df.index[df.index % 5 == 0]
+    df.loc[dropped, ["KC (M)", "Opportunity (M)"]] = ""
+    data, fit = _fitted(df)
+    assert data.skipped_no_kc == len(dropped)
+
+    col = fit.annotate(data)["Predicted Error Rate (M)"]
+    assert col.loc[dropped].isna().all()
+    kept = col.drop(index=dropped)
+    assert not kept.isna().any()
+    np.testing.assert_allclose(kept.to_numpy(), 1.0 - fit.predict_proba(fit.design))
+
+
+def test_annotate_overwrites_an_existing_prediction_column_in_place():
+    """DataShop exports can already carry the column; ours replaces, not duplicates."""
+    df = _minimal_frame()
+    df.insert(2, "Predicted Error Rate (M)", "stale")
+    data, fit = _fitted(df)
+    out = fit.annotate(data)
+
+    assert list(out.columns) == list(df.columns)          # position preserved
+    assert out.columns.tolist().count("Predicted Error Rate (M)") == 1
+    assert not (out["Predicted Error Rate (M)"] == "stale").any()
+
+
+def test_annotate_accumulates_one_column_per_kc_model():
+    """``into=`` chains fits of several KC models over one file — the CLI path."""
+    df = _minimal_frame()
+    df["KC (Fine)"] = df["KC (M)"] + "-" + df["Step Name"]
+    seen: dict[tuple[str, str], int] = {}
+    counts = []
+    for key in zip(df["Anon Student Id"], df["KC (Fine)"]):
+        seen[key] = seen.get(key, 0) + 1
+        counts.append(str(seen[key]))
+    df["Opportunity (Fine)"] = counts
+
+    data_m, fit_m = _fitted(df, "M")
+    data_f, fit_f = _fitted(df, "Fine")
+    out = fit_m.annotate(data_m)
+    out = fit_f.annotate(data_f, into=out)
+
+    assert "Predicted Error Rate (M)" in out.columns
+    assert "Predicted Error Rate (Fine)" in out.columns
+    assert len(out) == len(df)
+
+
+def test_annotate_requires_the_source_table():
+    data, fit = _fitted(_minimal_frame())
+    bare = StepData(y=data.y, students=data.students, items=data.items,
+                    kcs=data.kcs, opportunities=data.opportunities,
+                    kc_model=data.kc_model)
+    with pytest.raises(ValueError, match="source table"):
+        fit.annotate(bare)
+
+
+def test_annotate_refuses_a_subset_fit():
+    """A model fitted to a CV training split cannot annotate the full file."""
+    data, _ = _fitted(_minimal_frame())
+    design = build_afm_design(data)
+    train = np.arange(len(data))[:-10]
+    fold_fit = fit_afm(design.take(train), data.y[train],
+                       warn_not_converged=False, warn_separated=False)
+    with pytest.raises(ValueError, match="subset"):
+        fold_fit.annotate(data)
+
+
+def test_annotated_file_round_trips_through_the_loader(tmp_path):
+    """Written to disk, the annotated file is still a valid student-step file
+    that parses to the same observations — predictions ride along, blanks stay
+    blank, and nothing shifts by a row."""
+    df = _minimal_frame()
+    df.loc[df.index[3], ["KC (M)", "Opportunity (M)"]] = ""
+    data, fit = _fitted(df)
+
+    path = tmp_path / "annotated.txt"
+    fit.annotate(data).to_csv(path, sep="\t", index=False, lineterminator="\n")
+    again = load_student_step(str(path), kc_model="M")
+
+    assert np.array_equal(again.y, data.y)
+    assert again.kcs == data.kcs and again.opportunities == data.opportunities
+    raw = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    assert raw.loc[3, "Predicted Error Rate (M)"] == ""
+
+
+def test_cli_predictions_writes_one_column_per_model(tmp_path):
+    from leapfit.cli import main as cli_main
+
+    df = _minimal_frame()
+    df["KC (M2)"] = df["KC (M)"]
+    df["Opportunity (M2)"] = df["Opportunity (M)"]
+    export = tmp_path / "export.txt"
+    df.to_csv(export, sep="\t", index=False, lineterminator="\n")
+
+    out = tmp_path / "annotated.txt"
+    assert cli_main([str(export), "--cv", "none", "--predictions", str(out)]) == 0
+
+    written = pd.read_csv(out, sep="\t", dtype=str, keep_default_na=False)
+    assert len(written) == len(df)
+    for col in ("Predicted Error Rate (M)", "Predicted Error Rate (M2)"):
+        assert col in written.columns
+        assert (written[col] != "").all()
+    # Identical KC models must produce identical predictions.
+    assert written["Predicted Error Rate (M)"].tolist() == \
+        written["Predicted Error Rate (M2)"].tolist()
 
 
 # --------------------------------------------------------------------------

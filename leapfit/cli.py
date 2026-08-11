@@ -8,7 +8,8 @@ models can be compared without a round trip through DataShop or LearnSphere.
 
     leapfit-afm examples/student-step.txt \\
         --kc-model Topics --kc-model Skills \\
-        --cv item_blocked --seeds 0:50 --out afm-results.csv
+        --cv item_blocked --seeds 0:50 --out afm-results.csv \\
+        --predictions annotated-student-step.txt
 
 ``python -m leapfit.cli ...`` is the same entry point from a source checkout.
 
@@ -78,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="write the table to this CSV")
     p.add_argument("--kc-values", metavar="DIR",
                    help="also write per-KC parameters (DataShop layout) into DIR")
+    p.add_argument("--predictions", metavar="FILE",
+                   help="write the input file back out with one 'Predicted Error "
+                        "Rate (<model>)' column per fitted KC model (DataShop's "
+                        "convention; rows without a KC stay blank)")
     return p
 
 
@@ -99,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
 
     seeds = parse_seeds(args.seeds)
     rows = []
+    annotated = None  # the input table, gaining one prediction column per model
 
     for name in wanted:
         data = load_student_step(args.export, kc_model=name)
@@ -155,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
 
         rows.append(row)
 
+        if args.predictions:
+            annotated = fit.annotate(data, into=annotated)
+
         if args.kc_values:
             import os
             os.makedirs(args.kc_values, exist_ok=True)
@@ -169,6 +178,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.out:
         table.to_csv(args.out, index=False)
         print(f"\nwrote {args.out}", file=sys.stderr)
+    if annotated is not None:
+        # Original cells were read as strings so they round-trip verbatim; the
+        # only float columns are the ones we added, and NaN writes as blank.
+        annotated.to_csv(args.predictions, sep="\t", index=False,
+                         float_format="%.6f", lineterminator="\n")
+        print(f"wrote {args.predictions}", file=sys.stderr)
     return 0
 
 
