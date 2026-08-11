@@ -63,7 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "pooled = FastAfmAndCv (RMSE of pooled residuals)")
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--seeds", metavar="LO:HI|a,b,c",
-                   help="repeat CV over these seeds (e.g. '0:50' for the EDM protocol)")
+                   help="repeat CV over these seeds (e.g. '0:50' for a "
+                        "50-seed protocol)")
     p.add_argument("--method", default="TNC",
                    help="TNC reproduces LearnSphere; L-BFGS-B converges tighter")
     p.add_argument("--max-fun", type=int, default=None,

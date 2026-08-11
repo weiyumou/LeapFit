@@ -27,8 +27,8 @@ objective, and the AIC and BIC built from it inherit that. We expose both:
 actual Bernoulli log-likelihood.
 
 **Every column counts toward nPars**, including slopes resting on their lower
-bound of zero, and there is no intercept column. Verified against the EDM
-2025 tables via the identity ``BIC - AIC = nPars * (log N - 2)``; see
+bound of zero, and there is no intercept column. Verified against published
+model-fit tables via the identity ``BIC - AIC = nPars * (log N - 2)``; see
 ``tests/test_afm.py::test_published_aic_bic_identity``.
 
 What we do change:

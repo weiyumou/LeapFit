@@ -157,16 +157,16 @@ class AFMFit(LogisticFit):
     def kc_values(self, data: StepData, *, centre: bool = True) -> pd.DataFrame:
         """KC parameters in DataShop's model-values layout.
 
-        Column names match what DataShop exports and what the existing
-        ``refine-datashop-kc`` command reads back (``KC Name``, ``Slope``,
+        Column names match what DataShop exports (``KC Name``, ``Slope``,
         ``Intercept (probability) at Opportunity 1``), so a local fit is a
-        drop-in replacement for a downloaded KC-values file.
+        drop-in replacement for a downloaded KC-values file in any tooling
+        that reads one.
 
         Every KC in ``data`` gets a row, including ones whose columns were
         aliased away. **A KC that no student ever practises twice reports
         ``Slope = NaN``, not 0.** Its learning rate is not estimable — there is
         no second opportunity to estimate it from — and printing ``0.000``
-        would invite it into an RQ-3-style screen that reads zero as "students
+        would invite it into a low-slope screen that reads zero as "students
         did not learn".
 
         :param centre: report intercepts for the *average* student (sum-to-zero)
@@ -228,22 +228,3 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
                         warn_not_converged=warn_not_converged,
                         warn_separated=warn_separated, result_type=AFMFit,
                         label="AFM", stacklevel=3)  # 3: attribute past this wrapper
-
-
-def congruity_block(data: StepData, accumulated: np.ndarray,
-                    *, name: str = "congruity", columns: list[str] | None = None) -> Block:
-    """Wrap precomputed congruity accumulators as an unpenalized design block.
-
-    ``accumulated`` is ``(n_obs,)`` or ``(n_obs, p)`` — one column per
-    accumulator you want a separate coefficient for (e.g. cross-KC and
-    within-KC congruity, or a plain off-KC attempt count alongside them, which
-    is what identifies the transfer-neutral congruity level).
-    """
-    acc = np.asarray(accumulated, dtype=float)
-    if acc.ndim == 1:
-        acc = acc[:, None]
-    if acc.shape[0] != len(data):
-        raise ValueError(f"Expected {len(data)} rows, got {acc.shape[0]}")
-    labels = columns or ([name] if acc.shape[1] == 1
-                         else [f"{name}_{i}" for i in range(acc.shape[1])])
-    return Block.build(name, acc, labels)

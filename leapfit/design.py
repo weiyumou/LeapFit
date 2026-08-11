@@ -21,8 +21,9 @@ This is deliberately the extension point for everything downstream:
 
 * **A new model family** is a new set of blocks and nothing else; the solver,
   the identification pass, and the separation check all come for free.
-* **A congruity-weighted practice term** is one more :class:`Block` holding a
-  single column of accumulated congruity.
+* **A new predictor over practice history** — spacing gaps, similarity-weighted
+  practice, anything accumulated over :meth:`leapfit.data.StepData.practice_order`
+  — is one more :class:`Block` (see :func:`accumulator_block`).
 * **Hierarchical shrinkage** is a reparameterization, not new machinery:
   write ``beta_k = beta_parent(k) + b_k`` as an unpenalized parent block plus
   a ridge-penalized deviation block, and the ridge weight *is* the prior
@@ -32,6 +33,7 @@ This is deliberately the extension point for everything downstream:
 
 from __future__ import annotations
 
+from collections.abc import Sized
 from dataclasses import dataclass
 
 import numpy as np
@@ -227,10 +229,10 @@ class Design:
         ), self.aliased)
 
     def with_blocks(self, *extra: Block) -> Design:
-        """Append blocks — the hook for congruity terms and hierarchies.
+        """Append blocks — the hook for accumulator terms and hierarchies.
 
         The existing aliasing record carries over, but the new columns are
-        unchecked: call :meth:`identify` again afterwards. A congruity or
+        unchecked: call :meth:`identify` again afterwards. An accumulator or
         hierarchical-parent block can easily be collinear with what is already
         there, and that is exactly the failure this machinery exists to catch.
         """
@@ -328,9 +330,9 @@ class Design:
            column from ``prefer_drop`` is removed to break it.
 
         A student is dropped rather than a KC because the KC intercepts are
-        the reported output — learning curves and the RQ-3 screen — and a KC
-        missing from that table would be worse than an arbitrary reference
-        student. Use :meth:`~leapfit.afm.AFMFit.centred_students` to move the
+        the reported output — learning curves, difficulty tables, low-slope
+        screens — and a KC missing from that table would be worse than an
+        arbitrary reference student. Use :meth:`~leapfit.afm.AFMFit.centred_students` to move the
         fit to the reference-free sum-to-zero point afterwards.
 
         :param check: verify numerically that the result is full rank, and
@@ -408,6 +410,36 @@ class Design:
         one KC per row.
         """
         return self.kc_per_row() == 1.0
+
+
+def accumulator_block(data: Sized, values: np.ndarray, *,
+                      name: str = "accumulator",
+                      columns: list[str] | None = None,
+                      l2: float = 0.0) -> Block:
+    """Wrap per-observation accumulator columns as a design block.
+
+    An *accumulator* is any predictor computed over a student's practice
+    history — prior success/failure counts (PFA's terms), spacing gaps,
+    similarity-weighted practice. Build it over
+    :meth:`leapfit.data.StepData.practice_order` so it agrees with the
+    opportunity counts about what "before" means, then attach it with
+    :meth:`Design.with_blocks` and re-run :meth:`Design.identify`, which will
+    refuse the design if the new columns are collinear with what is already
+    there.
+
+    ``values`` is ``(n_obs,)`` or ``(n_obs, p)`` — one column per accumulator
+    that gets its own coefficient. ``data`` is only consulted for its length,
+    so passing the :class:`~leapfit.data.StepData` the design was built from
+    keeps the row-count check honest.
+    """
+    acc = np.asarray(values, dtype=float)
+    if acc.ndim == 1:
+        acc = acc[:, None]
+    if acc.shape[0] != len(data):
+        raise ValueError(f"Expected {len(data)} rows, got {acc.shape[0]}")
+    labels = columns or ([name] if acc.shape[1] == 1
+                         else [f"{name}_{i}" for i in range(acc.shape[1])])
+    return Block.build(name, acc, labels, l2=l2)
 
 
 def coefficient_frame(design: Design, weights: np.ndarray) -> pd.DataFrame:

@@ -26,8 +26,8 @@ from scipy.optimize import minimize
 from leapfit import (
     Block,
     StepData,
+    accumulator_block,
     build_afm_design,
-    congruity_block,
     cross_validate,
     fit_afm,
     from_frame,
@@ -241,14 +241,17 @@ def test_take_preserves_labels_penalty_and_bounds():
 
 
 def test_extra_block_extends_the_design():
+    """The accumulator seam: PFA's counts and any history-derived predictor."""
     data = _synthetic(n_students=5, n_kcs=3, n_items=15, seed=3)
     design = build_afm_design(data)
-    extra = congruity_block(data, np.random.default_rng(0).normal(size=(len(data), 2)),
-                            columns=["cross", "n_prior"])
+    extra = accumulator_block(data, np.random.default_rng(0).normal(size=(len(data), 2)),
+                              columns=["prior_successes", "prior_failures"])
     extended = design.with_blocks(extra)
     assert extended.n_params == design.n_params + 2
-    assert "congruity" in extended.slices()
-    assert np.all(extended.l2[extended.slices()["congruity"]] == 0.0)
+    assert "accumulator" in extended.slices()
+    assert np.all(extended.l2[extended.slices()["accumulator"]] == 0.0)
+    with pytest.raises(ValueError, match="rows"):
+        accumulator_block(data, np.zeros(len(data) + 1))
 
 
 # --------------------------------------------------------------------------
@@ -428,7 +431,7 @@ def test_zero_ridge_makes_the_two_likelihoods_agree():
 
 
 def test_kc_values_exports_datashop_column_names():
-    """The refine-datashop-kc command reads these exact headers."""
+    """Tooling that reads DataShop KC-values files expects these exact headers."""
     data = _synthetic(n_students=10, n_kcs=3, n_items=20, seed=12)
     fit = fit_afm(build_afm_design(data), data.y, method="L-BFGS-B")
     values = fit.kc_values(data)
@@ -666,7 +669,7 @@ def test_never_repeated_kc_reports_slope_as_undefined_not_zero():
 
 
 def test_identify_raises_on_a_collinear_extra_block():
-    """The guard that protects congruity and hierarchical blocks added later."""
+    """The guard that protects accumulator and hierarchical blocks added later."""
     data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
     design = build_afm_design(data, identify=False)
     kc_block = next(b for b in design.blocks if b.name == "kc_intercept")

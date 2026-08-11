@@ -14,8 +14,8 @@ accepts no random seed. Re-running it cannot produce a different partition.
 ``"pooled"`` — FastAfmAndCv (``learner_performance_prediction.py``): shuffle
 the labels, cut them into contiguous blocks, pool every held-out prediction
 across folds, and take one RMSE over the pooled vector. The shuffle is seeded,
-so repeated runs give different partitions — which is what makes a "50 random
-seeds" protocol like EDM 2025's meaningful. Note the last fold absorbs the
+so repeated runs give different partitions — which is what makes a repeated
+"N random seeds" protocol meaningful. Note the last fold absorbs the
 remainder, so fold sizes are unequal when the label count is not divisible.
 
 Blocking by item or by student leaves some columns of the design with no
@@ -195,7 +195,7 @@ def cross_validate(design: Design, data: StepData, *, scheme: str = "item_blocke
 
 def repeated_cross_validate(design: Design, data: StepData, *, seeds,
                             **kwargs) -> pd.DataFrame:
-    """Repeat CV over seeds — the EDM 2025 protocol (item-blocked, 50 seeds).
+    """Repeat CV over seeds, as published KC-model comparisons commonly do.
 
     Returns one row per seed. Note that averaging these and running a t-test
     over them treats non-independent resamples as independent; the spread is

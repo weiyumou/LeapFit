@@ -34,7 +34,6 @@ from leapfit.afm import (
     STUDENT_L2,
     AFMFit,
     build_afm_design,
-    congruity_block,
     fit_afm,
 )
 from leapfit.crossval import (
@@ -54,7 +53,14 @@ from leapfit.data import (
     list_kc_models,
     load_student_step,
 )
-from leapfit.design import Aliased, Block, Design, Separated, coefficient_frame
+from leapfit.design import (
+    Aliased,
+    Block,
+    Design,
+    Separated,
+    accumulator_block,
+    coefficient_frame,
+)
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
 
 __all__ = [
@@ -72,9 +78,9 @@ __all__ = [
     "Separated",
     "StepData",
     "__version__",
+    "accumulator_block",
     "build_afm_design",
     "coefficient_frame",
-    "congruity_block",
     "cross_validate",
     "fit_afm",
     "fit_logistic",

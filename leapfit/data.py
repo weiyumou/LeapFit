@@ -3,10 +3,9 @@
 The parsing rules in this module are not our own design: they replicate
 LearnSphere's PyAFM component
 (``AnalysisPyAfm/program/process_datashop.py::plot_datashop_student_step``)
-so that anything we fit stays comparable with the numbers DataShop and the
-EDM 2025 paper already report. Where the reference is ambiguous or silently
-lossy we raise instead of guessing, and every such divergence is marked
-``DIVERGENCE`` below.
+so that anything we fit stays comparable with numbers DataShop already
+reports. Where the reference is ambiguous or silently lossy we raise instead
+of guessing, and every such divergence is marked ``DIVERGENCE`` below.
 
 The rules, in the reference's own order:
 
@@ -110,9 +109,9 @@ class StepData:
 
         **One canonical ordering, used by everything.** The opportunity counts
         in the AFM design and any accumulator built over a student's history
-        (congruity-weighted practice, spacing gaps) must agree on what "before"
-        means, or a coefficient on one is measured against a different history
-        than the other.
+        (PFA's prior-success/failure counts, spacing gaps, similarity-weighted
+        practice) must agree on what "before" means, or a coefficient on one is
+        measured against a different history than the other.
 
         Ordered by ``First Transaction Time`` where the export provides it,
         with the file's own row order breaking ties — the same tie-break
