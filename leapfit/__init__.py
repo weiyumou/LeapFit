@@ -1,11 +1,10 @@
-"""leapfit — LearnSphere-grounded student models over DataShop student-step data.
+"""leapfit — student models for learning analytics, over DataShop student-step data.
 
-LearnSphere fits these models inside a workflow GUI, from components that are
-undocumented about which model they fit and that carry real defects (see
-"Defects found in the reference" in the README). This package reimplements them
-locally, validated against LearnSphere's own output where that output exists, so
-a baseline column in a paper is something you can inspect rather than something
-you downloaded.
+The implementations are grounded in and adapted from LearnSphere's reference
+components, validated against LearnSphere's own output where that output
+exists, so a baseline column in a paper is something you can inspect rather
+than something you downloaded. Provenance, deliberate divergences, and the
+validation record live in ``docs/DESIGN.md``.
 
 **One input format.** Every model here reads the same six columns of a DataShop
 student-step export — ``Anon Student Id``, ``Problem Name``, ``Step Name``,
@@ -14,7 +13,7 @@ model families never means reshaping data.
 
     from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
 
-    data   = load_student_step("ds5426_student_step.txt", kc_model="LOs-new")
+    data   = load_student_step("examples/student-step.txt", kc_model="Topics")
     design = build_afm_design(data)                 # analysis default
     fit    = fit_afm(design, data.y)
     print(fit.summary())

@@ -68,7 +68,7 @@ def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
         slope, not as a wall.
 
         A consequence worth keeping straight: because real fits admit negative
-        slopes, the EDM 2025 RQ-3 screen (``gamma <= 0.001``) selects KCs where
+        slopes, a low-slope screen (``gamma <= 0.001``) selects KCs where
         students did not learn *or got worse*.
     :param identify: drop aliased columns. Defaults to ``not learnsphere_compat``.
     :param recompute_opportunities: derive ``T`` from
@@ -76,11 +76,12 @@ def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
         DataShop's ``Opportunity`` column.
 
         The column is not always right. It follows the export's *row* order,
-        and on ds5426 that order contains 12 within-student inversions of
-        ``First Transaction Time`` — an attempt at 01:44:41 listed before one at
-        01:44:36 — which mis-numbers 28 rows (0.07%). Recomputing uses the
-        timestamps, which is what "prior practice" actually means. Off by
-        default because the column is what LearnSphere's published fits used.
+        and on the E-learning 2022 validation export that order contains 12
+        within-student inversions of ``First Transaction Time`` — an attempt at
+        01:44:41 listed before one at 01:44:36 — which mis-numbers 28 rows
+        (0.07%). Recomputing uses the timestamps, which is what "prior
+        practice" actually means. Off by default because the column is what
+        LearnSphere's published fits used.
     """
     if student_l2 is None:
         student_l2 = STUDENT_L2 if learnsphere_compat else 0.0

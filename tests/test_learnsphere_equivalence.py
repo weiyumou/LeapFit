@@ -162,7 +162,7 @@ def test_file_and_recomputed_opportunities_agree_almost_everywhere():
     """DataShop's Opportunity column follows *row* order, and row order is not
     sorted by time.
 
-    ds5426's export contains 12 within-student inversions of
+    The E-learning 2022 export contains 12 within-student inversions of
     ``First Transaction Time`` — an attempt at 01:44:41 listed before one at
     01:44:36 — and the shipped counts follow the file, so 28 rows carry the
     wrong opportunity number. Every disagreement traces to one of those

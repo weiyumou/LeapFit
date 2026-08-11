@@ -5,6 +5,7 @@ references
 data/
 prior-idea-*
 results/
+docs/
 
 # TeX & LaTeX Build Artifacts
 *.log

@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Fit AFM to a DataShop student-step export, one row per KC model.
 
-Reproduces the shape of the EDM 2025 model-fit tables (AIC, BIC, held-out
-RMSE) locally, so KC models can be compared without a round trip through
-DataShop or LearnSphere.
+Produces a model-comparison table (AIC, BIC, held-out RMSE) locally, so KC
+models can be compared without a round trip through DataShop or LearnSphere.
 
-    leapfit-afm ds5426_student_step.txt --list-models
+    leapfit-afm examples/student-step.txt --list-models
 
-    leapfit-afm ds5426_student_step.txt \\
-        --kc-model Single-KC --kc-model LOs-new --kc-model KCluster \\
-        --cv item_blocked --seeds 0:50 --out results/afm-e22.csv
+    leapfit-afm examples/student-step.txt \\
+        --kc-model Topics --kc-model Skills \\
+        --cv item_blocked --seeds 0:50 --out afm-results.csv
 
-``python run_afm.py ...`` still works from a source checkout.
+``python -m leapfit.cli ...`` is the same entry point from a source checkout.
 
 With ``--seeds`` the CV is repeated over each seed and the table reports the
 mean and standard deviation. The standard deviation describes how much the

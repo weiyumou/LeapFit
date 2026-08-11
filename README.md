@@ -1,18 +1,21 @@
-# leapfit — LearnSphere-grounded student models
+# leapfit
 
-LearnSphere fits student models inside a workflow GUI, from components that do
-not say which model they fit and that carry real defects — four things named
-"AFM" that fit four different models, an iteration cap that has never taken
-effect, a parameter count that omits a fitted parameter. `leapfit` reimplements
-them locally, **validated against LearnSphere's own output** where that output
-exists, so a baseline column in a paper is something you can inspect rather than
-something you downloaded.
+Student models for learning analytics and educational data mining, fitted
+directly from [DataShop](https://pslcdatashop.web.cmu.edu/) student-step
+exports. Today that is the **Additive Factors Model (AFM)**; Performance
+Factors Analysis (PFA), and Bayesian Knowledge Tracing (BKT) are
+on the [roadmap](#roadmap).
 
-**One input format.** Every model reads the same six columns of a DataShop
-student-step export, so switching model families never means reshaping data.
+- **One input format.** Every model reads the same six columns of a
+  student-step file, so switching model families never means reshaping data.
+- **Grounded.** The implementation is adapted from LearnSphere's reference
+  components and validated for equivalence against their output, so results
+  stay comparable with numbers DataShop already reports.
+- **Honest statistics.** Parameter counts equal the rank of the design,
+  coefficients with no finite estimate are flagged instead of printed as if
+  real, and every fit carries a convergence certificate — checked, not assumed.
 
-Today that is AFM. The roadmap is PFA, BKT, and 1PL/2PL IRT — see
-[Status](#status) for what is grounded against what.
+## Install
 
 ```bash
 # Not on PyPI yet — install from the repository:
@@ -21,392 +24,112 @@ uv pip install "git+https://github.com/weiyumou/LeapFit"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest tests/   # 76 pass in ~3s; 8 skip, needing LearnSphere run artifacts
+uv run pytest          # 76 pass in ~3s; 8 skip without validation artifacts
 ```
+
+## Quickstart
+
+The repository ships a small synthetic dataset
+([`examples/student-step.txt`](examples/)) tagged with two KC models — `Topics`,
+the model the responses were actually generated from, and `Skills`, a finer
+relabelling of the same steps.
 
 ```python
 from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
 
-data   = load_student_step("ds5426_student_step.txt", kc_model="LOs-new")
-design = build_afm_design(data)                 # analysis default
+data   = load_student_step("examples/student-step.txt", kc_model="Topics")
+design = build_afm_design(data)
 fit    = fit_afm(design, data.y)
-print(fit.summary())
+
+print(fit.summary())                     # log-likelihood, AIC/BIC, optimality
+print(fit.kc_values(data))               # per-KC intercepts and learning rates
 print(cross_validate(design, data, scheme="item_blocked").summary())
 ```
 
-```bash
-leapfit-afm ds5426_student_step.txt --list-models
+The same comparison from the command line:
 
-leapfit-afm ds5426_student_step.txt \
-    --kc-model Single-KC --kc-model LOs-new --kc-model KCluster \
-    --cv item_blocked --seeds 0:50 --out results/afm-e22.csv
+```bash
+leapfit-afm examples/student-step.txt --list-models
+leapfit-afm examples/student-step.txt --cv item_blocked --seeds 0:5
 ```
 
-## What the input file must contain
+```
+kc_model  n_kcs  n_obs  n_params  n_separated  log_likelihood      aic      bic  is_optimal  cv_rmse
+  Skills     12    480        35            0       -267.8217 605.6435 751.7260        True   0.4988
+  Topics      4    480        19            0       -268.9846 575.9691 655.2711        True   0.4586
+```
+*(columns abridged)*
 
-Six columns. Everything else in a DataShop student-step export is ignored.
+AIC, BIC, and held-out RMSE all prefer `Topics` — the planted true model — over
+the finer `Skills`. Every fitted learning rate is positive, as generated.
 
-| column | used for |
+## Input format
+
+A tab-separated student-step file with six required columns. Everything else in
+a full DataShop export is ignored.
+
+| column | meaning |
 |---|---|
-| `Anon Student Id` | the student block; the unit of student-blocked CV |
-| `Problem Name` | half of the item label |
-| `Step Name` | the other half — items are `Problem Name ## Step Name`, the unit of item-blocked CV |
-| `First Attempt` | the response: `correct` is a success, `incorrect` / `hint` / `unknown` are failures |
-| `KC (<model>)` | the Q-matrix row, `~~`-separated for multi-KC steps |
-| `Opportunity (<model>)` | prior practice `T`, `~~`-separated and aligned by position, numbered from 1 |
+| `Anon Student Id` | the learner; the unit of student-blocked CV |
+| `Problem Name`, `Step Name` | together the item label; the unit of item-blocked CV |
+| `First Attempt` | `correct` is a success; `incorrect` / `hint` / `unknown` are failures |
+| `KC (<model>)` | the step's knowledge component(s), `~~`-separated when there are several |
+| `Opportunity (<model>)` | how many times the student has met each KC, numbered from 1, aligned by position |
 
-One optional column changes behaviour:
-
-| column | effect if present |
-|---|---|
-| `First Transaction Time` | defines the canonical practice order, so `recompute_opportunities=True` can correct `Opportunity`. Absent, practice order falls back to file row order — which is what DataShop numbers by anyway |
+Optional: `First Transaction Time` defines the practice order, letting
+`recompute_opportunities=True` correct a miscounted `Opportunity` column.
 
 A file may carry any number of KC models; `list_kc_models(path)` enumerates
-them and each is fitted independently. A missing required column raises and
-names it. Values outside DataShop's `First Attempt` vocabulary raise rather
-than being scored as failures — a file writing `1`/`0` needs
-`success_values=("1",), failure_values=("0",)`, stated explicitly, because the
-alternative is an all-zero response that fits, converges, and reports a
-plausible AIC.
+them, and each fits independently. Malformed input raises with the row number
+rather than fitting something silently wrong — including outcome vocabularies
+the parser does not recognize (a file coding `1`/`0` needs
+`success_values=("1",), failure_values=("0",)` stated explicitly).
+[`examples/generate.py`](examples/generate.py) is a minimal reference for
+producing compatible files from your own data.
 
-Practical ceiling: identification runs a dense `p × p` eigendecomposition, so
-it is 0.3 s at 1,600 parameters, 22 s at 6,000, and 108 s at 10,000. Above
-roughly 10,000 parameters pass `identify=False` and count parameters yourself.
-Parsing and fitting are sparse and scale with the number of observations.
+## What you get beyond point estimates
 
-## Two settings, because reproduction and analysis want opposite defaults
+- **Identified parameter counts.** Aliased columns — a KC no student practises
+  twice, the student/KC sum redundancy — are removed, so `n_params = rank(X)`
+  and AIC/BIC never charge for parameters that do not exist. On one real
+  export's finest KC model that is 959 phantom parameters, 25% of its BIC
+  penalty.
+- **Separation detection.** A KC answered correctly by everyone has no finite
+  intercept estimate; leapfit reports it (`fit.separated`, a `Separated` flag
+  in `kc_values`) instead of printing the arbitrary number the optimizer
+  stopped at.
+- **A convergence certificate.** The objective is convex, so the fit checks the
+  KKT conditions and `fit.is_optimal` says whether this is *the* optimum —
+  independent of what the optimizer claims about itself.
+- **Reproducible cross-validation.** Unstratified, response-stratified,
+  student-blocked, and item-blocked schemes; both per-fold and pooled RMSE
+  conventions; seeded repeats; and `paired_cross_validate` to score several KC
+  models on identical folds for a properly paired comparison.
+- **A compatibility switch.** `build_afm_design(data, learnsphere_compat=True)`
+  reproduces LearnSphere's exact conventions (ridge, parameter counting) when
+  you need to match a published table; the default is the statistically clean
+  variant. 
 
-| | `build_afm_design(data)` — **default** | `learnsphere_compat=True` |
+## Roadmap
+
+| model | state | notes |
 |---|---|---|
-| purpose | the baseline in new work | reproduce the published table |
-| student ridge | none | 1.0 |
-| identification | aliased columns dropped | none |
-| `nPars` | `rank(X)` | `n_students + 2·n_KCs` |
-| slope bound | free | free |
+| **AFM** | shipped | validated for equivalence against LearnSphere workflow output |
+| PFA | planned | reference implementation audited; same design-matrix machinery |
+| BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
 
-Compat is a **fixture, not a model** — its only job is to hit LearnSphere's
-numbers, which `tests/test_learnsphere_equivalence.py` checks against wf3990's
-own `model_values.xml`. Everything scientific runs in the default.
+## Development
 
-### Why the default drops the ridge
-
-With one student and one KC per row, the student columns and the KC-intercept
-columns both sum to the all-ones vector, so the design is rank-deficient: you
-can add any constant to every student, subtract it from every KC intercept, and
-every prediction is unchanged. LearnSphere's ridge on students picks one point
-on that flat line — it costs 2.4 nats out of 21,000, which is the tell that it
-is an **identification device, not regularization**. The cost is a "log
-likelihood" that isn't one, and a parameter count that overstates the model.
-
-`Design.identify()` removes the redundancy directly instead, and finds a second
-kind the ridge cannot touch: **a KC that no student ever practises twice has
-`T ≡ 0`, so its slope column is identically zero and `γ_k` is not estimable at
-all.** E-learning 22:
-
-| KC model | columns | rank | phantom parameters |
-|---|---|---|---|
-| `Single-KC` | 41 | 40 | 1 |
-| `LOs-new` | 241 | 239 | 2 |
-| `pmi` (KCluster) | 275 | 274 | 1 |
-| `concept` | 781 | 767 | 14 |
-| `Unique-step` | 3769 | 2810 | **959** |
-
-BIC charges `log(42,176) = 10.65` per parameter, so `Unique-step`'s published
-BIC carries **10,213 nats of penalty for parameters that do not exist** — 25% of
-its total. The overcount scales with granularity, because fine-grained models
-are the ones with singleton KCs, which matters for any argument about how BIC
-penalizes granularity. It does not reorder the published table.
-
-Consequences, all pinned by tests: a dropped student becomes the reference
-level, so `kc_values()` reports intercepts at the **sum-to-zero** point (the
-average student) rather than an arbitrary one; and a KC with no second
-opportunity reports `Slope = NaN`, not `0.0`, so it cannot be mistaken for
-"students did not learn" by a `γ ≤ 0.001` screen.
-
-### A third kind of non-parameter: separation
-
-Identification is about the design; this one is about the design *and the
-responses*. A KC every student always gets right has an intercept whose MLE is
-`+∞` — raising it always improves the fit and touches nothing else — so no
-finite estimate exists. `Design.separated(y)` reports these exactly (the
-single-column case; full detection is an LP), respecting ridge and bounds,
-which both remove the divergence. E-learning 22:
-
-| KC model | KCs | separated | intercepts | slopes |
-|---|---|---|---|---|
-| `Single-KC` | 1 | 0 | 0 | 0 |
-| `LOs-new` | 101 | 1 | 0 | 1 |
-| `pmi` (KCluster) | 118 | 2 | 0 | 2 |
-| `concept` | 371 | 42 | 1 | 41 |
-| `Unique-step` | 1865 | **746** | 253 | 493 |
-
-The **likelihood** is fine: the gradient certificate still holds, so the
-reported value is essentially the supremum and AIC is not distorted through that
-channel. Two other things are wrong. First, 746 of `Unique-step`'s 2,810
-remaining parameters are quantities that were never estimated, and BIC charges
-10.65 nats for each. Second, their printed values are artefacts of where TNC
-stopped: across those 746 the magnitude runs from 0.96 to 647 with a median of
-23.5 — a spread that carries no information about the KCs.
-
-Detection is a lower bound and visibly so: the largest coefficient *not* flagged
-is 307, which is a group of columns separating the data only in combination.
-That is the LP case this deliberately does not attempt.
-
-`fit_afm` warns, `fit.summary()` reports it, `leapfit-afm` adds an `n_separated`
-column, and `kc_values()` carries a `Separated` flag — flagged rather than
-blanked, because unlike a never-repeated KC the datum is real and strong; it is
-the *estimate* that does not exist.
-
-## The reference
-
-Two components in [LearnSphere/WorkflowComponents](https://github.com/LearnSphere/WorkflowComponents),
-and it matters which:
-
-- **`AnalysisFastAfmAndCv`** (`program/learner_performance_prediction.py`) —
-  **this is what produced the EDM 2025 numbers** (workflow `wf3990`). It is the
-  only component emitting the `student_blocked_cv` / `item_blocked_cv` schema and
-  the `Skill`/`Student` parameter types found in the run artifacts. It fits
-  `sklearn.linear_model.LogisticRegression(solver="lbfgs")` — **unconstrained
-  slopes** — and reports the *unpenalized* log-likelihood as `-log_loss * n`.
-- **`AnalysisPyAfm`** (`program/process_datashop.py`, `program/custom_logistic.py`) —
-  the documented Python AFM. Bounds slopes at `(0, None)` and reports a
-  *penalized* objective as its log-likelihood.
-
-They fit different models. Where the two disagree, this package follows
-`AnalysisFastAfmAndCv`, because that is the published baseline. See
-[Defects found in the reference](#defects-found-in-the-reference) for what else
-the comparison turned up.
-
-One further quirk of `AnalysisFastAfmAndCv`: it **recomputes opportunity counts
-internally** (`df_to_sparse_afm`, a per-student `np.cumsum` over the Q-matrix) and
-never reads the `Opportunity (...)` columns of its input. Ours reads the columns
-by default, per PyAFM; pass `recompute_opportunities=True` for the other
-convention. They agree on 99.93% of ds5426's rows. The 0.07% that differ are not
-ties: **the export's row order contains 12 within-student inversions of
-`First Transaction Time`** — an attempt at 01:44:41 listed before one at
-01:44:36 — and DataShop's column follows row order, so 28 rows carry the wrong
-opportunity number. Recomputing fixes them and moves the log-likelihood by less
-than 1 nat.
-
-**The EDM 2025 numbers use LearnSphere's parameter-counting convention**
-(`nPars = n_students + 2·n_KCs`, no intercept column). Verified without touching
-any data, from the identity `BIC − AIC = nPars · (log N − 2)`. This pins the
-convention, *not* which component ran — the fits themselves came from the
-`wf3990` DataShop workflow, which differs from PyAFM (see below):
-
-| E-learning 2022 model | KCs | nPars = 39 + 2·KCs | predicted BIC−AIC | published |
-|---|---|---|---|---|
-| `Single-KC` | 1 | 41 | 354.63 | 354.634 |
-| `LOs-new` | 101 | 241 | 2084.55 | 2084.555 |
-| `Concept` | 371 | 781 | 6755.32 | 6755.343 |
-| `Unique-step` | 1865 | 3769 | 32600.34 | 32600.367 |
-
-at `N = 42,176`. Every row of both tables closes. Pinned in
-`tests/test_afm.py::test_published_aic_bic_identity`, so a later "improvement"
-to the parameter count breaks the build rather than the comparability.
-
-## Semantics reproduced
-
-| | rule |
-|---|---|
-| observation | one row of the student-step rollup; **rows with no KC are dropped**, so they leave `N` too |
-| response | `First Attempt == "correct"`; `hint`, `incorrect` and `unknown` are failures. Matched case-insensitively, and an unrecognized value raises — see [What the input file must contain](#what-the-input-file-must-contain) |
-| multi-KC | `KC (model)` and `Opportunity (model)` split on `~~`, aligned **by position** |
-| opportunity | DataShop's 1-based count **minus 1**, so a first encounter enters as `T = 0` |
-| ordering | one canonical practice sequence (`StepData.practice_order`), shared by `T` and any accumulator built over a student's history |
-| item label | `Problem Name ## Step Name` (the unit of item-blocked CV) |
-| design | `[student one-hot | KC indicator | KC × T]`, **no intercept column** |
-| penalty | ridge 1.0 on student intercepts only; KC intercepts and slopes unpenalized |
-| bounds | intercepts free; **slopes unbounded by default** — see below |
-| optimizer | `scipy.optimize.minimize(method="TNC")` from `w0 = 0` |
-| nPars | every column, including slopes resting at the bound |
-
-## The reference is two different models
-
-`AnalysisPyAfm` (Python) **bounds slopes at `(0, None)`**. The DataShop workflow
-that produced the EDM 2025 tables (`wf3990`, 2024-12-06) **does not**: 3,790 of
-its 29,700 fitted slopes are negative, down to −1.17. Bounding optimizes over a
-strictly smaller feasible set, so it reports a worse likelihood on identical
-data — 7–22 nats across E-learning-22's KC models.
-
-`build_afm_design(..., bound_slopes=False)` is therefore the **default**, because
-it reproduces the published baseline. Pass `True` for PyAFM's variant.
-
-A consequence worth keeping straight: since real fits admit negative slopes, the
-RQ-3 screen `γ ≤ 0.001` selects KCs where students did not learn **or got
-worse** — not only flat ones.
-
-### Validation against wf3990 (E-learning 22)
-
-`nPars` recovered from LearnSphere's own output as `(AIC + 2·ll)/2` matches
-`design.n_params` **exactly for all ten models**, from 41 to 3,769 parameters.
-With slopes unbounded, fitted AIC agrees to within ±18 nats on eight of ten:
-
-| model | our AIC − LearnSphere |
-|---|---|
-| `question-cosine` | −1.3 |
-| `Single-KC` | −3.7 |
-| `LOs` | +4.8 |
-| `pmi` (KCluster) | −9.9 |
-| `concept-cosine` | −10.6 |
-| `LOs-new` | +11.5 |
-| `concept-euclidean` | −18.0 |
-| **`concept`** (781 par.) | **−145.8** |
-| **`Unique-step`** (3,769 par.) | **−1618.2** |
-
-The last two are not disagreements about the model — our solutions carry a KKT
-optimality certificate on a convex objective, so LearnSphere's optimizer is
-stopping early exactly where the parameter count is largest. The BIC ordering
-still reproduces the paper's headline: `LOs-new` best, `pmi`/KCluster second.
-
-Caveat on `parameters.xml`: its coefficients score 540–610 nats *worse* than the
-same file's reported `log_likelihood` when evaluated on the full data, so those
-values are not the full-data MLE (most likely a CV-fold fit). Use
-`model_values.xml` for fit statistics; do not treat `parameters.xml` as the
-fitted model.
-
-## Three more things about the reference worth knowing
-
-**1. The two components report different likelihoods.** PyAFM sets
-`self.ll = -w.fun` where `w.fun` is the *penalized* objective, so its AIC and BIC
-are built on a penalized objective rather than a likelihood. `AnalysisFastAfmAndCv`
-instead reports the true Bernoulli log-likelihood (`-log_loss * n`) — but computes
-it from a fit that sklearn silently L2-regularizes at `C=1.0`, and counts
-parameters without the fitted global intercept. `AFMFit` exposes both conventions:
-`.ll` follows PyAFM, `.ll_unpenalized` / `.aic_unpenalized` / `.bic_unpenalized`
-are the textbook quantities and match FastAfmAndCv's definition.
-
-**2. PyAFM's iteration cap has never taken effect.** It passes
-`options={'maxiter': 1000}` to TNC, but TNC's budget option is `maxfun`;
-scipy raises `OptimizeWarning: Unknown solver options: maxiter` and ignores it.
-Every published AFM fit therefore ran at TNC's *default* budget of
-`max(100, 10·nPars)` — 410 evaluations for E22's `Single-KC` against 37,690 for
-`Unique-step`. We default `max_fun=None` to preserve that behaviour and route an
-explicit `max_fun` to the option the solver actually reads. Pinned in
-`test_references_iteration_cap_is_inert_for_tnc`.
-
-**3. There are two incompatible CV conventions in the repo**, differing in the
-third or fourth decimal — where KC-model comparisons are decided:
-
-- `convention="per_fold"` (PyAFM): RMSE within each fold, then average the fold
-  RMSEs. Item/student folds come from `LabelKFold`, which is **deterministic**
-  and accepts no seed.
-- `convention="pooled"` (FastAfmAndCv): shuffle labels, cut into contiguous
-  blocks, pool all held-out predictions, one RMSE over the pooled vector. The
-  shuffle is seeded, which is what makes a 50-seed protocol meaningful.
-
-The EDM 2025 protocol ("three folds, 50 random seeds, item-stratified") is the
-second. Both are here and the choice is explicit.
-
-## Divergences from the reference
-
-- **Sparse design.** PyAFM calls `X.toarray()`; that is 1.27 GB for E22's
-  `Unique-step`. Sparse it is 2 MB. Objective and gradient agree with the dense
-  reference to 1e-9 in value (`test_end_to_end_agreement_with_the_reference_recipe`);
-  coefficients agree to ~1e-5, the width of TNC's basin, not a discrepancy.
-- **Convergence is reported, not discarded.** A silent non-convergence is
-  indistinguishable from a bad KC model in the fit statistics.
-- **Malformed rows raise.** A row whose KC and opportunity fields differ in
-  length silently misaligns skills with counts in the reference; here it errors
-  with the row number, as does a non-integer opportunity value.
-- **Outcome labels are validated.** The reference compares `First Attempt` to
-  the literal `"correct"`, so an export writing `"Correct"` yields an all-zero
-  response, a converged fit, and a plausible AIC. Case is folded first (a no-op
-  on real DataShop files) and unrecognized values raise.
-- **Separation is detected and reported.** See above; the reference reports
-  diverging coefficients as ordinary estimates.
-- **`unseen_column_fraction` per fold.** Blocking by item or student leaves some
-  design columns with no training rows; their coefficients stay at 0 and those
-  predictions fall back to the student intercept. That is the reference's
-  behaviour and it is *the* mechanism by which a fine-grained KC model posts a
-  worse item-blocked RMSE than `Single-KC`. Measured at E22 scale: 0.0% of
-  held-out rows for a 101-KC model, 1.0% at 371 KCs, 100% at `Unique-step`.
-
-## Open question for the data
-
-The `BIC − AIC` identity closes at **39 students for E-learning 2023**, but the
-paper reports 41. Two students are missing from the fitted rollup. Nothing
-published depends on it; the data description may.
-
-## Layout and the extension seam
-
-Shared infrastructure first, then one module per model family. The split is what
-makes the roadmap cheap: a new *logistic* model is a new set of blocks and
-nothing else — solver, identification, separation check, and cross-validation
-all come for free.
-
-```
-leapfit/data.py      the export -> StepData (parsing rules, practice order)   shared
-leapfit/design.py    Block / Design: columns carrying their own penalty+bounds shared
-leapfit/fit.py       fit_logistic: objective, AIC/BIC, KKT certificate         shared
-leapfit/crossval.py  fold schemes and both RMSE conventions                    shared
-leapfit/afm.py       build_afm_design, AFMFit.kc_values                        AFM
-leapfit/cli.py       leapfit-afm: one row per KC model
-tests/test_afm.py                    68 tests, no data
-tests/test_package.py                 8 tests, the install check
-tests/test_learnsphere_equivalence.py 8 tests, needs wf3990 artifacts
-```
-
-`fit_afm` is four lines: `fit_logistic(..., result_type=AFMFit)`. PFA will be the
-same call with two count blocks instead of one opportunity block. BKT and IRT are
-not logistic, so they get their own fitters and share only `leapfit.data`.
-
-`Design` is a list of labelled `Block`s, each carrying its own per-column ridge
-and bounds. That is deliberately where the next models attach:
-
-- **Congruity-weighted practice** is one more block —
-  `design.with_blocks(congruity_block(data, accumulated))` — where `accumulated`
-  has a column per accumulator (cross-KC congruity, plus the plain off-KC
-  attempt count that identifies the transfer-neutral congruity level).
-- **Hierarchical shrinkage** is a reparameterization, not new machinery: write
-  `β_k = β_parent(k) + b_k` as an unpenalized parent block plus a ridge-penalized
-  deviation block. The ridge weight *is* the prior precision `1/σ²_b`. Estimating
-  `σ²_b` needs an outer loop; the inner fit is this same solver.
-
-## Status
-
-| model | state | grounded against |
-|---|---|---|
-| **AFM** | shipped, validated | LearnSphere `AnalysisFastAfmAndCv` via workflow `wf3990` output |
-| PFA | planned | `AnalysisPfaStepBased` — audited first; its counts leak the label, so compat mode will reproduce that behaviour flagged, not silently |
-| BKT | planned | Yudelson's `standard-bkt` C++, which builds and runs locally |
-| IRT 1PL/2PL | planned | **not LearnSphere** — no IRT component exists in the repo; `mirt` instead |
-
-AFM is validated end to end against `wf3990` on E-learning 22 — parsing,
-parameter counting, fitted AIC/BIC, identification, and the opportunity
-ordering. The equivalence suite needs the run artifacts and skips without them:
+CI runs lint and the full suite on Python 3.11–3.13, then builds the wheel,
+installs it into a clean environment, and fits a model from outside the source
+tree. The equivalence tests require LearnSphere run artifacts and skip without
+them, so a bare clone is always green:
 
 ```bash
-uv run pytest tests/                                # 76 pass, 8 skip, ~3s
-AFM_WF3990_DIR=/path/to/wf3990 uv run pytest tests/ # 84 pass, ~50s
+uv run pytest                                       # 76 pass, 8 skip, ~3s
+AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # 84 pass, ~50s
 ```
 
-A fresh clone is green with no data present — CI checks exactly that, so the
-skip guard cannot rot. It also builds the wheel, installs it into a clean
-environment, and fits a model from a directory with no source tree in sight,
-because an import that silently resolves against the checkout would hide a
-broken package.
+## License
 
-Runs on any DataShop student-step export carrying the six columns above; the
-portability tests build a six-column file from scratch and fit it, so that claim
-is checked rather than asserted. Not yet run against E-learning 23.
-
-Tested on Python 3.12 with numpy 2.5, pandas 3.0, scipy 1.18.
-
-### Defects found in the reference
-
-Auditing LearnSphere closely enough to reproduce it turned up defects worth
-reporting back. They are being written up for the LearnSphere issue tracker and
-will be linked here once filed:
-
-- **AFM** — four components named "AFM" fitting different models; a solver
-  iteration cap that has never taken effect because it is passed under a name
-  the solver does not read; a fitted intercept omitted from `AIC`/`BIC`.
-- **PFA** — `AnalysisPfaStepBased` builds its success/failure counts with an
-  inclusive `cumsum`, so each response is a regressor for itself. The
-  component's own manifest says these are *prior* counts, and the same
-  repository lags them correctly elsewhere.
-
-The specifics matter for this package's design, so the ones that change what
-`leapfit` does are documented in place above rather than deferred to those
-write-ups.
+[MIT](LICENSE)
