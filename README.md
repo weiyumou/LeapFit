@@ -15,8 +15,13 @@ Today that is AFM. The roadmap is PFA, BKT, and 1PL/2PL IRT — see
 [Status](#status) for what is grounded against what.
 
 ```bash
-uv sync                         # or: uv pip install -e ".[dev]"
-uv run pytest tests/test_afm.py # 68 tests, ~3s, no data required
+# Not on PyPI yet — install from the repository:
+uv pip install "git+https://github.com/weiyumou/LeapFit"
+
+# ...or for development:
+git clone https://github.com/weiyumou/LeapFit && cd LeapFit
+uv sync                # or: uv pip install -e ".[dev]"
+uv run pytest tests/   # 76 pass in ~3s; 8 skip, needing LearnSphere run artifacts
 ```
 
 ```python
@@ -169,8 +174,8 @@ and it matters which:
 
 They fit different models. Where the two disagree, this package follows
 `AnalysisFastAfmAndCv`, because that is the published baseline. See
-[learnsphere-issue-afm.md](learnsphere-issue-afm.md) for the full comparison and
-two defects found along the way.
+[Defects found in the reference](#defects-found-in-the-reference) for what else
+the comparison turned up.
 
 One further quirk of `AnalysisFastAfmAndCv`: it **recomputes opportunity counts
 internally** (`df_to_sparse_afm`, a per-student `np.cumsum` over the Q-matrix) and
@@ -338,6 +343,7 @@ leapfit/crossval.py  fold schemes and both RMSE conventions                    s
 leapfit/afm.py       build_afm_design, AFMFit.kc_values                        AFM
 leapfit/cli.py       leapfit-afm: one row per KC model
 tests/test_afm.py                    68 tests, no data
+tests/test_package.py                 8 tests, the install check
 tests/test_learnsphere_equivalence.py 8 tests, needs wf3990 artifacts
 ```
 
@@ -362,7 +368,7 @@ and bounds. That is deliberately where the next models attach:
 | model | state | grounded against |
 |---|---|---|
 | **AFM** | shipped, validated | LearnSphere `AnalysisFastAfmAndCv` via workflow `wf3990` output |
-| PFA | planned | `AnalysisPfaStepBased` — audited first, see `learnsphere-issue-pfa.md` |
+| PFA | planned | `AnalysisPfaStepBased` — audited first; its counts leak the label, so compat mode will reproduce that behaviour flagged, not silently |
 | BKT | planned | Yudelson's `standard-bkt` C++, which builds and runs locally |
 | IRT 1PL/2PL | planned | **not LearnSphere** — no IRT component exists in the repo; `mirt` instead |
 
@@ -371,9 +377,15 @@ parameter counting, fitted AIC/BIC, identification, and the opportunity
 ordering. The equivalence suite needs the run artifacts and skips without them:
 
 ```bash
-uv run pytest tests/test_afm.py                          # 68 tests, ~3s, no data
-AFM_WF3990_DIR=/path/to/wf3990 uv run pytest tests/      # 76 tests, ~50s
+uv run pytest tests/                                # 76 pass, 8 skip, ~3s
+AFM_WF3990_DIR=/path/to/wf3990 uv run pytest tests/ # 84 pass, ~50s
 ```
+
+A fresh clone is green with no data present — CI checks exactly that, so the
+skip guard cannot rot. It also builds the wheel, installs it into a clean
+environment, and fits a model from a directory with no source tree in sight,
+because an import that silently resolves against the checkout would hide a
+broken package.
 
 Runs on any DataShop student-step export carrying the six columns above; the
 portability tests build a six-column file from scratch and fit it, so that claim
@@ -383,9 +395,18 @@ Tested on Python 3.12 with numpy 2.5, pandas 3.0, scipy 1.18.
 
 ### Defects found in the reference
 
-Auditing LearnSphere closely enough to reproduce it turned up bugs worth
-reporting back. Drafts live at the repository root:
+Auditing LearnSphere closely enough to reproduce it turned up defects worth
+reporting back. They are being written up for the LearnSphere issue tracker and
+will be linked here once filed:
 
-- `learnsphere-issue-afm.md` — four components named "AFM" fitting different
-  models; an inert `maxiter`; an uncounted fitted intercept in AIC/BIC.
-- `learnsphere-issue-pfa.md` — see the document.
+- **AFM** — four components named "AFM" fitting different models; a solver
+  iteration cap that has never taken effect because it is passed under a name
+  the solver does not read; a fitted intercept omitted from `AIC`/`BIC`.
+- **PFA** — `AnalysisPfaStepBased` builds its success/failure counts with an
+  inclusive `cumsum`, so each response is a regressor for itself. The
+  component's own manifest says these are *prior* counts, and the same
+  repository lags them correctly elsewhere.
+
+The specifics matter for this package's design, so the ones that change what
+`leapfit` does are documented in place above rather than deferred to those
+write-ups.

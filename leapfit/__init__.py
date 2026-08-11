@@ -1,10 +1,10 @@
 """leapfit — LearnSphere-grounded student models over DataShop student-step data.
 
 LearnSphere fits these models inside a workflow GUI, from components that are
-undocumented about which model they fit and that carry real defects (see the
-issue drafts at the repository root). This package reimplements them locally,
-validated against LearnSphere's own output where that output exists, so a
-baseline column in a paper is something you can inspect rather than something
+undocumented about which model they fit and that carry real defects (see
+"Defects found in the reference" in the README). This package reimplements them
+locally, validated against LearnSphere's own output where that output exists, so
+a baseline column in a paper is something you can inspect rather than something
 you downloaded.
 
 **One input format.** Every model here reads the same six columns of a DataShop

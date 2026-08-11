@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv pip install --system -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      # Runs the whole suite deliberately. The LearnSphere equivalence tests
+      # need run artifacts that are not in the repository and must SKIP rather
+      # than fail or error — a bare clone staying green is the thing being
+      # checked here, and it is easy to break with a stray import.
+      - name: Test suite (equivalence tests skip without artifacts)
+        run: pytest tests/ -q --no-header -rs
+
+  package:
+    name: wheel installs and works
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv build
+      # Install the built wheel into a clean venv and exercise it from a
+      # directory with no source tree in sight, so the import cannot silently
+      # resolve against the checkout instead of site-packages.
+      - name: Install the wheel and fit a model outside the source tree
+        run: |
+          uv venv /tmp/venv
+          uv pip install --python /tmp/venv/bin/python dist/*.whl
+          mkdir -p /tmp/elsewhere && cd /tmp/elsewhere
+          /tmp/venv/bin/python - <<'PY'
+          import leapfit, pandas as pd
+          assert "site-packages" in leapfit.__file__, leapfit.__file__
+
+          rows = []
+          for s in range(8):
+              seen = {}
+              for r in range(4):
+                  for st in range(4):
+                      kc = f"kc{st % 2}"
+                      seen[kc] = seen.get(kc, 0) + 1
+                      rows.append({
+                          "Anon Student Id": f"S{s}", "Problem Name": "p",
+                          "Step Name": f"st{st}",
+                          "First Attempt": "correct" if (s + st + r) % 3 else "incorrect",
+                          "KC (M)": kc, "Opportunity (M)": str(seen[kc]),
+                      })
+          pd.DataFrame(rows).to_csv("mini.txt", sep="\t", index=False)
+
+          data = leapfit.load_student_step("mini.txt", kc_model="M")
+          fit = leapfit.fit_afm(leapfit.build_afm_design(data), data.y)
+          assert fit.is_optimal, fit.summary()
+          print("ok:", leapfit.__version__, fit.aic)
+          PY
+      - name: Console script is on PATH
+        run: /tmp/venv/bin/leapfit-afm --help
