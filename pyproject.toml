@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "leapfit"
-version = "0.1.0"
+version = "0.2.0"
 description = "LearnSphere-grounded student models over DataShop student-step data"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,7 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
 leapfit-afm = "leapfit.cli:main"
+leapfit-pfa = "leapfit.cli:main_pfa"
 
 [tool.hatch.build.targets.wheel]
 packages = ["leapfit"]

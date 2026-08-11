@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Fit AFM to a DataShop student-step export, one row per KC model.
+"""Fit a student model to a DataShop student-step export, one row per KC model.
 
 Produces a model-comparison table (AIC, BIC, held-out RMSE) locally, so KC
 models can be compared without a round trip through DataShop or LearnSphere.
+One command per model family, identical interfaces:
 
     leapfit-afm examples/student-step.txt --list-models
 
@@ -11,7 +12,9 @@ models can be compared without a round trip through DataShop or LearnSphere.
         --cv item_blocked --seeds 0:50 --out afm-results.csv \\
         --predictions annotated-student-step.txt
 
-``python -m leapfit.cli ...`` is the same entry point from a source checkout.
+    leapfit-pfa examples/student-step.txt --cv item_blocked
+
+``python -m leapfit.cli ...`` is ``leapfit-afm`` from a source checkout.
 
 With ``--seeds`` the CV is repeated over each seed and the table reports the
 mean and standard deviation. The standard deviation describes how much the
@@ -31,8 +34,10 @@ from leapfit import (
     CONVENTIONS,
     SCHEMES,
     build_afm_design,
+    build_pfa_design,
     cross_validate,
     fit_afm,
+    fit_pfa,
     list_kc_models,
     load_student_step,
     repeated_cross_validate,
@@ -49,8 +54,8 @@ def parse_seeds(spec: str | None) -> list[int] | None:
     return [int(s) for s in spec.split(",") if s.strip()]
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__,
+def build_parser(family: str = "afm") -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=f"leapfit-{family}", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("export", help="DataShop student-step export (tab-delimited)")
     p.add_argument("--kc-model", action="append", dest="kc_models", metavar="NAME",
@@ -70,13 +75,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-fun", type=int, default=None,
                    help="function-evaluation budget; default = solver default, "
                         "which is what published fits effectively used")
-    p.add_argument("--learnsphere-compat", action="store_true",
-                   help="reproduce the published baseline: student ridge 1.0, no "
-                        "identification, nPars = students + 2*KCs")
-    p.add_argument("--recompute-opportunities", action="store_true",
-                   help="derive T from First Transaction Time instead of DataShop's "
-                        "Opportunity column (see README)")
-    p.add_argument("--student-l2", type=float, default=None)
+    if family == "afm":
+        p.add_argument("--learnsphere-compat", action="store_true",
+                       help="reproduce the published baseline: student ridge 1.0, no "
+                            "identification, nPars = students + 2*KCs")
+        p.add_argument("--recompute-opportunities", action="store_true",
+                       help="derive T from First Transaction Time instead of "
+                            "DataShop's Opportunity column (see README)")
+        p.add_argument("--student-l2", type=float, default=None)
+    else:
+        p.add_argument("--pooled-slopes", action="store_true",
+                       help="one shared success/failure slope instead of per-KC "
+                            "slopes (the 'Simple' PFA variant)")
+        p.add_argument("--student-intercepts", action="store_true",
+                       help="add fixed student intercepts; canonical PFA has none")
+        p.add_argument("--inclusive-counts", action="store_true",
+                       help="reproduce AnalysisPfaStepBased's inclusive counts, "
+                            "which put each response inside its own predictor. "
+                            "For demonstrating that defect only.")
     p.add_argument("--out", help="write the table to this CSV")
     p.add_argument("--kc-values", metavar="DIR",
                    help="also write per-KC parameters (DataShop layout) into DIR")
@@ -87,8 +103,26 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _build_and_fit(args, family: str, data, method: str, max_fun):
+    """The one family-specific step: assemble the design, fit it."""
+    if family == "afm":
+        design = build_afm_design(
+            data, learnsphere_compat=args.learnsphere_compat,
+            student_l2=args.student_l2,
+            recompute_opportunities=args.recompute_opportunities)
+        fit = fit_afm(design, data.y, method=method, max_fun=max_fun)
+    else:
+        design = build_pfa_design(
+            data,
+            slopes="pooled" if args.pooled_slopes else "per_kc",
+            student_intercepts=args.student_intercepts,
+            counts="inclusive" if args.inclusive_counts else "prior")
+        fit = fit_pfa(design, data.y, method=method, max_fun=max_fun)
+    return design, fit
+
+
+def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
+    args = build_parser(family).parse_args(argv)
 
     available = list_kc_models(args.export)
     if args.list_models:
@@ -109,13 +143,9 @@ def main(argv: list[str] | None = None) -> int:
 
     for name in wanted:
         data = load_student_step(args.export, kc_model=name)
-        design = build_afm_design(
-            data, learnsphere_compat=args.learnsphere_compat,
-            student_l2=args.student_l2,
-            recompute_opportunities=args.recompute_opportunities)
         print(f"\n=== {name} ===\n{data.summary()}", file=sys.stderr)
 
-        fit = fit_afm(design, data.y, method=args.method, max_fun=args.max_fun)
+        design, fit = _build_and_fit(args, family, data, args.method, args.max_fun)
         print(fit.summary(), file=sys.stderr)
 
         row = {
@@ -186,6 +216,11 @@ def main(argv: list[str] | None = None) -> int:
                          float_format="%.6f", lineterminator="\n")
         print(f"wrote {args.predictions}", file=sys.stderr)
     return 0
+
+
+def main_pfa(argv: list[str] | None = None) -> int:
+    """The ``leapfit-pfa`` console script."""
+    return main(argv, family="pfa")
 
 
 if __name__ == "__main__":

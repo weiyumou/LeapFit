@@ -2,9 +2,9 @@
 
 Student models for learning analytics and educational data mining, fitted
 directly from [DataShop](https://pslcdatashop.web.cmu.edu/) student-step
-exports. Today that is the **Additive Factors Model (AFM)**; Performance
-Factors Analysis (PFA), and Bayesian Knowledge Tracing (BKT) are
-on the [roadmap](#roadmap).
+exports. Today that is the **Additive Factors Model (AFM)** and **Performance
+Factors Analysis (PFA)**; Bayesian Knowledge Tracing (BKT) is on the
+[roadmap](#roadmap).
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
@@ -24,7 +24,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 84 pass in ~3s; 8 skip without validation artifacts
+uv run pytest          # 103 pass in ~3s; 8 skip without validation artifacts
 ```
 
 ## Quickstart
@@ -46,11 +46,21 @@ print(fit.kc_values(data))               # per-KC intercepts and learning rates
 print(cross_validate(design, data, scheme="item_blocked").summary())
 ```
 
-The same comparison from the command line:
+Switching model families never means reshaping data — PFA is the same calls on
+the same `data`:
+
+```python
+from leapfit import build_pfa_design, fit_pfa
+
+pfa = fit_pfa(build_pfa_design(data), data.y)   # per-KC success/failure slopes
+```
+
+The same comparisons from the command line:
 
 ```bash
 leapfit-afm examples/student-step.txt --list-models
 leapfit-afm examples/student-step.txt --cv item_blocked --seeds 0:5
+leapfit-pfa examples/student-step.txt --cv item_blocked --seeds 0:5
 ```
 
 ```
@@ -121,7 +131,7 @@ producing compatible files from your own data.
 | model | state | notes |
 |---|---|---|
 | **AFM** | shipped | validated for equivalence against LearnSphere workflow output |
-| PFA | planned | reference implementation audited; same design-matrix machinery |
+| **PFA** | shipped | canonical fixed-effects PFA (Pavlik, Cen & Koedinger 2009) with strictly-prior counts; per-KC or pooled slopes, optional student intercepts. The audited reference builds its counts *including* each attempt's own outcome — that construction is reproducible here via an explicit option that warns, never silently |
 | BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
 
 ## Development
@@ -132,8 +142,8 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 84 pass, 8 skip, ~3s
-AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # 92 pass, ~50s
+uv run pytest                                       # 103 pass, 8 skip, ~3s
+AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # 111 pass, ~50s
 ```
 
 ## License

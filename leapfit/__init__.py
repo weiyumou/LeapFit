@@ -14,8 +14,8 @@ model families never means reshaping data.
     from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
 
     data   = load_student_step("examples/student-step.txt", kc_model="Topics")
-    design = build_afm_design(data)                 # analysis default
-    fit    = fit_afm(design, data.y)
+    design = build_afm_design(data)                 # or build_pfa_design(data)
+    fit    = fit_afm(design, data.y)                # or fit_pfa(...)
     print(fit.summary())
     print(cross_validate(design, data, scheme="item_blocked").summary())
 
@@ -26,9 +26,10 @@ Layout — shared infrastructure, then one module per model family:
     leapfit.fit       the penalized-logistic solver and its KKT certificate
     leapfit.crossval  fold schemes and both RMSE conventions
     leapfit.afm       Additive Factors Model
+    leapfit.pfa       Performance Factors Analysis
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from leapfit.afm import (
     STUDENT_L2,
@@ -62,6 +63,12 @@ from leapfit.design import (
     coefficient_frame,
 )
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
+from leapfit.pfa import (
+    PFAFit,
+    build_pfa_design,
+    fit_pfa,
+    success_failure_counts,
+)
 
 __all__ = [
     "CONVENTIONS",
@@ -75,15 +82,18 @@ __all__ = [
     "CVResult",
     "Design",
     "LogisticFit",
+    "PFAFit",
     "Separated",
     "StepData",
     "__version__",
     "accumulator_block",
     "build_afm_design",
+    "build_pfa_design",
     "coefficient_frame",
     "cross_validate",
     "fit_afm",
     "fit_logistic",
+    "fit_pfa",
     "from_frame",
     "list_kc_models",
     "load_student_step",
@@ -91,4 +101,5 @@ __all__ = [
     "paired_contrasts",
     "paired_cross_validate",
     "repeated_cross_validate",
+    "success_failure_counts",
 ]

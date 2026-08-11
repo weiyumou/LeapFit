@@ -129,31 +129,6 @@ class AFMFit(LogisticFit):
     """A fitted AFM: everything :class:`~leapfit.fit.LogisticFit` reports, in
     KC-shaped form."""
 
-    def centred_students(self, data: StepData) -> tuple[pd.Series, float]:
-        """Student effects at the sum-to-zero point, and the shift applied.
-
-        Reference coding leaves ``beta_k`` meaning "for the reference student",
-        which is an arbitrary choice. Moving to ``mean(theta) = 0`` makes it
-        "for the average student" instead. This is a slide along the flat
-        direction of :meth:`~leapfit.design.Design.identify`, so every fitted
-        value is unchanged — the caller must add the same shift to the KC
-        intercepts.
-
-        Only valid when each row carries exactly one KC: with two KCs on a row,
-        subtracting the shift from every KC intercept would remove it twice.
-        """
-        if not self.design.recentring_is_valid():
-            raise ValueError(
-                "Sum-to-zero recentring needs exactly one KC per row; this design "
-                f"has {self.design.kc_per_row()} KCs per row (multi-KC), where the "
-                "shift does not cancel."
-            )
-        fitted = self._block_values("student")
-        # Columns dropped as the reference level sit at zero by construction.
-        full = pd.Series({s: fitted.get(s, 0.0) for s in data.student_names})
-        shift = float(full.mean())
-        return full - shift, shift
-
     def kc_values(self, data: StepData, *, centre: bool = True) -> pd.DataFrame:
         """KC parameters in DataShop's model-values layout.
 

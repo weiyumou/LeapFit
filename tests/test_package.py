@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 #: per model family — the split that makes adding PFA/BKT/IRT a new module
 #: rather than a rewrite.
 SHARED = ["leapfit.data", "leapfit.design", "leapfit.fit", "leapfit.crossval"]
-FAMILIES = ["leapfit.afm"]
+FAMILIES = ["leapfit.afm", "leapfit.pfa"]
 
 
 def test_every_promised_module_imports():
@@ -74,15 +74,27 @@ def test_the_model_layer_depends_on_the_shared_layer_and_not_the_reverse():
                 "a specific model family")
 
 
-def test_shared_modules_carry_no_afm_specific_api():
-    """AFM's design builder and reporting live in the model module, not the core."""
+def test_shared_modules_carry_no_family_specific_api():
+    """Each family's design builder and reporting live in its own module."""
     import leapfit.design
     import leapfit.fit
 
     for module in (leapfit.design, leapfit.fit):
-        for symbol in ("build_afm_design", "AFMFit", "kc_values"):
+        for symbol in ("build_afm_design", "AFMFit", "build_pfa_design",
+                       "PFAFit", "kc_values", "success_failure_counts"):
             assert not hasattr(module, symbol), (
-                f"{module.__name__} exposes {symbol}, which is AFM-specific")
+                f"{module.__name__} exposes {symbol}, which is family-specific")
+
+
+def test_the_family_modules_do_not_import_each_other():
+    """AFM and PFA are siblings over the shared layer, not layered on each other."""
+    for name in FAMILIES:
+        source = (REPO / f"{name.replace('.', '/')}.py").read_text()
+        for other in FAMILIES:
+            if other == name:
+                continue
+            assert f"import {other}" not in source and f"from {other}" not in source, (
+                f"{name} imports {other}")
 
 
 @pytest.mark.parametrize("entry", ["leapfit.cli"])
@@ -96,7 +108,8 @@ def test_the_cli_entry_point_runs(entry):
     assert "--kc-model" in result.stdout
 
 
-def test_console_script_is_declared():
+def test_console_scripts_are_declared():
     with (REPO / "pyproject.toml").open("rb") as fh:
         scripts = tomllib.load(fh)["project"]["scripts"]
     assert scripts["leapfit-afm"] == "leapfit.cli:main"
+    assert scripts["leapfit-pfa"] == "leapfit.cli:main_pfa"
