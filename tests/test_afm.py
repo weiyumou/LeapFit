@@ -679,6 +679,151 @@ def test_identify_raises_on_a_collinear_extra_block():
         design.with_blocks(duplicate).identify()
 
 
+def _co_occurring_kc_data(pair_steps=3, solo_steps=3, n_students=6):
+    """``A`` and ``B`` tag exactly the same steps; ``C`` tags the rest.
+
+    The duplicate-KC case as it occurs in real labellings: two standards that
+    never appear apart. Their intercept columns are identical, and so are their
+    opportunity columns, since both are counted over the same rows.
+    """
+    rows = []
+    for i in range(n_students):
+        for j in range(pair_steps):
+            rows.append({"Anon Student Id": f"s{i}", "Problem Name": "p",
+                         "Step Name": f"pair{j}",
+                         "First Attempt": "correct" if (i + j) % 3 else "incorrect",
+                         "kc": "A~~B", "opp": f"{j + 1}~~{j + 1}"})
+        for j in range(solo_steps):
+            rows.append({"Anon Student Id": f"s{i}", "Problem Name": "p",
+                         "Step Name": f"solo{j}",
+                         "First Attempt": "correct" if (i + j) % 2 else "incorrect",
+                         "kc": "C", "opp": f"{j + 1}"})
+    return from_frame(_rollup_frame(rows), "M")
+
+
+def test_identify_drops_kcs_that_tag_identical_steps():
+    data = _co_occurring_kc_data()
+    full = build_afm_design(data, identify=False)
+    ident = full.identify()
+
+    dropped = dict(zip(ident.aliased.columns, ident.aliased.reasons))
+    assert dropped["kc_intercept:B"] == "duplicate of kc_intercept:A"
+    assert dropped["kc_slope:B"] == "duplicate of kc_slope:A"
+    assert ident.n_params == ident.rank(), "identified design must be full rank"
+    assert full.rank() == full.n_params - len(ident.aliased)
+
+
+def test_a_duplicate_kc_reports_no_estimate_rather_than_its_twins():
+    """The dropped half of a duplicate pair is not estimable; NaN says so."""
+    data = _co_occurring_kc_data()
+    fit = fit_afm(build_afm_design(data), data.y, method="L-BFGS-B",
+                  warn_not_converged=False, warn_separated=False)
+    values = fit.kc_values(data).set_index("KC Name")
+    assert not np.isnan(values.loc["A", "Intercept (logit)"])
+    assert np.isnan(values.loc["B", "Intercept (logit)"])
+    assert np.isnan(values.loc["B", "Slope"])
+
+
+def test_dropping_duplicate_kcs_leaves_the_likelihood_unchanged():
+    """The equivalence that licenses the drop: same optimum, fewer columns."""
+    data = _co_occurring_kc_data()
+    kwargs = {"method": "L-BFGS-B", "max_fun": 200_000,
+              "warn_not_converged": False, "warn_separated": False}
+    full = fit_afm(build_afm_design(data, identify=False, student_l2=0.0),
+                   data.y, **kwargs)
+    ident = fit_afm(build_afm_design(data), data.y, **kwargs)
+    assert ident.ll_unpenalized == pytest.approx(full.ll_unpenalized, abs=1e-4)
+    assert ident.n_params < full.n_params
+
+
+def test_duplicate_removal_can_create_the_sum_redundancy_and_it_is_still_broken():
+    """Every row here carries the pair, so dedup turns 2 KCs per row into 1.
+
+    The redundancy does not exist in the design as built — KCs per row is 2 —
+    and comes into being only once ``B`` is dropped. Deciding reference levels
+    before that would leave the design rank-deficient.
+    """
+    data = _co_occurring_kc_data(pair_steps=4, solo_steps=0)
+    design = build_afm_design(data, identify=False)
+    assert design.kc_per_row() == 2.0, "no sum redundancy to break as built"
+    ident = design.identify()
+    assert [c for c in ident.aliased.columns if c.startswith("student:")]
+    assert ident.n_params == ident.rank()
+
+
+def _two_cohort_data(n_per_cohort=4, n_steps=4):
+    """Two groups of students that share no items and no KCs."""
+    rows = []
+    for cohort, kcs in enumerate((("A", "B"), ("C", "D"))):
+        for i in range(n_per_cohort):
+            for j in range(n_steps):
+                rows.append({"Anon Student Id": f"c{cohort}s{i}",
+                             "Problem Name": f"p{cohort}",
+                             "Step Name": f"c{cohort}st{j}",
+                             "First Attempt": "correct" if (i + j) % 3 else "incorrect",
+                             "kc": kcs[j % 2], "opp": f"{j // 2 + 1}"})
+    return from_frame(_rollup_frame(rows), "M")
+
+
+def test_row_components_separates_cohorts_that_share_no_material():
+    design = build_afm_design(_two_cohort_data(), identify=False)
+    labels = design.row_components()
+    assert set(labels.tolist()) == {0, 1}
+    assert len(np.unique(labels[:16])) == 1, "one cohort's rows come first here"
+
+
+def test_identify_drops_one_reference_student_per_component():
+    """Each component shifts independently, so each carries its own redundancy."""
+    data = _two_cohort_data()
+    full = build_afm_design(data, identify=False)
+    assert full.rank() == full.n_params - 2, "two redundancies, not one"
+
+    ident = full.identify()
+    assert len(ident.aliased.by_block()["student"]) == 2
+    assert all("component" in reason for reason in ident.aliased.reasons
+               if "reference level" in reason)
+    assert ident.n_params == ident.rank()
+
+
+def test_a_single_component_keeps_the_plain_reference_level_reason():
+    """Regression: the ordinary export must not grow component bookkeeping."""
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=38, n_reps=5)
+    ident = build_afm_design(data, identify=False).identify()
+    assert ident.aliased.reasons == ("reference level (student/KC sum redundancy)",)
+
+
+def test_a_component_without_the_sum_redundancy_keeps_every_student():
+    """One cohort tags some steps with two KCs: no redundancy there to break.
+
+    Observed on the spacing-exp2 export's ``Question Group`` model, where nine
+    of the ten courses contribute a reference student and the tenth does not.
+    """
+    rows = []
+    for j in range(4):  # cohort 0: one KC per row -> redundant
+        for i in range(4):
+            rows.append({"Anon Student Id": f"c0s{i}", "Problem Name": "p0",
+                         "Step Name": f"c0st{j}",
+                         "First Attempt": "correct" if (i + j) % 3 else "incorrect",
+                         "kc": ("A", "B")[j % 2], "opp": f"{j // 2 + 1}"})
+    # cohort 1: one KC on some rows, two on others -> no redundancy to break
+    tagging = [("C", "1"), ("D", "1"), ("C~~D", "2~~2"),
+               ("C", "3"), ("D", "3"), ("C~~D", "4~~4")]
+    for j, (kc, opp) in enumerate(tagging):
+        for i in range(4):
+            rows.append({"Anon Student Id": f"c1s{i}", "Problem Name": "p1",
+                         "Step Name": f"c1st{j}",
+                         "First Attempt": "correct" if (i + j) % 2 else "incorrect",
+                         "kc": kc, "opp": opp})
+    data = from_frame(_rollup_frame(rows), "M")
+    full = build_afm_design(data, identify=False)
+    assert full.rank() == full.n_params - 1, "only cohort 0 carries a redundancy"
+
+    ident = full.identify()
+    students = ident.aliased.by_block()["student"]
+    assert len(students) == 1 and students[0].startswith("c0")
+    assert ident.n_params == ident.rank()
+
+
 def test_compat_preserves_the_learnsphere_parameter_count():
     data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=37, n_reps=5)
     compat = build_afm_design(data, learnsphere_compat=True)

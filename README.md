@@ -24,7 +24,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 103 pass in ~3s; equivalence extras skip without R / artifacts
+uv run pytest          # 111 pass in ~4s; equivalence extras skip without R / artifacts
 ```
 
 ## Quickstart
@@ -99,11 +99,17 @@ producing compatible files from your own data.
 
 ## What you get beyond point estimates
 
-- **Identified parameter counts.** Aliased columns — a KC no student practises
-  twice, the student/KC sum redundancy — are removed, so `n_params = rank(X)`
-  and AIC/BIC never charge for parameters that do not exist. On one real
-  export's finest KC model that is 959 phantom parameters, 25% of its BIC
-  penalty.
+- **Identified parameter counts.** Aliased columns are removed, so
+  `n_params = rank(X)` and AIC/BIC never charge for parameters that do not
+  exist. On one real export's finest KC model that is 959 phantom parameters,
+  25% of its BIC penalty. Three sources, all removed exactly rather than
+  numerically: a KC no student practises twice; two KCs that tag identical
+  steps (one keeps the estimate, the other reports `NaN` rather than a number
+  that is really its twin's); and the student/KC sum redundancy — *once per
+  connected component*, because an export whose cohorts never met the same
+  material carries one of them per cohort, and their intercept levels are then
+  comparable only within a cohort. Anything left over raises instead of being
+  counted, so a collinear block added later cannot slip through.
 - **Separation detection.** A KC answered correctly by everyone has no finite
   intercept estimate; leapfit reports it (`fit.separated`, a `Separated` flag
   in `kc_values`) instead of printing the arbitrary number the optimizer
@@ -142,7 +148,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 103 pass, 11 skip, ~3s
+uv run pytest                                       # 111 pass, 11 skip, ~4s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 LearnSphere equivalence tests
 ```
 

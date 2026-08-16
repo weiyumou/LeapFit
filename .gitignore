@@ -6,6 +6,7 @@ data/
 prior-idea-*
 results/
 docs/
+*.md
 
 # TeX & LaTeX Build Artifacts
 *.log
