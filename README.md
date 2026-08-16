@@ -24,7 +24,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 111 pass in ~4s; equivalence extras skip without R / artifacts
+uv run pytest          # 118 pass in ~4s; equivalence extras skip without R / artifacts
 ```
 
 ## Quickstart
@@ -61,6 +61,10 @@ The same comparisons from the command line:
 leapfit-afm examples/student-step.txt --list-models
 leapfit-afm examples/student-step.txt --cv item_blocked --seeds 0:5
 leapfit-pfa examples/student-step.txt --cv item_blocked --seeds 0:5
+
+# both blocking schemes on one set of fits, with the runs behind the means
+leapfit-afm examples/student-step.txt --cv student_blocked --cv item_blocked \
+    --seeds 0:10 --out comparison.csv --cv-folds cv-folds.csv
 ```
 
 ```
@@ -148,7 +152,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 111 pass, 11 skip, ~4s
+uv run pytest                                       # 118 pass, 11 skip, ~4s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 LearnSphere equivalence tests
 ```
 

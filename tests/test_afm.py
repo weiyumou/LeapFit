@@ -1271,6 +1271,85 @@ def test_cli_predictions_writes_one_column_per_model(tmp_path):
         written["Predicted Error Rate (M2)"].tolist()
 
 
+def _cli_export(tmp_path, name="export.txt"):
+    export = tmp_path / name
+    _minimal_frame().to_csv(export, sep="\t", index=False, lineterminator="\n")
+    return export
+
+
+def test_cli_one_scheme_keeps_the_unsuffixed_column_names(tmp_path):
+    """Existing invocations, and anything parsing their CSV, must not move."""
+    from leapfit.cli import main as cli_main
+    out = tmp_path / "table.csv"
+    assert cli_main([str(_cli_export(tmp_path)), "--cv", "item_blocked",
+                     "--out", str(out)]) == 0
+    table = pd.read_csv(out)
+    assert {"cv_rmse", "cv_rmse_sd", "cv_runs"} <= set(table.columns)
+    assert not [c for c in table.columns if c.endswith("_item_blocked")]
+
+
+def test_cli_scores_several_schemes_on_one_fit(tmp_path):
+    from leapfit.cli import main as cli_main
+    out = tmp_path / "table.csv"
+    assert cli_main([str(_cli_export(tmp_path)),
+                     "--cv", "student_blocked", "--cv", "item_blocked",
+                     "--out", str(out)]) == 0
+    table = pd.read_csv(out)
+    assert {"cv_rmse_student_blocked", "cv_rmse_item_blocked"} <= set(table.columns)
+    assert "cv_rmse" not in table.columns, "no single score to name any more"
+    assert table["cv_rmse_student_blocked"].notna().all()
+
+
+def test_cli_none_cannot_be_combined_with_a_scheme(tmp_path):
+    from leapfit.cli import main as cli_main
+    assert cli_main([str(_cli_export(tmp_path)), "--cv", "none",
+                     "--cv", "item_blocked"]) == 1
+
+
+def test_cli_cv_folds_writes_one_row_per_model_scheme_and_seed(tmp_path):
+    from leapfit.cli import main as cli_main
+    folds = tmp_path / "cv-folds.csv"
+    assert cli_main([str(_cli_export(tmp_path)),
+                     "--cv", "student_blocked", "--cv", "item_blocked",
+                     "--seeds", "0:3", "--cv-folds", str(folds)]) == 0
+    detail = pd.read_csv(folds)
+    assert len(detail) == 1 * 2 * 3, "one KC model x two schemes x three seeds"
+    assert set(detail["scheme"]) == {"student_blocked", "item_blocked"}
+    assert detail["kc_model"].unique().tolist() == ["M"]
+
+
+def test_cli_cv_folds_falls_back_to_per_fold_rows_without_seeds(tmp_path):
+    from leapfit.cli import main as cli_main
+    folds = tmp_path / "cv-folds.csv"
+    assert cli_main([str(_cli_export(tmp_path)), "--cv", "item_blocked",
+                     "--folds", "3", "--cv-folds", str(folds)]) == 0
+    detail = pd.read_csv(folds)
+    assert len(detail) == 3 and set(detail["fold"]) == {0, 1, 2}
+    assert detail["scheme"].unique().tolist() == ["item_blocked"]
+
+
+def test_cli_identification_writes_every_aliased_column(tmp_path):
+    from leapfit.cli import main as cli_main
+    path = tmp_path / "identification.csv"
+    assert cli_main([str(_cli_export(tmp_path)), "--cv", "none",
+                     "--identification", str(path)]) == 0
+    dropped = pd.read_csv(path)
+    assert dropped["column"].str.startswith("student:").any()
+    assert dropped["reason"].str.contains("reference level").any()
+
+
+def test_cli_identification_writes_a_header_when_nothing_is_aliased(tmp_path):
+    """An empty file is a result; a missing one is indistinguishable from a
+    run that never asked for it."""
+    from leapfit.cli import main as cli_main
+    path = tmp_path / "identification.csv"
+    assert cli_main([str(_cli_export(tmp_path, "compat.txt")), "--cv", "none",
+                     "--learnsphere-compat", "--identification", str(path)]) == 0
+    dropped = pd.read_csv(path)
+    assert dropped.empty
+    assert dropped.columns.tolist() == ["kc_model", "column", "reason"]
+
+
 # --------------------------------------------------------------------------
 # Synthetic data
 # --------------------------------------------------------------------------

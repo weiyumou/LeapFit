@@ -14,6 +14,18 @@ One command per model family, identical interfaces:
 
     leapfit-pfa examples/student-step.txt --cv item_blocked
 
+Several schemes score the same fits in one pass, and the runs behind the means
+can be written out beside them:
+
+    leapfit-afm examples/student-step.txt \\
+        --cv student_blocked --cv item_blocked --seeds 0:10 \\
+        --out comparison.csv --cv-folds cv-folds.csv \\
+        --identification identification.csv
+
+With one ``--cv`` the table's columns are ``cv_rmse``, ``cv_rmse_sd``, ...; with
+several they carry a ``_<scheme>`` suffix, because there is then no single
+held-out score to name.
+
 ``python -m leapfit.cli ...`` is ``leapfit-afm`` from a source checkout.
 
 With ``--seeds`` the CV is repeated over each seed and the table reports the
@@ -62,7 +74,13 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
                    help="KC model to fit; repeat for several. Default: all.")
     p.add_argument("--list-models", action="store_true",
                    help="print the KC models in the export and exit")
-    p.add_argument("--cv", choices=(*SCHEMES, "none"), default="item_blocked")
+    p.add_argument("--cv", action="append", dest="cv_schemes",
+                   choices=(*SCHEMES, "none"), metavar="SCHEME",
+                   help=f"blocking scheme, one of {', '.join((*SCHEMES, 'none'))}; "
+                        "repeat to score several on the same fits (default: "
+                        "item_blocked). With one scheme the table's columns are "
+                        "'cv_rmse', 'cv_rmse_sd', ...; with several they are "
+                        "suffixed by scheme, since there is no longer one score.")
     p.add_argument("--convention", choices=CONVENTIONS, default="per_fold",
                    help="per_fold = PyAFM (mean of fold RMSEs); "
                         "pooled = FastAfmAndCv (RMSE of pooled residuals)")
@@ -94,6 +112,14 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
                             "which put each response inside its own predictor. "
                             "For demonstrating that defect only.")
     p.add_argument("--out", help="write the table to this CSV")
+    p.add_argument("--cv-folds", metavar="FILE",
+                   help="write the per-seed cross-validation detail to this CSV — "
+                        "one row per KC model, scheme and seed (per fold when no "
+                        "--seeds), so a reported mean can be traced to the runs "
+                        "behind it")
+    p.add_argument("--identification", metavar="FILE",
+                   help="write every aliased column and the reason it was dropped "
+                        "to this CSV: what the parameter count excludes, and why")
     p.add_argument("--kc-values", metavar="DIR",
                    help="also write per-KC parameters (DataShop layout) into DIR")
     p.add_argument("--predictions", metavar="FILE",
@@ -137,8 +163,17 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
         print(f"Unknown KC model(s) {unknown}. Available: {available}", file=sys.stderr)
         return 1
 
+    schemes = args.cv_schemes or ["item_blocked"]
+    if "none" in schemes and len(schemes) > 1:
+        print(f"--cv none cannot be combined with {[s for s in schemes if s != 'none']}",
+              file=sys.stderr)
+        return 1
+    # One scheme keeps the historical column names, so existing invocations and
+    # anything parsing their CSV are unaffected; several need the suffix.
+    suffix = (lambda s: "") if len(schemes) == 1 else (lambda s: f"_{s}")
+
     seeds = parse_seeds(args.seeds)
-    rows = []
+    rows, fold_rows, alias_rows = [], [], []
     annotated = None  # the input table, gaining one prediction column per model
 
     for name in wanted:
@@ -162,33 +197,50 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
             "is_optimal": fit.is_optimal,
         }
 
-        if args.cv != "none":
-            cv_kwargs = {"scheme": args.cv, "n_folds": args.folds,
+        for scheme in schemes:
+            if scheme == "none":
+                continue
+            cv_kwargs = {"scheme": scheme, "n_folds": args.folds,
                          "convention": args.convention, "method": args.method,
                          "max_fun": args.max_fun}
+            s = suffix(scheme)
             if seeds:
                 table = repeated_cross_validate(design, data, seeds=seeds, **cv_kwargs)
                 row |= {
-                    "cv_rmse": table["rmse"].mean(),
-                    "cv_rmse_sd": table["rmse"].std(ddof=1),
-                    "cv_runs": len(table),
-                    "cv_unseen_fraction": table["unseen_column_fraction"].mean(),
-                    "cv_all_converged": bool(table["all_converged"].all()),
+                    f"cv_rmse{s}": table["rmse"].mean(),
+                    f"cv_rmse_sd{s}": table["rmse"].std(ddof=1),
+                    f"cv_runs{s}": len(table),
+                    f"cv_unseen_fraction{s}": table["unseen_column_fraction"].mean(),
+                    f"cv_all_converged{s}": bool(table["all_converged"].all()),
                 }
-                print(f"  {args.cv} / {args.convention} over {len(table)} seeds: "
-                      f"RMSE = {row['cv_rmse']:.4f} ({row['cv_rmse_sd']:.4f})",
-                      file=sys.stderr)
+                detail = table
+                print(f"  {scheme} / {args.convention} over {len(table)} seeds: "
+                      f"RMSE = {row[f'cv_rmse{s}']:.4f} "
+                      f"({row[f'cv_rmse_sd{s}']:.4f})", file=sys.stderr)
             else:
                 result = cross_validate(design, data, seed=None, **cv_kwargs)
                 row |= {
-                    "cv_rmse": result.rmse,
-                    "cv_rmse_sd": np.nan,
-                    "cv_runs": 1,
-                    "cv_unseen_fraction": float(np.mean(
+                    f"cv_rmse{s}": result.rmse,
+                    f"cv_rmse_sd{s}": np.nan,
+                    f"cv_runs{s}": 1,
+                    f"cv_unseen_fraction{s}": float(np.mean(
                         [f.unseen_column_fraction for f in result.folds])),
-                    "cv_all_converged": all(f.converged for f in result.folds),
+                    f"cv_all_converged{s}": all(f.converged for f in result.folds),
                 }
+                detail = result.frame
                 print(f"  {result.summary()}", file=sys.stderr)
+
+            if args.cv_folds:
+                detail = detail.copy()
+                if "scheme" not in detail:
+                    detail.insert(0, "scheme", scheme)
+                detail.insert(0, "kc_model", name)
+                fold_rows.append(detail)
+
+        if args.identification:
+            alias_rows += [{"kc_model": name, "column": column, "reason": reason}
+                           for column, reason in zip(design.aliased.columns,
+                                                     design.aliased.reasons)]
 
         rows.append(row)
 
@@ -209,6 +261,15 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
     if args.out:
         table.to_csv(args.out, index=False)
         print(f"\nwrote {args.out}", file=sys.stderr)
+    if args.cv_folds and fold_rows:
+        pd.concat(fold_rows, ignore_index=True).to_csv(args.cv_folds, index=False)
+        print(f"wrote {args.cv_folds}", file=sys.stderr)
+    if args.identification:
+        # Written even when empty: "nothing was aliased" is a result, and a
+        # missing file would be indistinguishable from a run that never asked.
+        pd.DataFrame(alias_rows, columns=["kc_model", "column", "reason"]).to_csv(
+            args.identification, index=False)
+        print(f"wrote {args.identification}", file=sys.stderr)
     if annotated is not None:
         # Original cells were read as strings so they round-trip verbatim; the
         # only float columns are the ones we added, and NaN writes as blank.
