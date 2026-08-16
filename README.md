@@ -18,14 +18,22 @@ Factors Analysis (PFA)**; Bayesian Knowledge Tracing (BKT) is on the
 ## Install
 
 ```bash
-# Not on PyPI yet — install from the repository:
-uv pip install "git+https://github.com/weiyumou/LeapFit"
+# Not on PyPI — install from a release tag:
+uv pip install "git+https://github.com/weiyumou/LeapFit@v0.2.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 118 pass in ~4s; equivalence extras skip without R / artifacts
+uv run pytest          # 118 pass in ~25s; equivalence extras skip without R / artifacts
 ```
+
+Another project can depend on leapfit with the same direct reference —
+`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.2.0"` in its
+`dependencies` or in an extra. Two consequences worth knowing before you do:
+PyPI refuses distributions whose metadata carries a direct URL, so a package
+that is itself published to PyPI cannot declare leapfit this way even in an
+extra nobody installs; and a direct reference pins one commit rather than
+resolving a range, so every upgrade is an edit downstream.
 
 ## Quickstart
 
@@ -152,7 +160,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 118 pass, 11 skip, ~4s
+uv run pytest                                       # 118 pass, 11 skip, ~25s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 LearnSphere equivalence tests
 ```
 

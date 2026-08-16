@@ -13,8 +13,9 @@ installation suffices. A disposable environment works too::
     PATH="/tmp/r-env/bin:$PATH" pytest tests/test_r_equivalence.py
 
 The mixed-effects variants LearnSphere's PFA components fit (``lme4::glmer``)
-are a different estimator class and are deliberately not compared here; see
-the design notes for that analysis.
+are a different estimator class and are deliberately not compared here: a
+penalized fixed-effects fit and an integrated-likelihood random-effects fit
+have no agreement to require.
 """
 
 from __future__ import annotations

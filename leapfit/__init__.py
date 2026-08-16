@@ -3,8 +3,11 @@
 The implementations are grounded in and adapted from LearnSphere's reference
 components, validated against LearnSphere's own output where that output
 exists, so a baseline column in a paper is something you can inspect rather
-than something you downloaded. Provenance, deliberate divergences, and the
-validation record live in ``docs/DESIGN.md``.
+than something you downloaded. Provenance and the deliberate divergences are
+recorded where they apply — in each module's docstring — and the validation
+record is the equivalence suite itself: ``tests/test_learnsphere_equivalence.py``
+against LearnSphere workflow output, ``tests/test_r_equivalence.py`` against
+R's ``stats::glm``.
 
 **One input format.** Every model here reads the same six columns of a DataShop
 student-step export — ``Anon Student Id``, ``Problem Name``, ``Step Name``,

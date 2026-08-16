@@ -8,13 +8,22 @@ version = "0.2.0"
 description = "LearnSphere-grounded student models over DataShop student-step data"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Canwen Wang", email = "canwenw@andrew.cmu.edu" }]
-keywords = ["educational-data-mining", "datashop", "learnsphere", "afm", "student-modeling"]
+keywords = ["educational-data-mining", "datashop", "learnsphere", "afm", "pfa", "student-modeling"]
+# Python versions listed are the ones CI runs the suite on, not the ones that
+# would probably work.
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Education",
 ]
 
 # Deliberately minimal. Everything here is used by the core fitter; anything
@@ -35,12 +44,23 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
+[project.urls]
+Homepage = "https://github.com/weiyumou/LeapFit"
+Repository = "https://github.com/weiyumou/LeapFit"
+Issues = "https://github.com/weiyumou/LeapFit/issues"
+
 [project.scripts]
 leapfit-afm = "leapfit.cli:main"
 leapfit-pfa = "leapfit.cli:main_pfa"
 
 [tool.hatch.build.targets.wheel]
 packages = ["leapfit"]
+
+# hatchling honours VCS ignores, and this repo inherits a research-workspace
+# `.gitignore` that drops all `*.md`. README survives only because it is the
+# declared readme; the changelog has to be named or the sdist ships without it.
+[tool.hatch.build.targets.sdist]
+artifacts = ["CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
