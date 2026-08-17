@@ -19,16 +19,16 @@ Factors Analysis (PFA)**; Bayesian Knowledge Tracing (BKT) is on the
 
 ```bash
 # Not on PyPI — install from a release tag:
-uv pip install "git+https://github.com/weiyumou/LeapFit@v0.2.0"
+uv pip install "git+https://github.com/weiyumou/LeapFit@v0.3.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 118 pass in ~25s; equivalence extras skip without R / artifacts
+uv run pytest          # 120 pass in ~25s; equivalence extras skip without R / artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
-`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.2.0"` in its
+`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.3.0"` in its
 `dependencies` or in an extra. Two consequences worth knowing before you do:
 PyPI refuses distributions whose metadata carries a direct URL, so a package
 that is itself published to PyPI cannot declare leapfit this way even in an

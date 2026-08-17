@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "leapfit"
-version = "0.2.0"
+version = "0.3.0"
 description = "LearnSphere-grounded student models over DataShop student-step data"
 readme = "README.md"
 requires-python = ">=3.11"
