@@ -36,6 +36,7 @@ from leapfit import (
     make_folds,
     paired_contrasts,
     paired_cross_validate,
+    repeated_cross_validate,
 )
 from leapfit.fit import _expit, _gradient, _objective
 
@@ -503,6 +504,41 @@ def test_the_two_conventions_give_different_numbers():
     # Jensen: sqrt is concave, so the mean of fold RMSEs sits at or below the
     # RMSE of the pooled residuals whenever the folds are equally sized.
     assert abs(per_fold.rmse - pooled.rmse) < 0.05, "same quantity, different estimator"
+
+
+@pytest.mark.parametrize("convention", ["per_fold", "pooled"])
+def test_worker_count_does_not_move_a_single_digit(convention):
+    """``n_jobs`` is a wall-clock knob, not a modelling one.
+
+    Partitions are drawn in the parent before any fit starts and results are
+    collected in submission order, so the only thing a second process can
+    change is how long the answer takes. Asserting on the repr rather than
+    ``approx`` is deliberate: 'close enough' is the failure mode this guards
+    against, since KC-model comparisons are decided in the fourth decimal.
+    """
+    data = _synthetic(n_students=14, n_kcs=4, n_items=20, seed=44, n_reps=5)
+    design = build_afm_design(data)
+    kw = {"scheme": "item_blocked", "n_folds": 3, "convention": convention,
+          "method": "L-BFGS-B"}
+
+    one = cross_validate(design, data, seed=7, n_jobs=1, **kw)
+    two = cross_validate(design, data, seed=7, n_jobs=2, **kw)
+    assert one == two, "the whole CVResult, per-fold detail included"
+    assert repr(one.rmse) == repr(two.rmse)
+
+    seeds = (0, 1, 2)
+    pd.testing.assert_frame_equal(
+        repeated_cross_validate(design, data, seeds=seeds, n_jobs=1, **kw),
+        repeated_cross_validate(design, data, seeds=seeds, n_jobs=2, **kw),
+        check_exact=True,
+    )
+
+    models = {"afm": design, "compat": build_afm_design(data, learnsphere_compat=True)}
+    pd.testing.assert_frame_equal(
+        paired_cross_validate(models, data, seeds=seeds, n_jobs=1, **kw),
+        paired_cross_validate(models, data, seeds=seeds, n_jobs=2, **kw),
+        check_exact=True,
+    )
 
 
 def test_item_blocked_cv_reports_unseen_columns():

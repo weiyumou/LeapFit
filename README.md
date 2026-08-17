@@ -132,7 +132,10 @@ producing compatible files from your own data.
 - **Reproducible cross-validation.** Unstratified, response-stratified,
   student-blocked, and item-blocked schemes; both per-fold and pooled RMSE
   conventions; seeded repeats; and `paired_cross_validate` to score several KC
-  models on identical folds for a properly paired comparison.
+  models on identical folds for a properly paired comparison. Pass `n_jobs`
+  (or `leapfit-afm ... -j -1`) to fit the folds across cores: partitions are
+  drawn before any fit starts and results are collected in order, so the
+  numbers are identical to a single-process run.
 - **Student-step in, student-step out.** `fit.annotate(data)` — or
   `leapfit-afm ... --predictions out.txt` — returns your input file unchanged
   except for one appended `Predicted Error Rate (<model>)` column per fitted KC

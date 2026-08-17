@@ -26,10 +26,21 @@ mechanism by which a fine-grained KC model can post a *worse* item-blocked
 RMSE than ``Single-KC`` despite fitting the training data better. We report
 the affected fraction per fold as :attr:`FoldResult.unseen_column_fraction`
 rather than leaving it invisible.
+
+Every entry point here takes ``n_jobs``. Fold fits are independent — a fold is
+a solve over its own row subset and shares nothing with its neighbours — so
+they spread over processes with no coordination. What does *not* move is the
+randomness: partitions are drawn in the parent from the same seeded generator
+and results are collected in submission order, so ``n_jobs=8`` returns bitwise
+what ``n_jobs=1`` returns. Parallelism buys wall clock and changes no number,
+which is the only form of it worth having in a package whose whole point is
+that a reported RMSE can be reproduced.
 """
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -145,71 +156,160 @@ def make_folds(data: StepData, scheme: str, n_folds: int,
     raise AssertionError(scheme)  # unreachable
 
 
+def _checked_folds(data: StepData, scheme: str, n_folds: int, seed: int | None,
+                   convention: str) -> list[np.ndarray]:
+    """:func:`make_folds`, refusing a partition that cannot be scored."""
+    folds = make_folds(data, scheme, n_folds, seed, convention)
+    for f, test_idx in enumerate(folds):
+        n_train = len(data) - len(test_idx)
+        if n_train == 0 or len(test_idx) == 0:
+            raise ValueError(
+                f"Fold {f} is degenerate: {n_train} train / {len(test_idx)} test")
+    return folds
+
+
+# --------------------------------------------------------------------------
+# Running the fold fits, optionally across processes
+#
+# Only the designs and the responses cross into a worker, and they cross once
+# per worker rather than once per fold: they go through the pool initializer
+# and land in ``_WORKER``, and a job is then just ``(model, seed, fold,
+# held-out row indices)``. That matters because ``StepData`` can carry a
+# 45 MB source table it does not need on the other side, and because a design
+# for a 42,000-row course pickles to a couple of megabytes that would
+# otherwise be resent for every fold of every seed.
+# --------------------------------------------------------------------------
+
+_SOLE = "model"  # the model name used when there is only one design
+_WORKER: dict = {}
+
+
+def _init_worker(models: dict[str, Design], y: np.ndarray, method: str,
+                 max_fun: int | None) -> None:
+    _WORKER.update(models=models, y=y, method=method, max_fun=max_fun)
+
+
+def _score_fold(job: tuple) -> dict:
+    """Fit one training split and score its held-out rows. Runs in a worker."""
+    name, _seed, _fold, test_idx = job
+    design, y = _WORKER["models"][name], _WORKER["y"]
+    train_idx = np.setdiff1d(np.arange(design.n_obs), test_idx, assume_unique=False)
+
+    train_design, test_design = design.take(train_idx), design.take(test_idx)
+    fit = fit_logistic(train_design, y[train_idx], method=_WORKER["method"],
+                       max_fun=_WORKER["max_fun"], warn_not_converged=False,
+                       warn_separated=False)
+    resid = y[test_idx] - fit.predict_proba(test_design)
+
+    trained = np.asarray((train_design.matrix != 0).sum(axis=0)).ravel() > 0
+    touches_unseen = np.asarray(
+        (test_design.matrix[:, ~trained] != 0).sum(axis=1)
+    ).ravel() > 0
+
+    return {
+        "n_train": len(train_idx), "n_test": len(test_idx),
+        "resid": resid,
+        "rmse": float(np.sqrt(np.mean(resid ** 2))),
+        "sse": float(np.sum(resid ** 2)),
+        "unseen_column_fraction": float(touches_unseen.mean()),
+        "converged": bool(fit.converged),
+        "is_optimal": bool(fit.is_optimal),
+    }
+
+
+def _worker_count(n_jobs: int | None, n_tasks: int) -> int:
+    """joblib's convention: ``-1`` is every core, ``-2`` all but one."""
+    if n_jobs is None or n_jobs == 0:
+        return 1
+    if n_jobs < 0:
+        n_jobs = (os.cpu_count() or 1) + 1 + n_jobs
+    return max(1, min(n_jobs, n_tasks))
+
+
+def _run_folds(jobs: list[tuple], models: dict[str, Design], y: np.ndarray,
+               method: str, max_fun: int | None, n_jobs: int | None) -> list[dict]:
+    """Score every job, in submission order whatever the worker count."""
+    workers = _worker_count(n_jobs, len(jobs))
+    if workers == 1:
+        try:
+            _init_worker(models, y, method, max_fun)
+            return [_score_fold(job) for job in jobs]
+        finally:
+            _WORKER.clear()  # don't pin the designs in the caller's process
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
+                             initargs=(models, y, method, max_fun)) as pool:
+        return list(pool.map(_score_fold, jobs))
+
+
+def _combine(scored: list[dict], convention: str) -> float:
+    if convention == "per_fold":
+        return float(np.mean([s["rmse"] for s in scored]))
+    resid = np.concatenate([s["resid"] for s in scored])
+    return float(np.sqrt(np.mean(resid ** 2)))
+
+
 def cross_validate(design: Design, data: StepData, *, scheme: str = "item_blocked",
                    n_folds: int = 3, seed: int | None = None,
                    convention: str = "per_fold", method: str = DEFAULT_METHOD,
-                   max_fun: int | None = None) -> CVResult:
-    """Refit the design on each training split and score the held-out rows."""
+                   max_fun: int | None = None, n_jobs: int | None = 1) -> CVResult:
+    """Refit the design on each training split and score the held-out rows.
+
+    :param n_jobs: worker processes to fit folds in, ``-1`` for every core.
+        The result does not depend on it.
+    """
     if convention not in CONVENTIONS:
         raise ValueError(f"convention must be one of {CONVENTIONS}, got {convention!r}")
 
     y = np.asarray(data.y, dtype=float)
-    test_folds = make_folds(data, scheme, n_folds, seed, convention)
-    all_rows = np.arange(len(data))
+    test_folds = _checked_folds(data, scheme, n_folds, seed, convention)
+    jobs = [(_SOLE, seed, f, idx) for f, idx in enumerate(test_folds)]
+    scored = _run_folds(jobs, {_SOLE: design}, y, method, max_fun, n_jobs)
 
-    results, pooled_true, pooled_pred = [], [], []
-    for f, test_idx in enumerate(test_folds):
-        train_idx = np.setdiff1d(all_rows, test_idx, assume_unique=False)
-        if len(train_idx) == 0 or len(test_idx) == 0:
-            raise ValueError(f"Fold {f} is degenerate: {len(train_idx)} train / {len(test_idx)} test")
-
-        train_design, test_design = design.take(train_idx), design.take(test_idx)
-        fit = fit_logistic(train_design, y[train_idx], method=method,
-                      max_fun=max_fun, warn_not_converged=False,
-                      warn_separated=False)
-        pred = fit.predict_proba(test_design)
-
-        trained = np.asarray((train_design.matrix != 0).sum(axis=0)).ravel() > 0
-        touches_unseen = np.asarray(
-            (test_design.matrix[:, ~trained] != 0).sum(axis=1)
-        ).ravel() > 0
-
-        results.append(FoldResult(
-            fold=f, n_train=len(train_idx), n_test=len(test_idx),
-            rmse=float(np.sqrt(np.mean((y[test_idx] - pred) ** 2))),
-            unseen_column_fraction=float(touches_unseen.mean()),
-            converged=fit.converged,
-        ))
-        pooled_true.append(y[test_idx])
-        pooled_pred.append(pred)
-
-    if convention == "per_fold":
-        rmse = float(np.mean([r.rmse for r in results]))
-    else:
-        resid = np.concatenate(pooled_true) - np.concatenate(pooled_pred)
-        rmse = float(np.sqrt(np.mean(resid ** 2)))
-
+    results = tuple(
+        FoldResult(fold=f, n_train=s["n_train"], n_test=s["n_test"],
+                   rmse=s["rmse"], unseen_column_fraction=s["unseen_column_fraction"],
+                   converged=s["converged"])
+        for f, s in enumerate(scored)
+    )
     return CVResult(scheme=scheme, convention=convention, n_folds=n_folds,
-                    seed=seed, rmse=rmse, folds=tuple(results))
+                    seed=seed, rmse=_combine(scored, convention), folds=results)
 
 
 def repeated_cross_validate(design: Design, data: StepData, *, seeds,
-                            **kwargs) -> pd.DataFrame:
+                            scheme: str = "item_blocked", n_folds: int = 3,
+                            convention: str = "per_fold",
+                            method: str = DEFAULT_METHOD,
+                            max_fun: int | None = None,
+                            n_jobs: int | None = 1) -> pd.DataFrame:
     """Repeat CV over seeds, as published KC-model comparisons commonly do.
 
     Returns one row per seed. Note that averaging these and running a t-test
     over them treats non-independent resamples as independent; the spread is
     a description of partition sensitivity, not a standard error.
+
+    Every (seed, fold) pair is one job in a single pool, rather than one pool
+    per seed: a 50-seed 3-fold protocol is 150 independent fits, and cutting it
+    at the seed boundary would idle every core past the third.
     """
-    rows = []
+    seeds = list(seeds)
+    y = np.asarray(data.y, dtype=float)
+
+    jobs, widths = [], []
     for seed in seeds:
-        result = cross_validate(design, data, seed=seed, **kwargs)
+        folds = _checked_folds(data, scheme, n_folds, seed, convention)
+        widths.append(len(folds))
+        jobs += [(_SOLE, seed, f, idx) for f, idx in enumerate(folds)]
+    scored = _run_folds(jobs, {_SOLE: design}, y, method, max_fun, n_jobs)
+
+    rows, start = [], 0
+    for seed, width in zip(seeds, widths):
+        chunk, start = scored[start:start + width], start + width
         rows.append({
-            "seed": seed, "scheme": result.scheme, "convention": result.convention,
-            "rmse": result.rmse,
+            "seed": seed, "scheme": scheme, "convention": convention,
+            "rmse": _combine(chunk, convention),
             "unseen_column_fraction": float(np.mean(
-                [f.unseen_column_fraction for f in result.folds])),
-            "all_converged": all(f.converged for f in result.folds),
+                [s["unseen_column_fraction"] for s in chunk])),
+            "all_converged": all(s["converged"] for s in chunk),
         })
     return pd.DataFrame(rows)
 
@@ -218,7 +318,8 @@ def paired_cross_validate(models: dict[str, Design], data: StepData, *,
                           scheme: str = "item_blocked", n_folds: int = 3,
                           seeds=(0,), convention: str = "pooled",
                           method: str = DEFAULT_METHOD,
-                          max_fun: int | None = None) -> pd.DataFrame:
+                          max_fun: int | None = None,
+                          n_jobs: int | None = 1) -> pd.DataFrame:
     """Score several designs on **identical** folds, for paired comparison.
 
     Every KC model built from one export covers the same rows, so seed ``s``
@@ -236,6 +337,10 @@ def paired_cross_validate(models: dict[str, Design], data: StepData, *,
 
     Returns one row per (seed, fold, model). Pivot on ``model`` and difference
     the columns to get the paired contrasts.
+
+    ``n_jobs`` spreads those (seed, fold, model) fits over processes; every
+    design is shipped to each worker once, so adding models to the comparison
+    costs fits, not transfers.
     """
     sizes = {name: d.n_obs for name, d in models.items()}
     if len(set(sizes.values())) > 1:
@@ -247,25 +352,19 @@ def paired_cross_validate(models: dict[str, Design], data: StepData, *,
         raise ValueError(f"Designs have {next(iter(sizes.values()))} rows, data has {len(data)}")
 
     y = np.asarray(data.y, dtype=float)
-    all_rows = np.arange(len(data))
-    records = []
 
+    jobs = []
     for seed in seeds:
-        for f, test_idx in enumerate(make_folds(data, scheme, n_folds, seed, convention)):
-            train_idx = np.setdiff1d(all_rows, test_idx)
-            for name, design in models.items():
-                fit = fit_logistic(design.take(train_idx), y[train_idx], method=method,
-                              max_fun=max_fun, warn_not_converged=False,
-                              warn_separated=False)
-                pred = fit.predict_proba(design.take(test_idx))
-                records.append({
-                    "seed": seed, "fold": f, "model": name,
-                    "n_test": len(test_idx),
-                    "rmse": float(np.sqrt(np.mean((y[test_idx] - pred) ** 2))),
-                    "sse": float(np.sum((y[test_idx] - pred) ** 2)),
-                    "is_optimal": fit.is_optimal,
-                })
-    return pd.DataFrame(records)
+        for f, test_idx in enumerate(
+                _checked_folds(data, scheme, n_folds, seed, convention)):
+            jobs += [(name, seed, f, test_idx) for name in models]
+    scored = _run_folds(jobs, models, y, method, max_fun, n_jobs)
+
+    return pd.DataFrame([
+        {"seed": seed, "fold": f, "model": name, "n_test": s["n_test"],
+         "rmse": s["rmse"], "sse": s["sse"], "is_optimal": s["is_optimal"]}
+        for (name, seed, f, _), s in zip(jobs, scored)
+    ])
 
 
 def paired_contrasts(folds: pd.DataFrame, baseline: str) -> pd.DataFrame:

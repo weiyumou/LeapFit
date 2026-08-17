@@ -32,6 +32,11 @@ With ``--seeds`` the CV is repeated over each seed and the table reports the
 mean and standard deviation. The standard deviation describes how much the
 score moves with the fold partition; it is *not* a standard error, and a
 t-test across these repeats treats non-independent resamples as independent.
+
+That is also where the time goes — a 50-seed 3-fold protocol is 150 fits per
+KC model per scheme — so ``-j`` spreads those fits across cores. The fits are
+independent and the partitions are drawn before any of them start, so ``-j -1``
+produces the same table as ``-j 1``, sooner.
 """
 
 from __future__ import annotations
@@ -93,6 +98,11 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
     p.add_argument("--max-fun", type=int, default=None,
                    help="function-evaluation budget; default = solver default, "
                         "which is what published fits effectively used")
+    p.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                   help="worker processes for the cross-validation fits "
+                        "(-1 = every core). Folds are drawn in the parent and "
+                        "collected in order, so this changes the wall clock and "
+                        "not the numbers.")
     if family == "afm":
         p.add_argument("--learnsphere-compat", action="store_true",
                        help="reproduce the published baseline: student ridge 1.0, no "
@@ -202,7 +212,7 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
                 continue
             cv_kwargs = {"scheme": scheme, "n_folds": args.folds,
                          "convention": args.convention, "method": args.method,
-                         "max_fun": args.max_fun}
+                         "max_fun": args.max_fun, "n_jobs": args.jobs}
             s = suffix(scheme)
             if seeds:
                 table = repeated_cross_validate(design, data, seeds=seeds, **cv_kwargs)

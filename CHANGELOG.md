@@ -3,6 +3,31 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## Unreleased
+
+### Added
+
+- **Parallel cross-validation.** `cross_validate`, `repeated_cross_validate`
+  and `paired_cross_validate` take `n_jobs` (joblib's convention: `-1` is every
+  core), and the CLI takes `-j/--jobs`. Fold fits are independent, so they run
+  in a process pool; the designs and responses cross to each worker once
+  through the pool initializer rather than once per fold, and `StepData` — with
+  its source table — never crosses at all. Measured on E-learning-22, a 50-seed
+  3-fold protocol goes from 54 s to 12 s (`LOs-MCQ`) and 104 s to 17 s
+  (`Unique-step-MCQ`) on 12 cores.
+
+  Partitions are drawn in the parent before any fit starts and results are
+  collected in submission order, so the worker count is a wall-clock knob only:
+  `n_jobs=-1` returns bitwise what `n_jobs=1` returns, asserted in
+  `test_worker_count_does_not_move_a_single_digit`.
+
+### Changed
+
+- `repeated_cross_validate` takes its cross-validation arguments explicitly
+  instead of forwarding `**kwargs` to `cross_validate`, so that all
+  (seed, fold) pairs can be dispatched as one pool rather than one pool per
+  seed. Keyword callers are unaffected; the accepted names are unchanged.
+
 ## 0.2.0 — 2026-08-16
 
 First tagged release. 0.1.0 existed only as a version string in the working
