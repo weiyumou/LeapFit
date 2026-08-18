@@ -48,6 +48,7 @@ from leapfit.crossval import (
     make_folds,
     paired_contrasts,
     paired_cross_validate,
+    paired_scores,
     repeated_cross_validate,
 )
 from leapfit.data import (
@@ -103,6 +104,7 @@ __all__ = [
     "make_folds",
     "paired_contrasts",
     "paired_cross_validate",
+    "paired_scores",
     "repeated_cross_validate",
     "success_failure_counts",
 ]

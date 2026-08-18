@@ -28,10 +28,27 @@ held-out score to name.
 
 ``python -m leapfit.cli ...`` is ``leapfit-afm`` from a source checkout.
 
+When several KC models are fitted and cover the same rows — the usual case,
+since every model comes from one export — the comparison is **paired**: folds
+are drawn once per scheme and seed and every model is scored on those
+identical partitions. The ``cv_rmse`` columns are then comparable by
+construction, and a contrasts table reports each model's within-fold RMSE
+difference against a baseline (the best-scoring model unless ``--baseline``
+names one; negative ``mean_diff`` = beats the baseline). That within-fold
+difference is the statistically sound comparison: differencing with the fold
+held fixed removes the partition from the between-model variance entirely,
+where t-testing two independently repeated CV means treats non-independent
+resamples as independent. Models that cover *different* rows (steps mapped in
+one model but not another) cannot share folds; the run says so and falls back
+to independent per-model CV. ``--no-paired`` forces that fallback — which is
+also the only route to the deterministic ``LabelKFold`` partition (``per_fold``
+convention without ``--seeds``) that reproduces PyAFM literally.
+
 With ``--seeds`` the CV is repeated over each seed and the table reports the
 mean and standard deviation. The standard deviation describes how much the
 score moves with the fold partition; it is *not* a standard error, and a
 t-test across these repeats treats non-independent resamples as independent.
+Paired runs without ``--seeds`` use seed 0, since shared folds must be seeded.
 
 That is also where the time goes — a 50-seed 3-fold protocol is 150 fits per
 KC model per scheme — so ``-j`` spreads those fits across cores. The fits are
@@ -55,8 +72,11 @@ from leapfit import (
     cross_validate,
     fit_afm,
     fit_pfa,
+    from_frame,
     list_kc_models,
-    load_student_step,
+    paired_contrasts,
+    paired_cross_validate,
+    paired_scores,
     repeated_cross_validate,
 )
 
@@ -92,7 +112,19 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--seeds", metavar="LO:HI|a,b,c",
                    help="repeat CV over these seeds (e.g. '0:50' for a "
-                        "50-seed protocol)")
+                        "50-seed protocol). Paired CV defaults to seed 0, "
+                        "since shared folds must be seeded.")
+    p.add_argument("--no-paired", action="store_true",
+                   help="draw folds independently per KC model instead of "
+                        "sharing them across models. Shared folds are the "
+                        "default whenever every fitted model covers the same "
+                        "rows; independent folds are the pre-0.4 protocol and "
+                        "the only route to the deterministic LabelKFold "
+                        "partition (per_fold convention without --seeds).")
+    p.add_argument("--baseline", metavar="NAME",
+                   help="KC model to contrast the others against in paired CV "
+                        "(default: the model with the best mean cv_rmse per "
+                        "scheme)")
     p.add_argument("--method", default="TNC",
                    help="TNC reproduces LearnSphere; L-BFGS-B converges tighter")
     p.add_argument("--max-fun", type=int, default=None,
@@ -122,11 +154,15 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
                             "which put each response inside its own predictor. "
                             "For demonstrating that defect only.")
     p.add_argument("--out", help="write the table to this CSV")
+    p.add_argument("--contrasts", metavar="FILE",
+                   help="write the paired contrasts (per-model RMSE difference "
+                        "against the baseline, paired by fold) to this CSV")
     p.add_argument("--cv-folds", metavar="FILE",
-                   help="write the per-seed cross-validation detail to this CSV — "
-                        "one row per KC model, scheme and seed (per fold when no "
-                        "--seeds), so a reported mean can be traced to the runs "
-                        "behind it")
+                   help="write the cross-validation detail behind the means to "
+                        "this CSV — one row per KC model, scheme, seed and fold "
+                        "for paired CV (per seed for independent repeated CV; "
+                        "per fold for a single run), so a reported mean can be "
+                        "traced to the runs behind it")
     p.add_argument("--identification", metavar="FILE",
                    help="write every aliased column and the reason it was dropped "
                         "to this CSV: what the parameter count excludes, and why")
@@ -157,6 +193,119 @@ def _build_and_fit(args, family: str, data, method: str, max_fun):
     return design, fit
 
 
+def _shared_rows(fitted: list) -> bool:
+    """Whether every fitted model covers exactly the same export rows.
+
+    Equal row *counts* are not enough: two KC models can each drop a different
+    set of unmapped steps and land on the same total. ``source_rows`` is the
+    position of each observation in the export, so equality there is equality
+    of coverage (and of ``y``, row for row).
+    """
+    ref = fitted[0].data.source_rows
+    return all(np.array_equal(entry.data.source_rows, ref) for entry in fitted[1:])
+
+
+class _Fitted:
+    """One KC model's artifacts, carried from the fit pass to the CV pass."""
+
+    def __init__(self, name, data, design, fit, row):
+        self.name, self.data, self.design, self.fit, self.row = \
+            name, data, design, fit, row
+
+
+def _independent_cv(args, fitted: list, schemes: list[str], seeds, suffix,
+                    fold_rows: list) -> None:
+    """The pre-paired protocol: each model scored on its own folds."""
+    print("\n=== cross-validation: independent folds per model ===", file=sys.stderr)
+    for entry in fitted:
+        for scheme in schemes:
+            cv_kwargs = {"scheme": scheme, "n_folds": args.folds,
+                         "convention": args.convention, "method": args.method,
+                         "max_fun": args.max_fun, "n_jobs": args.jobs}
+            s = suffix(scheme)
+            if seeds:
+                table = repeated_cross_validate(entry.design, entry.data,
+                                                seeds=seeds, **cv_kwargs)
+                entry.row |= {
+                    f"cv_rmse{s}": table["rmse"].mean(),
+                    f"cv_rmse_sd{s}": table["rmse"].std(ddof=1),
+                    f"cv_runs{s}": len(table),
+                    f"cv_unseen_fraction{s}": table["unseen_column_fraction"].mean(),
+                    f"cv_all_converged{s}": bool(table["all_converged"].all()),
+                }
+                detail = table
+                print(f"  {entry.name}: {scheme} / {args.convention} over "
+                      f"{len(table)} seeds: RMSE = {entry.row[f'cv_rmse{s}']:.4f} "
+                      f"({entry.row[f'cv_rmse_sd{s}']:.4f})", file=sys.stderr)
+            else:
+                result = cross_validate(entry.design, entry.data, seed=None,
+                                        **cv_kwargs)
+                entry.row |= {
+                    f"cv_rmse{s}": result.rmse,
+                    f"cv_rmse_sd{s}": np.nan,
+                    f"cv_runs{s}": 1,
+                    f"cv_unseen_fraction{s}": float(np.mean(
+                        [f.unseen_column_fraction for f in result.folds])),
+                    f"cv_all_converged{s}": all(f.converged for f in result.folds),
+                }
+                detail = result.frame
+                print(f"  {entry.name}: {result.summary()}", file=sys.stderr)
+
+            if args.cv_folds:
+                detail = detail.copy()
+                if "scheme" not in detail:
+                    detail.insert(0, "scheme", scheme)
+                detail.insert(0, "kc_model", entry.name)
+                fold_rows.append(detail)
+
+
+def _paired_cv(args, fitted: list, schemes: list[str], seeds, suffix,
+               fold_rows: list, contrast_rows: list) -> None:
+    """Shared folds across all models; scores and contrasts from one set of fits."""
+    seeds = seeds or [0]
+    models = {entry.name: entry.design for entry in fitted}
+    data = fitted[0].data
+    print(f"\n=== cross-validation: paired, folds shared by all {len(models)} "
+          f"models ({len(seeds)} seed(s); --no-paired for the independent "
+          "protocol) ===", file=sys.stderr)
+
+    for scheme in schemes:
+        folds = paired_cross_validate(
+            models, data, scheme=scheme, n_folds=args.folds, seeds=tuple(seeds),
+            convention=args.convention, method=args.method,
+            max_fun=args.max_fun, n_jobs=args.jobs)
+        scores = paired_scores(folds, args.convention)
+        s = suffix(scheme)
+
+        print(f"  {scheme} / {args.convention} / {args.folds} folds:", file=sys.stderr)
+        for entry in fitted:
+            sc = scores[scores["model"] == entry.name]
+            entry.row |= {
+                f"cv_rmse{s}": float(sc["rmse"].mean()),
+                f"cv_rmse_sd{s}": float(sc["rmse"].std(ddof=1)),
+                f"cv_runs{s}": len(sc),
+                f"cv_unseen_fraction{s}": float(sc["unseen_column_fraction"].mean()),
+                f"cv_all_converged{s}": bool(sc["all_converged"].all()),
+            }
+            print(f"    {entry.name}: RMSE = {entry.row[f'cv_rmse{s}']:.4f}"
+                  f" | {entry.row[f'cv_unseen_fraction{s}']:.1%} of held-out "
+                  "rows hit an unseen column", file=sys.stderr)
+
+        baseline = args.baseline or scores.groupby("model")["rmse"].mean().idxmin()
+        contrasts = paired_contrasts(folds, baseline=baseline)
+        contrasts.insert(0, "scheme", scheme)
+        contrast_rows.append(contrasts)
+        for c in contrasts.itertuples():
+            print(f"    {c.model} vs {baseline}: {c.mean_diff:+.6f} "
+                  f"(better in {c.folds_better}/{c.n_folds} folds)", file=sys.stderr)
+
+        if args.cv_folds:
+            fold_rows.append(
+                folds.rename(columns={"model": "kc_model"}).assign(scheme=scheme)[
+                    ["kc_model", "scheme", "seed", "fold", "n_test", "rmse", "sse",
+                     "unseen_column_fraction", "converged", "is_optimal"]])
+
+
 def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
     args = build_parser(family).parse_args(argv)
 
@@ -172,6 +321,10 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
     if unknown := [m for m in wanted if m not in available]:
         print(f"Unknown KC model(s) {unknown}. Available: {available}", file=sys.stderr)
         return 1
+    if args.baseline and args.baseline not in wanted:
+        print(f"--baseline {args.baseline!r} is not among the fitted KC models "
+              f"{wanted}", file=sys.stderr)
+        return 1
 
     schemes = args.cv_schemes or ["item_blocked"]
     if "none" in schemes and len(schemes) > 1:
@@ -183,11 +336,14 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
     suffix = (lambda s: "") if len(schemes) == 1 else (lambda s: f"_{s}")
 
     seeds = parse_seeds(args.seeds)
-    rows, fold_rows, alias_rows = [], [], []
+    rows, fold_rows, alias_rows, contrast_rows = [], [], [], []
     annotated = None  # the input table, gaining one prediction column per model
 
+    # ---- fit every model once; CV needs them all before it can share folds ----
+    export = pd.read_csv(args.export, sep="\t", dtype=str, keep_default_na=False)
+    fitted: list[_Fitted] = []
     for name in wanted:
-        data = load_student_step(args.export, kc_model=name)
+        data = from_frame(export, kc_model=name)
         print(f"\n=== {name} ===\n{data.summary()}", file=sys.stderr)
 
         design, fit = _build_and_fit(args, family, data, args.method, args.max_fun)
@@ -206,53 +362,13 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
             "bic": fit.bic,
             "is_optimal": fit.is_optimal,
         }
-
-        for scheme in schemes:
-            if scheme == "none":
-                continue
-            cv_kwargs = {"scheme": scheme, "n_folds": args.folds,
-                         "convention": args.convention, "method": args.method,
-                         "max_fun": args.max_fun, "n_jobs": args.jobs}
-            s = suffix(scheme)
-            if seeds:
-                table = repeated_cross_validate(design, data, seeds=seeds, **cv_kwargs)
-                row |= {
-                    f"cv_rmse{s}": table["rmse"].mean(),
-                    f"cv_rmse_sd{s}": table["rmse"].std(ddof=1),
-                    f"cv_runs{s}": len(table),
-                    f"cv_unseen_fraction{s}": table["unseen_column_fraction"].mean(),
-                    f"cv_all_converged{s}": bool(table["all_converged"].all()),
-                }
-                detail = table
-                print(f"  {scheme} / {args.convention} over {len(table)} seeds: "
-                      f"RMSE = {row[f'cv_rmse{s}']:.4f} "
-                      f"({row[f'cv_rmse_sd{s}']:.4f})", file=sys.stderr)
-            else:
-                result = cross_validate(design, data, seed=None, **cv_kwargs)
-                row |= {
-                    f"cv_rmse{s}": result.rmse,
-                    f"cv_rmse_sd{s}": np.nan,
-                    f"cv_runs{s}": 1,
-                    f"cv_unseen_fraction{s}": float(np.mean(
-                        [f.unseen_column_fraction for f in result.folds])),
-                    f"cv_all_converged{s}": all(f.converged for f in result.folds),
-                }
-                detail = result.frame
-                print(f"  {result.summary()}", file=sys.stderr)
-
-            if args.cv_folds:
-                detail = detail.copy()
-                if "scheme" not in detail:
-                    detail.insert(0, "scheme", scheme)
-                detail.insert(0, "kc_model", name)
-                fold_rows.append(detail)
+        rows.append(row)
+        fitted.append(_Fitted(name, data, design, fit, row))
 
         if args.identification:
             alias_rows += [{"kc_model": name, "column": column, "reason": reason}
                            for column, reason in zip(design.aliased.columns,
                                                      design.aliased.reasons)]
-
-        rows.append(row)
 
         if args.predictions:
             annotated = fit.annotate(data, into=annotated)
@@ -265,12 +381,41 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
             fit.kc_values(data).to_csv(path, index=False)
             print(f"  KC parameters -> {path}", file=sys.stderr)
 
+    # ---- cross-validation: paired when the models can share folds ----
+    cv_schemes = [s for s in schemes if s != "none"]
+    if cv_schemes:
+        paired = len(fitted) >= 2 and not args.no_paired
+        if paired and not _shared_rows(fitted):
+            paired = False
+            coverage = {entry.name: len(entry.data) for entry in fitted}
+            print("\nKC models cover different rows of the export (a step with "
+                  f"no KC label is dropped for that model): {coverage}. Shared "
+                  "folds are impossible, so falling back to independent "
+                  "per-model CV; no paired contrasts.", file=sys.stderr)
+        if paired:
+            _paired_cv(args, fitted, cv_schemes, seeds, suffix,
+                       fold_rows, contrast_rows)
+        else:
+            _independent_cv(args, fitted, cv_schemes, seeds, suffix, fold_rows)
+
     table = pd.DataFrame(rows)
     print()
     print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    if contrast_rows:
+        contrasts = pd.concat(contrast_rows, ignore_index=True)
+        print("\npaired contrasts, within-fold (negative mean_diff = model "
+              "beats baseline):")
+        print(contrasts.to_string(index=False, float_format=lambda v: f"{v:.6f}"))
     if args.out:
         table.to_csv(args.out, index=False)
         print(f"\nwrote {args.out}", file=sys.stderr)
+    if args.contrasts:
+        if contrast_rows:
+            contrasts.to_csv(args.contrasts, index=False)
+            print(f"wrote {args.contrasts}", file=sys.stderr)
+        else:
+            print(f"not writing {args.contrasts}: paired CV did not run, so "
+                  "there are no contrasts", file=sys.stderr)
     if args.cv_folds and fold_rows:
         pd.concat(fold_rows, ignore_index=True).to_csv(args.cv_folds, index=False)
         print(f"wrote {args.cv_folds}", file=sys.stderr)

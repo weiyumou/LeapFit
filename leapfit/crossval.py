@@ -362,9 +362,36 @@ def paired_cross_validate(models: dict[str, Design], data: StepData, *,
 
     return pd.DataFrame([
         {"seed": seed, "fold": f, "model": name, "n_test": s["n_test"],
-         "rmse": s["rmse"], "sse": s["sse"], "is_optimal": s["is_optimal"]}
+         "rmse": s["rmse"], "sse": s["sse"],
+         "unseen_column_fraction": s["unseen_column_fraction"],
+         "converged": s["converged"], "is_optimal": s["is_optimal"]}
         for (name, seed, f, _), s in zip(jobs, scored)
     ])
+
+
+def paired_scores(folds: pd.DataFrame, convention: str) -> pd.DataFrame:
+    """Per-(model, seed) RMSE from a paired table, under either convention.
+
+    A :func:`paired_cross_validate` table carries enough per fold (``rmse``,
+    ``sse``, ``n_test``) to reconstruct what :func:`repeated_cross_validate`
+    would report under either convention — from the same fits, on folds shared
+    across models rather than drawn per model. ``per_fold`` is the mean of the
+    fold RMSEs; ``pooled`` is ``sqrt(sum(sse) / sum(n_test))``, identical to
+    pooling the held-out residuals.
+
+    Returns one row per (model, seed), with the same score columns as
+    :func:`repeated_cross_validate`.
+    """
+    if convention not in CONVENTIONS:
+        raise ValueError(f"convention must be one of {CONVENTIONS}, got {convention!r}")
+    grouped = folds.groupby(["model", "seed"], sort=False)
+    rmse = (grouped["rmse"].mean() if convention == "per_fold"
+            else np.sqrt(grouped["sse"].sum() / grouped["n_test"].sum()))
+    return pd.DataFrame({
+        "rmse": rmse,
+        "unseen_column_fraction": grouped["unseen_column_fraction"].mean(),
+        "all_converged": grouped["converged"].all(),
+    }).reset_index()
 
 
 def paired_contrasts(folds: pd.DataFrame, baseline: str) -> pd.DataFrame:

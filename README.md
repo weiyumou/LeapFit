@@ -79,11 +79,23 @@ leapfit-afm examples/student-step.txt --cv student_blocked --cv item_blocked \
 kc_model  n_kcs  n_obs  n_params  n_separated  log_likelihood      aic      bic  is_optimal  cv_rmse
   Skills     12    480        35            0       -267.8217 605.6435 751.7260        True   0.4988
   Topics      4    480        19            0       -268.9846 575.9691 655.2711        True   0.4586
+
+paired contrasts, within-fold (negative mean_diff = model beats baseline):
+      scheme  model baseline  mean_diff  sd_diff  n_folds  folds_better
+item_blocked Skills   Topics   0.040176 0.024314       15             0
 ```
 *(columns abridged)*
 
 AIC, BIC, and held-out RMSE all prefer `Topics` — the planted true model — over
 the finer `Skills`. Every fitted learning rate is positive, as generated.
+
+When several KC models cover the same rows — the usual case — they are scored
+on **identical folds** and the contrasts table reports each model's held-out
+RMSE difference against the best one, *paired by fold*: here `Skills` loses to
+`Topics` on all 15 shared partitions, a far sharper statement than comparing
+two independently resampled means. `--baseline NAME` picks the reference
+model, `--contrasts FILE` writes the table, and `--no-paired` restores
+independent per-model folds.
 
 ## Input format
 
@@ -131,11 +143,14 @@ producing compatible files from your own data.
   independent of what the optimizer claims about itself.
 - **Reproducible cross-validation.** Unstratified, response-stratified,
   student-blocked, and item-blocked schemes; both per-fold and pooled RMSE
-  conventions; seeded repeats; and `paired_cross_validate` to score several KC
-  models on identical folds for a properly paired comparison. Pass `n_jobs`
-  (or `leapfit-afm ... -j -1`) to fit the folds across cores: partitions are
-  drawn before any fit starts and results are collected in order, so the
-  numbers are identical to a single-process run.
+  conventions; seeded repeats. Several KC models over the same rows are scored
+  on identical folds (`paired_cross_validate`, the CLI default), so model
+  comparison is a paired within-fold contrast (`paired_contrasts`) rather than
+  a t-test over non-independent resamples — and one paired run also yields
+  each model's per-seed scores under either convention (`paired_scores`). Pass
+  `n_jobs` (or `leapfit-afm ... -j -1`) to fit the folds across cores:
+  partitions are drawn before any fit starts and results are collected in
+  order, so the numbers are identical to a single-process run.
 - **Student-step in, student-step out.** `fit.annotate(data)` — or
   `leapfit-afm ... --predictions out.txt` — returns your input file unchanged
   except for one appended `Predicted Error Rate (<model>)` column per fitted KC

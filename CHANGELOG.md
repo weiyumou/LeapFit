@@ -3,6 +3,41 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## Unreleased
+
+### Added
+
+- **Paired model comparison is the CLI default.** When several KC models are
+  fitted and cover the same export rows, folds are now drawn once per scheme
+  and seed and every model is scored on those identical partitions. The
+  `cv_rmse` columns are then comparable by construction, and a contrasts table
+  (stdout, and `--contrasts FILE`) reports each model's within-fold RMSE
+  difference against a baseline — the best-scoring model, or `--baseline NAME`.
+  Differencing with the fold held fixed removes the partition from the
+  between-model variance, which is both sounder and more powerful than
+  t-testing two independently repeated CV means. Models covering different
+  rows fall back to independent per-model CV with an explanation; `--no-paired`
+  forces that protocol.
+- `paired_scores` aggregates a `paired_cross_validate` table to per-(model,
+  seed) scores under either RMSE convention — one paired run carries both, plus
+  everything `repeated_cross_validate` reports, asserted equal in
+  `test_paired_scores_reconstruct_repeated_cv`.
+- `paired_cross_validate` tables now carry `unseen_column_fraction` and
+  `converged` per (seed, fold, model), matching the other entry points.
+
+### Changed
+
+- With `--seeds`, reported `cv_rmse` values are unchanged: fold drawing
+  depends only on the data, so same-seed partitions were already identical
+  across models. Without `--seeds`, a multi-model run now uses seed 0 (shared
+  folds must be seeded) instead of the deterministic `LabelKFold` partition,
+  so those RMSEs move within their partition sensitivity. Single-model runs
+  and `--no-paired` keep the previous behaviour exactly, including
+  `LabelKFold` for `per_fold` without `--seeds`.
+- The CLI reads the export once and fits every KC model before
+  cross-validating (shared folds need all designs up front), so per-model CV
+  progress now prints after all fit summaries rather than interleaved.
+
 ## 0.3.0 — 2026-08-16
 
 ### Added

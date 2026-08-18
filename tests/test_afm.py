@@ -36,8 +36,10 @@ from leapfit import (
     make_folds,
     paired_contrasts,
     paired_cross_validate,
+    paired_scores,
     repeated_cross_validate,
 )
+from leapfit.crossval import CONVENTIONS
 from leapfit.fit import _expit, _gradient, _objective
 
 # --------------------------------------------------------------------------
@@ -942,6 +944,37 @@ def test_paired_cv_rejects_designs_over_different_rows():
                               a, n_folds=2)
 
 
+@pytest.mark.parametrize("convention", CONVENTIONS)
+def test_paired_scores_reconstruct_repeated_cv(convention):
+    """One paired run carries both conventions' per-seed scores exactly.
+
+    With seeded folds the partitions are the same either way, so aggregating
+    the paired table must reproduce what :func:`repeated_cross_validate`
+    reports — the claim that lets the CLI source its ``cv_rmse`` columns and
+    the contrasts from a single set of fits.
+    """
+    data = _synthetic(n_students=14, n_kcs=4, n_items=20, seed=45, n_reps=5)
+    design = build_afm_design(data)
+    seeds = (0, 1, 2)
+    kw = {"scheme": "item_blocked", "n_folds": 3, "convention": convention,
+          "method": "L-BFGS-B"}
+
+    scores = paired_scores(
+        paired_cross_validate({"m": design}, data, seeds=seeds, **kw), convention)
+    repeated = repeated_cross_validate(design, data, seeds=seeds, **kw)
+
+    assert scores["seed"].tolist() == repeated["seed"].tolist()
+    np.testing.assert_allclose(scores["rmse"], repeated["rmse"], rtol=1e-12)
+    np.testing.assert_allclose(scores["unseen_column_fraction"],
+                               repeated["unseen_column_fraction"], rtol=1e-12)
+    assert scores["all_converged"].tolist() == repeated["all_converged"].tolist()
+
+
+def test_paired_scores_reject_an_unknown_convention():
+    with pytest.raises(ValueError, match="convention"):
+        paired_scores(pd.DataFrame(), "median")
+
+
 # --------------------------------------------------------------------------
 # Portability: what the reader requires, and what it refuses
 # --------------------------------------------------------------------------
@@ -1384,6 +1417,78 @@ def test_cli_identification_writes_a_header_when_nothing_is_aliased(tmp_path):
     dropped = pd.read_csv(path)
     assert dropped.empty
     assert dropped.columns.tolist() == ["kc_model", "column", "reason"]
+
+
+def _two_model_export(tmp_path, shared_rows=True):
+    """An export carrying KC models M and M2 — identical mappings, unless
+    ``shared_rows=False`` blanks one of M2's labels so their coverage differs."""
+    df = _minimal_frame()
+    df["KC (M2)"] = df["KC (M)"]
+    df["Opportunity (M2)"] = df["Opportunity (M)"]
+    if not shared_rows:
+        df.loc[df.index[3], ["KC (M2)", "Opportunity (M2)"]] = ""
+    export = tmp_path / "export.txt"
+    df.to_csv(export, sep="\t", index=False, lineterminator="\n")
+    return export
+
+
+def test_cli_pairs_models_that_share_rows(tmp_path, capsys):
+    """Two models over the same rows: shared folds, contrasts, full detail."""
+    from leapfit.cli import main as cli_main
+    out, contrasts, folds = (tmp_path / n for n in
+                             ("table.csv", "contrasts.csv", "folds.csv"))
+    assert cli_main([str(_two_model_export(tmp_path)), "--cv", "item_blocked",
+                     "--out", str(out), "--contrasts", str(contrasts),
+                     "--cv-folds", str(folds)]) == 0
+    assert "paired, folds shared" in capsys.readouterr().err
+
+    table = pd.read_csv(out)
+    assert {"cv_rmse", "cv_rmse_sd", "cv_runs"} <= set(table.columns)
+    assert table["cv_runs"].tolist() == [1, 1], "default paired protocol: seed 0"
+
+    detail = pd.read_csv(folds)
+    assert len(detail) == 2 * 3, "two models x three folds x one seed"
+    sizes = detail.pivot_table(index=["seed", "fold"], columns="kc_model",
+                               values="n_test")
+    np.testing.assert_array_equal(sizes["M"].to_numpy(), sizes["M2"].to_numpy())
+
+    c = pd.read_csv(contrasts)
+    assert len(c) == 1 and {c["model"].iloc[0], c["baseline"].iloc[0]} == {"M", "M2"}
+    # Identical KC models fit identically, so the paired difference vanishes —
+    # which only shared folds can show exactly.
+    assert c["mean_diff"].abs().max() < 1e-12
+
+
+def test_cli_paired_baseline_can_be_named(tmp_path):
+    from leapfit.cli import main as cli_main
+    contrasts = tmp_path / "contrasts.csv"
+    assert cli_main([str(_two_model_export(tmp_path)), "--cv", "item_blocked",
+                     "--baseline", "M2", "--contrasts", str(contrasts)]) == 0
+    c = pd.read_csv(contrasts)
+    assert c["baseline"].unique().tolist() == ["M2"]
+    assert cli_main([str(_two_model_export(tmp_path)),
+                     "--baseline", "nope"]) == 1
+
+
+def test_cli_falls_back_when_models_cover_different_rows(tmp_path, capsys):
+    """Equal exports, unequal coverage: paired CV is impossible, and the run
+    must say so rather than silently comparing across different splits."""
+    from leapfit.cli import main as cli_main
+    contrasts = tmp_path / "contrasts.csv"
+    assert cli_main([str(_two_model_export(tmp_path, shared_rows=False)),
+                     "--cv", "item_blocked", "--contrasts", str(contrasts)]) == 0
+    err = capsys.readouterr().err
+    assert "cover different rows" in err
+    assert not contrasts.exists(), "no paired contrasts without shared folds"
+
+
+def test_cli_no_paired_restores_independent_folds(tmp_path, capsys):
+    from leapfit.cli import main as cli_main
+    out = tmp_path / "table.csv"
+    assert cli_main([str(_two_model_export(tmp_path)), "--cv", "item_blocked",
+                     "--no-paired", "--out", str(out)]) == 0
+    assert "independent folds per model" in capsys.readouterr().err
+    assert pd.read_csv(out)["cv_rmse"].notna().all()
 
 
 # --------------------------------------------------------------------------
