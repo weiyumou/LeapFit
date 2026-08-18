@@ -32,7 +32,7 @@ Layout — shared infrastructure, then one module per model family:
     leapfit.pfa       Performance Factors Analysis
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from leapfit.afm import (
     STUDENT_L2,
