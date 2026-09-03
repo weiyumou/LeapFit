@@ -3,6 +3,91 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## 0.5.0 — 2026-09-03
+
+### Added
+
+- **Learning Factors Analysis: a search over KC models** (`leapfit/lfa.py`,
+  `leapfit-lfa`). Not another student model — the states *are* KC labellings
+  and each is scored by fitting AFM to it, so `leapfit.lfa` sits above
+  `leapfit.afm` and reuses the identification pass, the separation check and
+  the KKT certificate unchanged. `build_factor_matrix` assembles the
+  difficulty-factor matrix from KC models already on the export, `lfa_search`
+  runs greedy best-first on BIC (default) or AIC, and `LFAResult` carries the
+  trajectory, the ranked frontier, every state's optimality certificate, and
+  every refused move with its reason.
+
+  Grounded against DataShop's own LFA, whose search engine ships only as a
+  binary: leapfit reproduces the offline `lfa-6.0` tool's fit statistics to
+  **1.2e-9** under `learnsphere_compat=True`. A run of that tool is kept as a
+  fixture and `tests/test_lfa_equivalence.py` pins the agreement, the
+  parameter-count convention recovered from the reference's own output, and
+  the two defects below.
+
+- **Two screens on every candidate move**, both before any fit, so a refused
+  move costs no optimization. *Evidence*: a new KC needs
+  `min_opportunities` observations at `T >= 1`, the only rows a slope column
+  touches. *Estimability*: `Design.separated` restricted to the KCs the move
+  touched.
+
+  These are not defensive detail. On the validated export the reference
+  selected a KC model whose slope has no finite estimate, and because its
+  operator set is split-only that one move then appeared in **all 99** states
+  it reported. 34% of the 941 candidate moves at one measured node were
+  separated. Neither honest parameter counting (`n_params = rank(X)`) nor
+  bounding the slopes removes the preference — both measured, and the same
+  single-step split still ranked first of 941 — so this is a property of the
+  criterion rather than the estimator.
+
+- **Held-out validation of the shortlist** (`validate_top`, `LFAValidation`),
+  scoring the top states and any authored models on folds shared by every
+  candidate. This is the protocol the reference's own follow-up prescribes:
+  search by an information criterion because cross-validation is unaffordable
+  inside the loop, then test the best models out of sample. The interesting
+  output is the *agreement*, and on the shipped example there is none — BIC's
+  pick is third by held-out RMSE, and the planted `Topics` model is fifth of
+  six in sample and second of six held out.
+
+- **Merge operators** (`merges`: `"none"`, `"lineage"`, `"pairwise"`,
+  `"both"`), which the published method has only as a manual step. Pairwise
+  merge *enlarges the reachable set* — a KC that is the union of two factors'
+  steps is not expressible as any sequence of splits — while lineage-undo adds
+  only paths, mattering when `beam` has evicted a state.
+
+- **`root=`**, to start the search from a KC model you already have rather
+  than from the "All" model (one skill on every step, which is what an
+  export's `Single-KC` column holds). This is the published setup, and it is
+  what makes merging useful: from the All root neither merge operator changes
+  the answer, because there is nothing to coarsen, while from an authored
+  91-KC root pairwise merge finds a model **38.4 nats** of BIC better than
+  splitting alone, with the merge in the winning lineage.
+
+- **Warm starts.** `fit_logistic` and `fit_afm` take `w0` (default unchanged),
+  and `lfa_search` seeds each child from its parent. 2.2–2.9× fewer function
+  evaluations for identical optima — safe to use aggressively *because* the
+  objective is convex and `is_optimal` certifies each fit independently of
+  where it started.
+
+- **Parallel scoring.** `lfa_search` takes `n_jobs`. An eight-expansion search
+  on a 20,687-row export goes from 72.8 s to 14.7 s on eight workers, and the
+  worker count is a wall-clock knob only: `test_the_worker_count_does_not_move_a_single_digit`
+  asserts equality of every score, every refusal and the whole ranking. The
+  pool is held open for the search rather than per expansion, because shipping
+  the observations is the fixed cost (3.9 s to twelve workers) and paying it
+  per iteration erased the gain entirely.
+
+### Changed
+
+- `tests/test_package.py` gains a third tier. A search over KC models is
+  neither shared infrastructure nor a model family but a *consumer* of one, so
+  `leapfit.lfa` imports `leapfit.afm` deliberately and a new test asserts the
+  edge runs one way.
+
+### Fixed
+
+- The stated test counts in `README.md` were wrong in both places (`135 pass`,
+  `118 pass, 11 skip`). Measured on a fresh clone: 180 pass, 29 skip in ~21 s.
+
 ## 0.4.0 — 2026-08-18
 
 ### Added
