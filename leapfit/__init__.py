@@ -76,10 +76,12 @@ from leapfit.lfa import (
     FactorMatrix,
     LFAResult,
     LFAState,
+    LFAValidation,
     Move,
     Rejected,
     build_factor_matrix,
     lfa_search,
+    validate_top,
 )
 from leapfit.pfa import (
     PFAFit,
@@ -104,6 +106,7 @@ __all__ = [
     "FactorMatrix",
     "LFAResult",
     "LFAState",
+    "LFAValidation",
     "LogisticFit",
     "Move",
     "PFAFit",
@@ -130,4 +133,5 @@ __all__ = [
     "paired_scores",
     "repeated_cross_validate",
     "success_failure_counts",
+    "validate_top",
 ]

@@ -34,6 +34,7 @@ from leapfit.lfa import (
     relabel,
     replay,
     split,
+    validate_top,
 )
 from leapfit.lfa import _partition as partition
 
@@ -501,3 +502,112 @@ def test_a_state_reports_its_kc_model_as_step_to_label():
     mapping = res.best.kc_model(P.steps)
     assert set(mapping) == set(P.steps)
     assert set(mapping.values()) == set(res.best.labels)
+
+
+# --------------------------------------------------------------------------
+# Held-out validation of the top states
+# --------------------------------------------------------------------------
+
+
+def _validated(**kwargs):
+    models, P = _example_factors()
+    res = lfa_search(models["Topics"], P, max_iterations=8)
+    kwargs.setdefault("n", 4)
+    kwargs.setdefault("seeds", (0, 1, 2))
+    return models, res, validate_top(res, models["Topics"], **kwargs)
+
+
+def test_every_candidate_is_scored_on_the_same_folds():
+    """Shared folds are what make the contrast paired rather than two means."""
+    _, _, val = _validated()
+    per_fold = val.folds.groupby(["seed", "fold"])["n_test"].nunique()
+    assert (per_fold == 1).all(), (
+        "one held-out row count per (seed, fold) means every model saw that fold")
+    counts = val.folds.groupby("model").size()
+    assert counts.nunique() == 1, "and every model was scored on all of them"
+
+
+def test_the_root_and_authored_models_join_the_comparison():
+    models, _, val = _validated(extra=None)
+    assert "root" in set(val.frame()["model"]), "the search's starting point"
+    _, _, with_extra = _validated(extra=models)
+    named = set(with_extra.frame()["model"])
+    assert {"Topics", "Skills", "root"} <= named, (
+        "an authored KC model is the comparison that says whether searching helped")
+
+
+def test_validation_reports_whether_the_criterion_agrees_with_held_out_rmse():
+    """On this example it does not, and that is the point of the stage.
+
+    BIC prefers a 2-KC model; pooled item-blocked RMSE prefers a 3-KC one. The
+    disagreement is deterministic here, so it is pinned rather than described —
+    if a change ever made the criterion and the held-out score agree on this
+    data, that would be a result worth noticing, not a silent improvement.
+    """
+    _, _, val = _validated()
+    assert not val.agrees
+    assert val.winner != val.frame().iloc[0]["model"]
+    assert "DISAGREE" in val.summary()
+
+
+def test_the_authored_model_can_beat_the_criterions_pick_out_of_sample():
+    authored, _ = _example_factors()
+    _, _, val = _validated(extra=authored)
+    frame = val.frame().set_index("model")
+    assert frame.loc["Topics", "search_rank"] > frame.loc["Topics", "cv_rank"], (
+        "the planted model is penalised in sample and rewarded out of sample")
+
+
+def test_contrasts_difference_within_fold_and_exclude_the_baseline():
+    _, _, val = _validated()
+    assert val.baseline == "root", "the search's starting point by default"
+    assert val.baseline not in set(val.contrasts["model"])
+    assert (val.contrasts["n_folds"] == 9).all(), "3 folds x 3 seeds, paired"
+
+
+def test_the_baseline_can_be_named():
+    _, res, _ = _validated()
+    models, _ = _example_factors()
+    val = validate_top(res, models["Topics"], n=3, baseline="rank1")
+    assert val.baseline == "rank1"
+    assert "rank1" not in set(val.contrasts["model"])
+
+
+def test_an_unknown_baseline_raises():
+    _, res, _ = _validated()
+    models, _ = _example_factors()
+    with pytest.raises(KeyError, match="baseline"):
+        validate_top(res, models["Topics"], n=2, baseline="nope")
+
+
+def test_an_extra_model_over_other_rows_cannot_be_paired():
+    models, res, _ = _validated()
+    short = _constant_student_data()
+    with pytest.raises(ValueError, match="different row set"):
+        validate_top(res, models["Topics"], n=2, extra={"other": short})
+
+
+def test_validation_scores_in_the_mode_the_search_used():
+    """In-sample and held-out columns must describe the same models."""
+    models, P = _example_factors()
+    res = lfa_search(models["Topics"], P, max_iterations=4,
+                     learnsphere_compat=True)
+    assert res.learnsphere_compat
+    val = validate_top(res, models["Topics"], n=3, include_root=False)
+    frame = val.frame().set_index("model")
+    assert frame.loc["rank1", "bic"] == pytest.approx(res.states[0].bic)
+    assert frame.loc["rank1", "n_params"] == res.states[0].n_params
+
+
+def test_n_must_be_at_least_one():
+    models, res, _ = _validated()
+    with pytest.raises(ValueError, match="n must be at least 1"):
+        validate_top(res, models["Topics"], n=0)
+
+
+def test_rank_correlation_needs_three_candidates():
+    models, P = _example_factors()
+    res = lfa_search(models["Topics"], P, max_iterations=3)
+    val = validate_top(res, models["Topics"], n=1, include_root=True)
+    assert val.rank_correlation() != val.rank_correlation(), "NaN for two"
+    assert "undefined" in val.summary()

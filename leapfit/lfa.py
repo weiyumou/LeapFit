@@ -76,6 +76,7 @@ import numpy as np
 import pandas as pd
 
 from leapfit.afm import build_afm_design, fit_afm
+from leapfit.crossval import paired_contrasts, paired_cross_validate, paired_scores
 from leapfit.data import StepData
 from leapfit.design import Design
 from leapfit.fit import DEFAULT_METHOD
@@ -344,6 +345,7 @@ class LFAResult:
     n_iterations: int
     stopped: str
     persistent_separation: tuple[str, ...] = ()
+    learnsphere_compat: bool = False
 
     @property
     def best(self) -> LFAState:
@@ -729,4 +731,198 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
         rejected=Rejected(tuple(moves), tuple(reasons)), factors=factors,
         heuristic=heuristic, n_evaluated=len(cache), n_iterations=iteration,
         stopped=stopped, persistent_separation=persistent,
+        learnsphere_compat=learnsphere_compat,
+    )
+
+
+# --------------------------------------------------------------------------
+# Held-out validation of what the search chose
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LFAValidation:
+    """Held-out scores for a search's top states, on identical folds.
+
+    The search ranks by an information criterion because cross-validating
+    inside the loop is unaffordable — the reference's own follow-up says so
+    outright (Koedinger, McLaughlin & Stamper, EDM 2012: "too computationally
+    expensive to run inside the LFA search... After the search is complete, we
+    test the best models using cross validation"). This is that second step,
+    and the interesting output is not a score but an *agreement*: whether the
+    criterion that drove the search also picks the winner out of sample.
+
+    Because every searched KC model covers the same rows, the folds are drawn
+    once and shared, so the comparison is a within-fold paired contrast rather
+    than a set of independently resampled means — see
+    :func:`~leapfit.crossval.paired_cross_validate`.
+    """
+
+    folds: pd.DataFrame
+    contrasts: pd.DataFrame
+    searched: pd.DataFrame
+    baseline: str
+    heuristic: str
+    scheme: str
+    convention: str
+    n_folds: int
+    seeds: tuple[int, ...]
+
+    def frame(self) -> pd.DataFrame:
+        """One row per candidate: its in-sample criterion and its held-out RMSE."""
+        per_seed = paired_scores(self.folds, self.convention)
+        scores = per_seed.groupby("model", as_index=False).agg(
+            cv_rmse=("rmse", "mean"),
+            unseen_column_fraction=("unseen_column_fraction", "mean"),
+            all_converged=("all_converged", "all"),
+        )
+        out = self.searched.merge(scores, on="model", how="left")
+        out["search_rank"] = out[self.heuristic].rank(method="min").astype(int)
+        out["cv_rank"] = out["cv_rmse"].rank(method="min").astype(int)
+        return out.sort_values("search_rank", ignore_index=True)
+
+    @property
+    def winner(self) -> str:
+        """The model with the lowest held-out RMSE."""
+        frame = self.frame()
+        return str(frame.loc[frame["cv_rmse"].idxmin(), "model"])
+
+    @property
+    def agrees(self) -> bool:
+        """Whether the criterion's pick also wins out of sample."""
+        frame = self.frame()
+        return bool(frame.loc[frame[self.heuristic].idxmin(), "model"] == self.winner)
+
+    def rank_correlation(self) -> float:
+        """Spearman correlation between the search order and the held-out order.
+
+        A description of how well the criterion tracked generalization on these
+        candidates, not an inferential claim — with a handful of models and a
+        handful of folds there is not enough to test.
+        """
+        frame = self.frame()
+        if len(frame) < 3:
+            return float("nan")
+        return float(frame["search_rank"].corr(frame["cv_rank"], method="spearman"))
+
+    def summary(self) -> str:
+        frame = self.frame()
+        best = frame.iloc[0]
+        rho = self.rank_correlation()
+        lines = [
+            (f"Paired CV of {len(frame)} candidate(s): {self.scheme}, "
+             f"{self.n_folds} folds x {len(self.seeds)} seed(s), "
+             f"{self.convention} RMSE"),
+            (f"  {self.heuristic.upper()} picked {best['model']!r} "
+             f"(cv_rmse {best['cv_rmse']:.4f}); "
+             f"held-out picks {self.winner!r}"),
+            ("  the criterion and held-out RMSE agree on the winner"
+             if self.agrees else
+             "  they DISAGREE — the criterion's pick is not the best predictor"),
+            f"  rank correlation {rho:.3f}" if rho == rho else
+            "  rank correlation undefined for fewer than three candidates",
+        ]
+        if len(self.contrasts):
+            lines.append(f"  paired contrasts against {self.baseline!r} "
+                         "(negative mean_diff beats it):")
+            lines.append("    " + self.contrasts.to_string(
+                index=False).replace("\n", "\n    "))
+        return "\n".join(lines)
+
+
+def validate_top(result: LFAResult, data: StepData, *, n: int = 5,
+                 include_root: bool = True,
+                 extra: Mapping[str, StepData] | None = None,
+                 baseline: str | None = None,
+                 scheme: str = "item_blocked", n_folds: int = 3,
+                 seeds=(0,), convention: str = "pooled",
+                 method: str = DEFAULT_METHOD, max_fun: int | None = None,
+                 n_jobs: int | None = 1) -> LFAValidation:
+    """Cross-validate a search's top ``n`` states on identical folds.
+
+    Candidates are named ``"rank1"`` .. ``"rankN"`` in search order, plus
+    ``"root"`` for the "All" model the search began from, plus whatever is
+    passed in ``extra`` under its own name. Scoring uses the mode the search
+    used, taken from ``result``, so the in-sample and held-out columns of
+    :meth:`LFAValidation.frame` describe the same models.
+
+    Opportunity counts are recomputed for **every** candidate, including any in
+    ``extra`` that ships its own ``Opportunity`` column. The searched models
+    have no such column, so recomputing throughout is what makes the
+    comparison a comparison; call
+    :func:`~leapfit.crossval.cross_validate` directly to reproduce a published
+    number for an authored model under its own convention.
+
+    :param n: how many of the ranked states to score. The frontier can hold
+        hundreds; the point of the exercise is the top handful.
+    :param extra: hand-authored KC models to score alongside — the comparison
+        that says whether searching beat the labelling you already had. Each
+        must cover the same rows as ``data``.
+    :param baseline: what the contrasts difference against. Defaults to
+        ``"root"`` when it is included, else the search's own pick, so the
+        headline reads "did refining help out of sample".
+    """
+    if n < 1:
+        raise ValueError(f"n must be at least 1, got {n!r}")
+
+    steps = result.factors.steps
+    compat = result.learnsphere_compat
+    designs: dict[str, Design] = {}
+    rows: list[dict] = []
+
+    def record(name: str, state: LFAState | None, design: Design,
+               scored: StepData) -> None:
+        designs[name] = design
+        if state is None:
+            fit = fit_afm(design, scored.y, method=method, max_fun=max_fun,
+                          warn_not_converged=False, warn_separated=False)
+            state = LFAState(
+                labels=(), history=(), ll=fit.ll, aic=fit.aic, bic=fit.bic,
+                n_kcs=len(scored.kc_names), n_params=fit.n_params,
+                is_optimal=fit.is_optimal, n_separated=len(fit.separated))
+        rows.append({
+            "model": name, "depth": state.depth, "n_kcs": state.n_kcs,
+            "n_params": state.n_params, "log_likelihood": state.ll,
+            "aic": state.aic, "bic": state.bic,
+            "is_optimal": state.is_optimal,
+            "history": " | ".join(str(m) for m in state.history),
+        })
+
+    def design_for(state: LFAState) -> tuple[Design, StepData]:
+        scored = relabel(data, steps, state.labels)
+        return build_afm_design(scored, learnsphere_compat=compat,
+                                recompute_opportunities=False), scored
+
+    if include_root:
+        design, scored = design_for(result.root)
+        record("root", result.root, design, scored)
+    for rank, state in enumerate(result.states[:n], start=1):
+        if include_root and state.labels == result.root.labels:
+            continue
+        design, scored = design_for(state)
+        record(f"rank{rank}", state, design, scored)
+    for name, authored in (extra or {}).items():
+        if list(authored.items) != list(data.items):
+            raise ValueError(
+                f"extra model {name!r} covers a different row set from the "
+                "search data, so folds cannot be shared and the comparison "
+                "would not be paired."
+            )
+        design = build_afm_design(authored, learnsphere_compat=compat,
+                                  recompute_opportunities=True)
+        record(name, None, design, authored)
+
+    if baseline is None:
+        baseline = "root" if include_root else next(iter(designs))
+    if baseline not in designs:
+        raise KeyError(f"baseline {baseline!r} not among {list(designs)}")
+
+    folds = paired_cross_validate(
+        designs, data, scheme=scheme, n_folds=n_folds, seeds=seeds,
+        convention=convention, method=method, max_fun=max_fun, n_jobs=n_jobs)
+    return LFAValidation(
+        folds=folds, contrasts=paired_contrasts(folds, baseline),
+        searched=pd.DataFrame(rows), baseline=baseline,
+        heuristic=result.heuristic, scheme=scheme, convention=convention,
+        n_folds=n_folds, seeds=tuple(seeds),
     )
