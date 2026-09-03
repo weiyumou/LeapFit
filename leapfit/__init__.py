@@ -72,6 +72,7 @@ from leapfit.design import (
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
 from leapfit.lfa import (
     HEURISTICS,
+    MERGES,
     MIN_OPPORTUNITIES,
     FactorMatrix,
     LFAResult,
@@ -81,6 +82,7 @@ from leapfit.lfa import (
     Rejected,
     build_factor_matrix,
     lfa_search,
+    root_labels,
     validate_top,
 )
 from leapfit.pfa import (
@@ -95,6 +97,7 @@ __all__ = [
     "DEFAULT_METHOD",
     "FIRST_ATTEMPT_VALUES",
     "HEURISTICS",
+    "MERGES",
     "MIN_OPPORTUNITIES",
     "SCHEMES",
     "STUDENT_L2",
@@ -132,6 +135,7 @@ __all__ = [
     "paired_cross_validate",
     "paired_scores",
     "repeated_cross_validate",
+    "root_labels",
     "success_failure_counts",
     "validate_top",
 ]

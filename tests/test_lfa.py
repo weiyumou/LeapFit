@@ -29,12 +29,15 @@ import pytest
 from leapfit import build_afm_design, fit_afm, from_frame, load_student_step
 from leapfit.lfa import (
     HEURISTICS,
+    MERGES,
     FactorMatrix,
     Move,
     build_factor_matrix,
     lfa_search,
+    merge,
     relabel,
     replay,
+    root_labels,
     split,
     validate_top,
 )
@@ -184,6 +187,37 @@ def test_a_derived_skill_can_be_split_again():
     labels = split(("all",) * 3, STEPS, "all", "f", frozenset({"a", "b"}))
     got = split(labels, STEPS, "all*f", "g", frozenset({"a"}))
     assert got == ("all*f*g", "all*f", "all")
+
+
+def test_merge_joins_two_skills():
+    labels = ("all*f", "all*g", "all")
+    assert merge(labels, "all*f", "all*g") == ("all*f+all*g", "all*f+all*g", "all")
+
+
+def test_a_merge_label_does_not_depend_on_the_order_it_was_asked_in():
+    """Which is what lets the two orders collapse to one state."""
+    labels = ("x", "y", "z")
+    assert merge(labels, "x", "y") == merge(labels, "y", "x")
+
+
+def test_merging_an_absent_or_identical_skill_is_impossible():
+    labels = ("x", "y", "z")
+    assert merge(labels, "x", "nope") is None
+    assert merge(labels, "nope", "x") is None
+    assert merge(labels, "x", "x") is None, "a skill cannot merge with itself"
+
+
+def test_a_merge_reads_as_a_merge_in_the_history():
+    assert str(Move("merge", "a", "b")) == "merge a and b"
+    assert str(Move("split", "a", "f")) == "split a by f"
+
+
+def test_replay_applies_merges_as_well_as_splits():
+    P = FactorMatrix(STEPS, ("f", "g"),
+                     (frozenset({"a"}), frozenset({"b"})))
+    history = (Move("split", "all", "f"), Move("split", "all", "g"),
+               Move("merge", "all*f", "all*g"))
+    assert replay(history, P) == ("all*f+all*g", "all*f+all*g", "all")
 
 
 def test_replay_reconstructs_a_labelling_from_its_history():
@@ -433,8 +467,8 @@ def test_lineage_merge_changes_nothing_when_the_frontier_never_fills():
     beam has evicted something.
     """
     models, P = _example_factors()
-    with_merge = lfa_search(models["Topics"], P, max_iterations=6, merge=True)
-    without = lfa_search(models["Topics"], P, max_iterations=6, merge=False)
+    with_merge = lfa_search(models["Topics"], P, max_iterations=6, merges="lineage")
+    without = lfa_search(models["Topics"], P, max_iterations=6, merges="none")
     assert with_merge.best.labels == without.best.labels
     assert with_merge.n_evaluated == without.n_evaluated
 
@@ -743,3 +777,212 @@ def test_cli_lfa_lists_the_models_and_exits(capsys):
     from leapfit.cli import main_lfa
     assert main_lfa([EXAMPLE, "--list-models"]) == 0
     assert capsys.readouterr().out.split() == ["Skills", "Topics"]
+
+
+# --------------------------------------------------------------------------
+# What the pairwise merge buys
+# --------------------------------------------------------------------------
+
+
+def _three_step_data():
+    rows = []
+    for student in ("s1", "s2", "s3"):
+        for step in ("a", "b", "c"):
+            rows += _mixed(student, step, step, 6)
+    return from_frame(_frame(rows), "F")
+
+
+def _two_factor_matrix(data):
+    """P with factors {a} and {b} only — no factor equals the union {a, b}."""
+    steps = tuple(sorted(set(data.items)))
+    a, b = (s for s in steps if s.endswith(("##a", "##b")))
+    return FactorMatrix(steps, ("f", "g"), (frozenset({a}), frozenset({b})))
+
+
+def test_a_union_of_two_factors_is_reachable_only_by_merging():
+    """The justification for the operator, as an exhaustive search.
+
+    Split only ever divides a part, so from the ``All`` root over factors
+    ``{a}`` and ``{b}`` the reachable labellings are ``{abc}``, ``{a|bc}``,
+    ``{b|ac}`` and ``{a|b|c}``. Putting ``a`` and ``b`` together in one KC and
+    leaving ``c`` alone is not among them, and no factor equals ``{a, b}``.
+    Carve them out separately and merge, and it is reachable.
+    """
+    data = _three_step_data()
+    P = _two_factor_matrix(data)
+    steps = P.steps
+    a, b = (next(s for s in steps if s.endswith(f"##{x}")) for x in "ab")
+    target = partition(tuple("ab" if s in (a, b) else "c" for s in steps))
+
+    kw = {"max_iterations": 20, "patience": 0, "min_opportunities": 1}
+    without = lfa_search(data, P, merges="none", **kw)
+    assert without.stopped == "exhausted", "the whole space was enumerated"
+    assert target not in {partition(s.labels) for s in without.states}
+
+    with_merge = lfa_search(data, P, merges="pairwise", **kw)
+    assert target in {partition(s.labels) for s in with_merge.states}, (
+        "a KC that is the union of two factors needs the merge operator")
+
+
+def test_pairwise_merge_reaches_strictly_more_states_than_splitting_alone():
+    data = _three_step_data()
+    P = _two_factor_matrix(data)
+    kw = {"max_iterations": 20, "patience": 0, "min_opportunities": 1}
+    split_only = lfa_search(data, P, merges="none", **kw)
+    pairwise = lfa_search(data, P, merges="pairwise", **kw)
+    seen = {partition(s.labels) for s in split_only.states}
+    grown = {partition(s.labels) for s in pairwise.states}
+    assert seen < grown, "a superset, and strictly bigger"
+
+
+def test_offering_both_merge_operators_explores_at_least_as_much():
+    models, P = _example_factors()
+    kw = {"max_iterations": 4, "patience": 0}
+    counts = {m: lfa_search(models["Topics"], P, merges=m, **kw).n_evaluated
+              for m in MERGES}
+    assert counts["none"] <= counts["lineage"]
+    assert counts["none"] < counts["pairwise"]
+    assert counts["both"] >= max(counts.values())
+
+
+def test_a_merge_is_never_offered_twice_on_one_lineage():
+    models, P = _example_factors()
+    result = lfa_search(models["Topics"], P, max_iterations=6, merges="both")
+    for state in result.states:
+        moves = [(m.kind, m.skill, m.factor) for m in state.history]
+        assert len(moves) == len(set(moves))
+
+
+def test_merges_must_be_a_known_mode():
+    models, P = _example_factors()
+    with pytest.raises(ValueError, match="merges must be one of"):
+        lfa_search(models["Topics"], P, merges="pairwise-ish")
+
+
+def test_the_cli_offers_the_merge_operators(tmp_path):
+    out = tmp_path / "f.csv"
+    assert _lfa_cli("--merges", "both", "--out", str(out)) == 0
+    assert len(pd.read_csv(out)) > 1
+
+
+def test_merging_pays_off_from_a_fine_grained_model_not_from_the_root():
+    """Why the operator's value is coupled to where the search starts.
+
+    From the ``All`` root there is nothing to coarsen: BIC has already judged
+    each accepted split worth more than its two parameters, so undoing one
+    cannot win, and on a real export 26 scored merge moves changed no answer.
+    From an authored *fine* model the same operator is immediately productive
+    — which is precisely the situation Cen, Koedinger & Junker (2006) handled
+    by merging into the starting model **by hand**.
+    """
+    data = load_student_step(EXAMPLE, kc_model="Skills")
+    steps = tuple(sorted(set(data.items)))
+    at = dict(zip(data.items, (kcs[0] for kcs in data.kcs)))
+    labels = tuple(at[step] for step in steps)
+
+    def bic(current):
+        scored = relabel(data, steps, current)
+        design = build_afm_design(scored)
+        return fit_afm(design, scored.y, warn_not_converged=False,
+                       warn_separated=False).bic
+
+    authored = bic(labels)
+    skills = sorted(set(labels))
+    best = min(bic(merge(labels, a, b))
+               for i, a in enumerate(skills) for b in skills[i + 1:])
+    assert best < authored - 10, (
+        f"one merge should buy real BIC here: {authored:.3f} -> {best:.3f}")
+
+
+# --------------------------------------------------------------------------
+# Starting from a KC model you already have
+# --------------------------------------------------------------------------
+
+
+def test_the_root_defaults_to_the_all_model():
+    """Which is the ``Single-KC`` labelling, built rather than read."""
+    models, P = _example_factors()
+    assert root_labels(P) == ("all",) * len(P.steps)
+    result = lfa_search(models["Topics"], P, max_iterations=1)
+    assert result.root.n_kcs == 1
+
+
+def test_a_step_data_and_a_mapping_describe_the_same_root():
+    models, P = _example_factors()
+    skills = models["Skills"]
+    mapping = dict(zip(skills.items, (kcs[0] for kcs in skills.kcs)))
+    assert root_labels(P, skills) == root_labels(P, mapping)
+    assert len(set(root_labels(P, skills))) == 12
+
+
+def test_a_root_must_label_every_step():
+    _, P = _example_factors()
+    partial = dict(zip(P.steps[:-1], ["x"] * (len(P.steps) - 1)))
+    with pytest.raises(ValueError, match="A root must cover every step"):
+        root_labels(P, partial)
+
+
+def test_a_multi_kc_model_cannot_be_a_root():
+    _, P = _example_factors()
+    df = _frame([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
+                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}])
+    with pytest.raises(ValueError, match="more than one"):
+        root_labels(P, from_frame(df, "F"))
+
+
+def test_replay_rebuilds_from_the_root_it_was_given():
+    P = FactorMatrix(STEPS, ("f",), (frozenset({"a"}),))
+    history = (Move("split", "x", "f"),)
+    assert replay(history, P, ("x", "x", "y")) == ("x*f", "x", "y")
+    with pytest.raises(ValueError, match="degenerate"):
+        replay(history, P)          # no skill named "x" under the All root
+
+
+def test_from_a_fine_root_splitting_can_do_nothing_and_merging_pays():
+    """The whole reason ``root=`` and the merge operator belong together.
+
+    Split only refines, and BIC will not buy a refinement of an already-fine
+    model — so from the authored 12-KC ``Skills`` labelling a split-only search
+    returns the root untouched. The same search with pairwise merge coarsens it
+    to 6 KCs and gains 80-odd nats. Neither number is interesting alone; the
+    pair is, because it shows the operator was idle from the ``All`` root for a
+    structural reason rather than a data one.
+    """
+    models, P = _example_factors()
+    kw = {"root": models["Skills"], "max_iterations": 6, "patience": 0,
+          "min_opportunities": 1}
+    split_only = lfa_search(models["Skills"], P, merges="none", **kw)
+    assert split_only.best.history == (), "no refinement of Skills pays"
+    assert split_only.best.bic == split_only.root.bic
+
+    merging = lfa_search(models["Skills"], P, merges="pairwise", **kw)
+    assert merging.best.bic < split_only.best.bic - 50
+    assert merging.best.n_kcs < merging.root.n_kcs, "it coarsened the model"
+    assert all(m.kind == "merge" for m in merging.best.history)
+
+
+def test_a_separation_already_in_the_root_does_not_refuse_every_move():
+    """The screens judge moves, not the state they were handed.
+
+    A move can only make the KCs it *touched* separate, so a separation
+    elsewhere is not its doing. Comparing against the whole design instead
+    refused 4,251 of 4,277 merge candidates on a 91-KC root that carried three
+    separated KCs — every move inherited them, so every move was refused and
+    the search scored nothing.
+    """
+    data = _screen_data()
+    root = dict(zip(data.items, (kcs[0] for kcs in data.kcs)))
+    P = build_factor_matrix({"F": data})
+    result = lfa_search(data, P, root=root, max_iterations=2, patience=0,
+                        merges="pairwise", min_opportunities=1)
+    assert result.root_separation, "the root's own separated KC is reported"
+    assert result.n_evaluated > 1, (
+        "and moves are still scored rather than blanket-refused")
+    assert "came in with the root" in result.summary()
+
+
+def test_the_cli_can_start_from_an_authored_kc_model(tmp_path):
+    out = tmp_path / "f.csv"
+    assert _lfa_cli("--root", "Skills", "--merges", "pairwise",
+                    "--out", str(out)) == 0
+    assert len(pd.read_csv(out)) > 1

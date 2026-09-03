@@ -84,6 +84,7 @@ import pandas as pd
 from leapfit import (
     CONVENTIONS,
     HEURISTICS,
+    MERGES,
     SCHEMES,
     build_afm_design,
     build_factor_matrix,
@@ -479,6 +480,12 @@ def build_lfa_parser() -> argparse.ArgumentParser:
         description="Search for a KC model with Learning Factors Analysis, "
                     "scored by AFM, then validate the shortlist out of sample.")
     p.add_argument("export", help="DataShop student-step export (tab-delimited)")
+    p.add_argument("--root", metavar="NAME",
+                   help="KC model to start the search from (default: the "
+                        "'All' model, one skill on every step — which is what "
+                        "a Single-KC column already is). Starting from an "
+                        "authored model is what gives --merges pairwise "
+                        "something to coarsen")
     p.add_argument("--factors", action="append", dest="factor_models",
                    metavar="NAME",
                    help="KC model to draw difficulty factors from; repeatable. "
@@ -503,8 +510,12 @@ def build_lfa_parser() -> argparse.ArgumentParser:
                    help="accept moves whose KC parameters have no finite "
                         "estimate — reproduces the reference, including its "
                         "selection of such models")
-    p.add_argument("--no-merge", action="store_true",
-                   help="split only; skip lineage-undo merges")
+    p.add_argument("--merges", choices=MERGES, default="lineage",
+                   help="which merge operators to offer (default: lineage). "
+                        "'pairwise' joins any two of a state's skills and "
+                        "reaches KC models no sequence of splits can; "
+                        "'lineage' undoes a recorded split; 'both' offers "
+                        "each, since neither subsumes the other")
     p.add_argument("--beam", type=int, default=BEAM, metavar="N",
                    help=f"unexpanded states retained (default: {BEAM})")
     p.add_argument("--no-warm-start", action="store_true",
@@ -639,12 +650,21 @@ def main_lfa(argv: list[str] | None = None) -> int:
     for column, reason in zip(factors.dropped, factors.reasons):
         print(f"  dropped {column}: {reason}", file=sys.stderr)
 
+    root = None
+    if args.root:
+        if args.root not in available:
+            print(f"--root {args.root!r} is not a KC model in the export. "
+                  f"Available: {available}", file=sys.stderr)
+            return 1
+        root = load_student_step(args.export, kc_model=args.root)
+        print(f"root: {args.root} ({len(root.kc_names)} KCs)", file=sys.stderr)
+
     result = lfa_search(
-        data, factors, heuristic=args.heuristic,
+        data, factors, root=root, heuristic=args.heuristic,
         max_iterations=args.max_iterations, patience=args.patience,
         min_opportunities=args.min_opportunities,
         screen_separation=not args.no_screen_separation,
-        merge=not args.no_merge, beam=args.beam,
+        merges=args.merges, beam=args.beam,
         warm_start=not args.no_warm_start,
         learnsphere_compat=args.learnsphere_compat,
         method=args.method, max_fun=args.max_fun, n_jobs=args.jobs)

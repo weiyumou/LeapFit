@@ -9,7 +9,9 @@ pass, the separation check, the KKT optimality certificate — applies unchanged
 to every state the search visits::
 
     state   a Q matrix: one KC label per step
-    root    the "All" model, one skill on every step
+    root    the "All" model by default — one skill on every step, which is what
+            an export's Single-KC column already holds — or any labelling you
+            hand it (``root=``), as the published method does
     P       which steps carry which difficulty factor, built from KC models
             that already exist on the export (:func:`build_factor_matrix`)
     split   carve the steps of skill k that carry factor f into a new skill
@@ -52,12 +54,15 @@ flag that makes recomputation optional for AFM is not optional here.
 
 DIVERGENCE (merge). The published method has only Binary Split — Cen,
 Koedinger & Junker (2006) merge by hand into the *starting* model rather than
-as a search move. :func:`lfa_search` offers merge as lineage-undo, and it
-matters only because the frontier is bounded: undoing a split reaches a state
-that was scored earlier and may since have been evicted from the beam. It adds
-search *paths*, not reachable states — split alone can reach any refinement
-the factors express. Arbitrary pairwise merge over all KC pairs is a larger
-operator and is deliberately not implemented here.
+as a search move. :func:`lfa_search` offers both a lineage-undo and an
+arbitrary pairwise merge (:data:`MERGES`). Pairwise genuinely enlarges the
+reachable set: a KC that is the union of two factors' steps is not expressible
+as any sequence of splits. Their value is coupled to ``root``: from the **All**
+root neither operator changes the answer, because the coarsest possible
+starting point leaves nothing to coarsen, while from an authored fine model
+merging is worth 38 nats of BIC over splitting alone on the validated export.
+That is why the 2006 paper merged into an authored model rather than a single
+skill.
 
 Not implemented, deliberately: Firth-penalized likelihood, which would remove
 the unbounded reward at its source instead of screening the symptom. Its
@@ -111,8 +116,32 @@ MAX_ITERATIONS = 50
 #: cap is what gives :func:`lfa_search`'s merge operator anything to do.
 BEAM = 1000
 
+#: Merge operators, which do different jobs.
+#:
+#: ``"pairwise"`` joins any two of the state's skills and **enlarges the
+#: reachable set**: split only ever divides a part, so every split-reachable
+#: labelling has parts that are intersections of factor sets and complements,
+#: and a part that is a *union* of two factors' steps is unreachable unless
+#: some factor equals it.
+#:
+#: ``"lineage"`` undoes a recorded split by replaying the history without it.
+#: It does **not** enlarge the reachable set — every state it reaches is
+#: split-reachable — but it adds *paths*, which is what matters under a bounded
+#: frontier: a state evicted from ``beam`` can come back this way.
+#:
+#: So the two are not redundant, though not for symmetric reasons. From a given
+#: state one pairwise merge cannot in general reach what a lineage-undo
+#: reaches, and vice versa, so under a finite budget ``"both"`` explores more
+#: than either.
+MERGES = ("none", "lineage", "pairwise", "both")
+
 #: Joins a skill to the factor it was split by, as the reference names them.
 SPLIT_SEP = "*"
+
+#: Joins two skills a pairwise merge has combined. The reference has no merge
+#: operator, so this convention is ours; the operands are sorted, so a merge
+#: names one label whichever order it was asked for.
+MERGE_SEP = "+"
 
 ROOT_SKILL = "all"
 
@@ -246,14 +275,25 @@ def build_factor_matrix(models: Mapping[str, StepData]) -> FactorMatrix:
 
 @dataclass(frozen=True)
 class Move:
-    """One model operator application, as the reference records it."""
+    """One model operator application.
+
+    The two operands read differently per ``kind``, which is why ``__str__``
+    exists rather than a bare repr: a ``"split"`` names the skill it divides
+    and the *factor* it divides by ("split all by fractions", the reference's
+    own phrasing), while a ``"merge"`` names the two *skills* it joins ("merge
+    all*fractions and all*ratios"). ``factor`` therefore holds a factor for a
+    split and a second skill for a merge — the field keeps its name because
+    split is the operator the reference and the literature define, and merge is
+    the addition.
+    """
 
     kind: str
     skill: str
     factor: str
 
     def __str__(self) -> str:
-        return f"{self.kind} {self.skill} by {self.factor}"
+        joiner = "and" if self.kind == "merge" else "by"
+        return f"{self.kind} {self.skill} {joiner} {self.factor}"
 
 
 @dataclass(frozen=True)
@@ -347,6 +387,7 @@ class LFAResult:
     n_iterations: int
     stopped: str
     persistent_separation: tuple[str, ...] = ()
+    root_separation: tuple[str, ...] = ()
     learnsphere_compat: bool = False
 
     @property
@@ -389,6 +430,12 @@ class LFAResult:
                 "a property of the data, not of any move, and it makes "
                 "certification borderline throughout")]
               if self.persistent_separation else []),
+            *([(f"  note: the root already carries "
+                f"{len(self.root_separation)} KC coefficient(s) with no finite "
+                f"estimate ({', '.join(self.root_separation[:2])}); the screens "
+                "cannot refuse a starting point, so this came in with the root "
+                "— merging is what removes it")]
+              if self.root_separation else []),
             self.best.summary(),
         ])
 
@@ -415,7 +462,32 @@ def split(labels: tuple[str, ...], steps: tuple[str, ...], skill: str,
                  for step, label in zip(steps, labels))
 
 
-def replay(history: tuple[Move, ...], factors: FactorMatrix) -> tuple[str, ...]:
+def merge(labels: tuple[str, ...], left: str,
+          right: str) -> tuple[str, ...] | None:
+    """Join two of a state's skills into one.
+
+    ``None`` when the move is impossible — either name is absent from the
+    state, or they are the same skill. The joined label sorts its operands, so
+    the state a merge reaches does not depend on the order it was asked in;
+    that is what lets :func:`_partition` recognise two orders as one state.
+
+    This is the operator the published method does not have. Split alone can
+    only ever *divide* an existing part, so every reachable labelling has parts
+    that are intersections of factor sets and their complements. A part that is
+    a **union** of two factors' step sets is unreachable unless some factor
+    happens to equal that union — carve them out separately, merge them, and it
+    is reachable. That is the whole of what this buys, and
+    ``test_a_union_of_two_factors_is_reachable_only_by_merging`` pins it.
+    """
+    if left == right or left not in set(labels) or right not in set(labels):
+        return None
+    joined = MERGE_SEP.join(sorted((left, right)))
+    return tuple(joined if label in (left, right) else label
+                 for label in labels)
+
+
+def replay(history: tuple[Move, ...], factors: FactorMatrix,
+           root: tuple[str, ...] | None = None) -> tuple[str, ...]:
     """The labelling a move sequence produces from the root.
 
     Merge is implemented as replay-without-a-move rather than as an inverse
@@ -423,14 +495,53 @@ def replay(history: tuple[Move, ...], factors: FactorMatrix) -> tuple[str, ...]:
     is no state that a history cannot express.
     """
     at = dict(zip(factors.factors, factors.members))
-    labels = (ROOT_SKILL,) * len(factors.steps)
+    labels = root if root is not None else (ROOT_SKILL,) * len(factors.steps)
     for move in history:
-        got = split(labels, factors.steps, move.skill, move.factor,
-                    at[move.factor])
+        if move.kind == "merge":
+            got = merge(labels, move.skill, move.factor)
+        else:
+            got = split(labels, factors.steps, move.skill, move.factor,
+                        at[move.factor])
         if got is None:
             raise ValueError(f"replaying {move} is degenerate; history is stale")
         labels = got
     return labels
+
+
+def root_labels(factors: FactorMatrix,
+                root: Mapping[str, str] | StepData | None = None) -> tuple[str, ...]:
+    """The labelling a search starts from, aligned to ``factors.steps``.
+
+    ``None`` gives the **All** model — one skill on every step, which is what
+    the reference builds for itself and calls "All". Anything else starts from
+    a labelling you already have: a ``step -> KC`` mapping, or a
+    :class:`~leapfit.data.StepData` parsed from a KC model in the export,
+    which is the published setup ("the initial node is the existing cognitive
+    model", Cen, Koedinger & Junker 2006).
+
+    Which root you pick decides whether merging can do anything: from All
+    there is nothing to coarsen, and from an authored fine model there is a
+    great deal — see :data:`MERGES`.
+    """
+    if root is None:
+        return (ROOT_SKILL,) * len(factors.steps)
+    if isinstance(root, StepData):
+        wide = [i for i, row in enumerate(root.kcs) if len(row) != 1]
+        if wide:
+            raise ValueError(
+                f"the root KC model tags {len(wide)} row(s) with more than one "
+                f"KC (first at observation {wide[0]}); a search state carries "
+                "one label per step, so a multi-KC model cannot be a root."
+            )
+        root = dict(zip(root.items, (row[0] for row in root.kcs)))
+    if missing := [s for s in factors.steps if s not in root]:
+        raise ValueError(
+            f"the root labels {len(factors.steps) - len(missing)} of "
+            f"{len(factors.steps)} steps; {len(missing)} are unlabelled "
+            f"(first: {missing[0]!r}). A root must cover every step, or the "
+            "starting model is undefined on some rows."
+        )
+    return tuple(root[step] for step in factors.steps)
 
 
 def _partition(labels: tuple[str, ...]) -> frozenset[frozenset[int]]:
@@ -474,6 +585,16 @@ def screen(data: StepData, design: Design | None, touched: tuple[str, ...], *,
     creating it. This is checked on the *design*, before any fit, so a refused
     move costs no optimization.
 
+    Both axes look only at ``touched``, and for the estimability axis that is
+    load-bearing rather than an optimization. A move can only make the KCs it
+    touched separate — splitting ``k`` changes no other KC's columns — so a
+    separation elsewhere is not this move's doing and refusing it would be
+    refusing the state you started from. From the ``All`` root that never
+    bites, because All has no KC separation and every separated state the
+    search meets is one a move created. From an authored root it bites hard:
+    a 91-KC model with three separated KCs refused **4,251 of 4,277** merge
+    candidates when this compared against the whole design, scoring none.
+
     :param design: ``None`` when identification already refused the state.
     :param touched: the KC labels the move created or changed.
     """
@@ -489,7 +610,9 @@ def screen(data: StepData, design: Design | None, touched: tuple[str, ...], *,
         return "not identifiable"
     if separation:
         by_block = design.separated(data.y).by_block()
-        if by_block.get("kc_intercept") or by_block.get("kc_slope"):
+        wanted = set(touched)
+        if any(name in wanted for block in ("kc_intercept", "kc_slope")
+               for name in by_block.get(block, ())):
             return "separated"
     return None
 
@@ -636,12 +759,13 @@ def _run_candidates(jobs: list[tuple], pool) -> list[tuple]:
 
 
 def lfa_search(data: StepData, factors: FactorMatrix, *,
+               root: Mapping[str, str] | StepData | None = None,
                heuristic: str = "bic",
                max_iterations: int = MAX_ITERATIONS,
                patience: int = PATIENCE,
                min_opportunities: int = MIN_OPPORTUNITIES,
                screen_separation: bool = True,
-               merge: bool = True,
+               merges: str = "lineage",
                beam: int = BEAM,
                warm_start: bool = True,
                learnsphere_compat: bool = False,
@@ -660,6 +784,20 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
     skills in sorted order, and ties in the frontier break on
     ``(score, depth, history)``, so two runs on one input agree exactly.
 
+    :param root: the KC model to start from — ``None`` for the **All** model
+        (one skill on every step, the reference's own starting point and
+        exactly the ``Single-KC`` labelling an export usually carries), or a
+        ``step -> KC`` mapping or :class:`~leapfit.data.StepData` to begin from
+        a labelling you already have. The published method does the latter:
+        "the initial node is the existing cognitive model".
+
+        The root decides what the operators can do. From All there is nothing
+        to coarsen, so :data:`MERGES` earns nothing; from an authored
+        fine-grained model merging is immediately productive. It also decides
+        what the screens can protect you from: they refuse *moves*, and a root
+        is not a move, so a fine root may start the search already holding a KC
+        with no finite estimate — reported as
+        :attr:`LFAResult.root_separation` rather than silently.
     :param heuristic: one of :data:`HEURISTICS`.
     :param patience: stop after this many expansions that do not improve the
         incumbent; 0 to disable and run to ``max_iterations``.
@@ -667,9 +805,22 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
     :param screen_separation: estimability screen; see :func:`screen`. Leaving
         this off reproduces the reference, including its selection of KC models
         whose parameters have no finite estimate.
-    :param merge: offer lineage-undo merges. Only reachable states already
-        evicted from ``beam`` can come back this way, so it does nothing when
-        the frontier never fills.
+    :param merges: which merge operators to offer, one of :data:`MERGES`.
+
+        ``"lineage"`` (the default) undoes a recorded split. It can only reach
+        states that were already *scored* as children, so it does nothing
+        unless ``beam`` has evicted one since.
+
+        ``"pairwise"`` joins any two of the state's skills, and unlike lineage
+        it **enlarges the reachable set**: a KC that is the union of two
+        factors' steps is not expressible as any sequence of splits. It costs
+        ``C(|Q|, 2)`` extra candidates per expansion, small beside split's
+        ``|Q| * |P|`` whenever P is wide.
+
+        ``"both"`` offers each. Pairwise reaches strictly more *states* than
+        lineage, but from any given state the two offer different *moves*, so
+        under a finite iteration budget neither makes the other pointless —
+        see :data:`MERGES`.
     :param beam: unexpanded states retained.
     :param learnsphere_compat: score with the reference's conventions (student
         ridge, ``n_params = n_students + 2 * n_KCs``) rather than
@@ -689,6 +840,8 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
     """
     if heuristic not in HEURISTICS:
         raise ValueError(f"heuristic must be one of {HEURISTICS}, got {heuristic!r}")
+    if merges not in MERGES:
+        raise ValueError(f"merges must be one of {MERGES}, got {merges!r}")
     if beam < 1:
         raise ValueError(f"beam must be at least 1, got {beam!r}")
 
@@ -701,27 +854,35 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
         )
 
     at = dict(zip(factors.factors, factors.members))
-    root_labels = (ROOT_SKILL,) * len(factors.steps)
+    start = root_labels(factors, root)
     root, reason = _evaluate(
-        data, factors.steps, root_labels, (), None, 0, touched=(ROOT_SKILL,),
+        data, factors.steps, start, (), None, 0,
+        touched=tuple(sorted(set(start))),
         min_opportunities=0, separation=False,
         learnsphere_compat=learnsphere_compat,
         method=method, max_fun=max_fun)
-    if root is None:  # pragma: no cover - the All model is always identifiable
-        raise ValueError(f"the root 'All' model was refused: {reason}")
+    if root is None:
+        raise ValueError(
+            f"the root model was refused: {reason}. A root is a starting point "
+            "rather than a move, so the screens do not apply to it; this is "
+            "identification refusing the labelling itself."
+        )
 
     # A coefficient that separates the responses under the "All" model — a
     # student who never varied, say — separates under every refinement of it,
     # so no move can repair it and every state inherits a flat direction. Read
     # it once, at the root, and report it rather than letting it surface as an
     # unexplained ``separated=1`` on each state in turn.
-    root_design = build_afm_design(relabel(data, factors.steps, root_labels),
+    root_design = build_afm_design(relabel(data, factors.steps, start),
                                    learnsphere_compat=learnsphere_compat,
                                    recompute_opportunities=False)
-    persistent = tuple(
-        column for column in root_design.separated(data.y).columns
-        if not column.startswith(("kc_intercept:", "kc_slope:"))
-    )
+    at_root = root_design.separated(data.y).columns
+    kc_block = ("kc_intercept:", "kc_slope:")
+    persistent = tuple(c for c in at_root if not c.startswith(kc_block))
+    # A KC separated at the root is a different matter: a later split can
+    # divide its rows and remove the divergence, so it is not persistent — but
+    # the screens never saw it, because a root is not a move.
+    at_root_kcs = tuple(c for c in at_root if c.startswith(kc_block))
 
     # The source table is what makes a StepData large, and nothing a worker
     # does touches it: relabelling reads ``items``, opportunity counts read the
@@ -730,7 +891,7 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
     portable = dataclasses.replace(data, source=None, source_rows=None)
     initargs = (portable, factors.steps, learnsphere_compat, min_opportunities,
                 screen_separation, method, max_fun)
-    root_key = _partition(root_labels)
+    root_key = _partition(start)
     cache: dict[frozenset[frozenset[int]], LFAState] = {root_key: root}
     # The frontier holds *keys*, not states: an LFAState carries a coefficient
     # vector, so ``state in frontier`` would compare numpy arrays.
@@ -763,10 +924,10 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
             iteration += 1
 
             tried: list[tuple[tuple[str, ...], tuple[Move, ...], tuple[str, ...]]] = []
-            done = {(m.skill, m.factor) for m in parent.history}
+            done = {(m.kind, m.skill, m.factor) for m in parent.history}
             for skill in sorted(set(parent.labels)):
                 for factor in factors.factors:
-                    if (skill, factor) in done:
+                    if ("split", skill, factor) in done:
                         continue
                     child = split(parent.labels, factors.steps, skill, factor,
                                   at[factor])
@@ -775,16 +936,29 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
                     move = Move("split", skill, factor)
                     tried.append((child, (*parent.history, move),
                                   (f"{skill}{SPLIT_SEP}{factor}", skill)))
-            if merge:
+            if merges in ("lineage", "both"):
                 for i, move in enumerate(parent.history):
                     if move.kind != "split":
                         continue
                     history = parent.history[:i] + parent.history[i + 1:]
                     try:
-                        child = replay(history, factors)
+                        child = replay(history, factors, start)
                     except ValueError:
                         continue
                     tried.append((child, history, tuple(sorted(set(child)))))
+            if merges in ("pairwise", "both"):
+                skills = sorted(set(parent.labels))
+                for i, left in enumerate(skills):
+                    for right in skills[i + 1:]:
+                        if ("merge", left, right) in done:
+                            continue
+                        child = merge(parent.labels, left, right)
+                        if child is None:  # pragma: no cover - both present
+                            continue
+                        move = Move("merge", left, right)
+                        joined = MERGE_SEP.join(sorted((left, right)))
+                        tried.append(
+                            (child, (*parent.history, move), (joined,)))
 
             # The parent is fixed for the whole expansion, so its coefficients are
             # the seed every child starts from — pulled out here rather than
@@ -843,7 +1017,7 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
         rejected=Rejected(tuple(moves), tuple(reasons)), factors=factors,
         heuristic=heuristic, n_evaluated=len(cache), n_iterations=iteration,
         stopped=stopped, persistent_separation=persistent,
-        learnsphere_compat=learnsphere_compat,
+        root_separation=at_root_kcs, learnsphere_compat=learnsphere_compat,
     )
 
 
