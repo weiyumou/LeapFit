@@ -52,6 +52,7 @@ Issues = "https://github.com/weiyumou/LeapFit/issues"
 [project.scripts]
 leapfit-afm = "leapfit.cli:main"
 leapfit-pfa = "leapfit.cli:main_pfa"
+leapfit-lfa = "leapfit.cli:main_lfa"
 
 [tool.hatch.build.targets.wheel]
 packages = ["leapfit"]

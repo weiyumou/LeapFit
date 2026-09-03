@@ -3,8 +3,9 @@
 Student models for learning analytics and educational data mining, fitted
 directly from [DataShop](https://pslcdatashop.web.cmu.edu/) student-step
 exports. Today that is the **Additive Factors Model (AFM)** and **Performance
-Factors Analysis (PFA)**; Bayesian Knowledge Tracing (BKT) is on the
-[roadmap](#roadmap).
+Factors Analysis (PFA)**, plus **Learning Factors Analysis (LFA)** — a search
+for the KC model itself, scored by AFM. Bayesian Knowledge Tracing (BKT) is on
+the [roadmap](#roadmap).
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
@@ -24,7 +25,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit@v0.4.0"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 135 pass in ~50s; equivalence extras skip without R / artifacts
+uv run pytest          # 180 pass, 29 skip in ~21s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
@@ -61,6 +62,65 @@ the same `data`:
 from leapfit import build_pfa_design, fit_pfa
 
 pfa = fit_pfa(build_pfa_design(data), data.y)   # per-KC success/failure slopes
+```
+
+**Which KC model?** LFA turns that into a search. It is not another student
+model — the states *are* KC labellings, and each is scored by fitting AFM to
+it, so the identification pass, the separation check and the optimality
+certificate come along unchanged.
+
+```python
+from leapfit import build_factor_matrix, lfa_search, validate_top
+
+authored = {m: load_student_step("examples/student-step.txt", kc_model=m)
+            for m in ("Topics", "Skills")}
+factors  = build_factor_matrix(authored)   # the difficulty factors to split by
+search   = lfa_search(data, factors)       # greedy best-first on BIC
+
+print(search.summary())                    # trajectory, refusals, certificates
+print(search.frame().head())               # the ranked frontier, one row per state
+
+# then check the shortlist out of sample, on folds shared by every candidate
+print(validate_top(search, data, n=3, extra=authored, seeds=(0, 1, 2)).summary())
+```
+
+```
+LFA search over 16 difficulty factor(s), heuristic=BIC
+  6 expansion(s), 83 state(s) evaluated, stopped: no improvement
+  root  644.299
+  best  641.984  (improvement 2.315 over 1 move(s))
+  no moves refused
+  0 of 83 evaluated state(s) not at a certified optimum
+2 KCs, 15 params  ll=-274.6886  AIC=579.377  BIC=641.984
+  split all by fractions
+
+Paired CV of 5 candidate(s): item_blocked, 3 folds x 3 seed(s), pooled RMSE
+  BIC picked 'rank1' (cv_rmse 0.4590); held-out picks 'Topics'
+  they DISAGREE — the criterion's pick is not the best predictor
+  rank correlation 0.400
+  paired contrasts against 'root' (negative mean_diff beats it):
+     model baseline  mean_diff  sd_diff  n_folds  folds_better
+    Topics     root  -0.005674 0.005766        9             7
+     rank1     root  -0.004796 0.006096        9             7
+     rank2     root  -0.000112 0.008829        9             6
+    Skills     root   0.028462 0.025754        9             0
+```
+
+Read that as two answers, not one. BIC prefers a two-KC model to everything the
+search reached; held-out RMSE prefers `Topics`, the planted truth, which BIC
+ranks *below* it. Choosing a KC model by an information criterion and checking
+it out of sample are different questions, and `validate_top` reports the
+disagreement instead of hiding it — the protocol the reference's own follow-up
+prescribes. Pass `n_jobs=-1` to score each expansion across cores — a 5×
+wall-clock win on a real export, and bitwise the same answer.
+
+The same search from the command line, writing the labelling it found back out
+in a form DataShop can import:
+
+```bash
+leapfit-lfa examples/student-step.txt \
+    --factors Topics --factors Skills --validate 5 --compare Topics \
+    --seeds 0:3 -j -1 --out frontier.csv --qmatrix discovered-kc-model.txt
 ```
 
 The same comparisons from the command line:
@@ -168,6 +228,7 @@ producing compatible files from your own data.
 |---|---|---|
 | **AFM** | shipped | validated for equivalence against LearnSphere workflow output |
 | **PFA** | shipped | canonical fixed-effects PFA (Pavlik, Cen & Koedinger 2009) with strictly-prior counts; per-KC or pooled slopes, optional student intercepts. The audited reference builds its counts *including* each attempt's own outcome — that construction is reproducible here via an explicit option that warns, never silently |
+| **LFA** | shipped | a search over KC models rather than a model: greedy best-first on AFM's BIC or AIC, reproducing the reference's fit statistics to 1e-9. Every candidate move is screened for estimability and evidence — the reference's own selection contained a KC whose slope has no finite estimate, and that one move then appeared in all 99 states it reported — and the top states are validated out of sample on identical folds |
 | BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
 
 ## Development
@@ -178,8 +239,9 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 118 pass, 11 skip, ~25s
-AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 LearnSphere equivalence tests
+uv run pytest                                       # 180 pass, 29 skip, ~21s
+AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
+LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 ```
 
 With `Rscript` on `PATH`, three more tests fit the same designs through R's

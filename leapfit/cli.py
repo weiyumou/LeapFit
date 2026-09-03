@@ -14,6 +14,22 @@ One command per model family, identical interfaces:
 
     leapfit-pfa examples/student-step.txt --cv item_blocked
 
+``leapfit-lfa`` is the odd one out, because it answers a different question —
+*which* KC model, rather than how well a given one fits. It searches, then
+checks the shortlist out of sample, and can write the labelling it found back
+out in a form DataShop can import:
+
+    leapfit-lfa examples/student-step.txt \\
+        --factors Topics --factors Skills --heuristic bic \\
+        --validate 5 --compare Topics --seeds 0:3 -j -1 \\
+        --out frontier.csv --refusals refusals.csv \\
+        --qmatrix discovered-kc-model.txt
+
+Its table is one row per *searched state* rather than one per KC model, and it
+carries the moves the screens refused beside the states they would have
+produced. See :mod:`leapfit.lfa` for what the screens are and why a search
+needs them.
+
 Several schemes score the same fits in one pass, and the runs behind the means
 can be written out beside them:
 
@@ -59,6 +75,7 @@ produces the same table as ``-j 1``, sooner.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 
 import numpy as np
@@ -66,19 +83,26 @@ import pandas as pd
 
 from leapfit import (
     CONVENTIONS,
+    HEURISTICS,
+    MERGES,
     SCHEMES,
     build_afm_design,
+    build_factor_matrix,
     build_pfa_design,
     cross_validate,
     fit_afm,
     fit_pfa,
     from_frame,
+    lfa_search,
     list_kc_models,
+    load_student_step,
     paired_contrasts,
     paired_cross_validate,
     paired_scores,
     repeated_cross_validate,
+    validate_top,
 )
+from leapfit.lfa import BEAM, MAX_ITERATIONS, MIN_OPPORTUNITIES, PATIENCE, relabel
 
 
 def parse_seeds(spec: str | None) -> list[int] | None:
@@ -437,6 +461,273 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
 def main_pfa(argv: list[str] | None = None) -> int:
     """The ``leapfit-pfa`` console script."""
     return main(argv, family="pfa")
+
+
+# --------------------------------------------------------------------------
+# leapfit-lfa: search for the KC model, then check it out of sample
+#
+# A separate entry point rather than another ``family``, because the output is
+# a different shape: one row per *searched state* instead of one per KC model,
+# plus a trajectory, the moves the screens refused, and a labelling to write
+# back. What it shares with the others is the vocabulary — ``--cv``, ``-j``,
+# ``--out`` mean here what they mean there.
+# --------------------------------------------------------------------------
+
+
+def build_lfa_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="leapfit-lfa",
+        description="Search for a KC model with Learning Factors Analysis, "
+                    "scored by AFM, then validate the shortlist out of sample.")
+    p.add_argument("export", help="DataShop student-step export (tab-delimited)")
+    p.add_argument("--root", metavar="NAME",
+                   help="KC model to start the search from (default: the "
+                        "'All' model, one skill on every step — which is what "
+                        "a Single-KC column already is). Starting from an "
+                        "authored model is what gives --merges pairwise "
+                        "something to coarsen")
+    p.add_argument("--factors", action="append", dest="factor_models",
+                   metavar="NAME",
+                   help="KC model to draw difficulty factors from; repeatable. "
+                        "Default: every eligible model in the export. A model "
+                        "is eligible if it tags one KC per row and covers the "
+                        "same rows as the others.")
+    p.add_argument("--list-models", action="store_true",
+                   help="print the KC models in the export and exit")
+
+    p.add_argument("--heuristic", choices=HEURISTICS, default="bic",
+                   help="what the search ranks by (default: bic)")
+    p.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS,
+                   metavar="N", help=f"expansion budget (default: {MAX_ITERATIONS})")
+    p.add_argument("--patience", type=int, default=PATIENCE, metavar="N",
+                   help=f"stop after N expansions that do not improve the "
+                        f"incumbent; 0 disables (default: {PATIENCE})")
+    p.add_argument("--min-opportunities", type=int, default=MIN_OPPORTUNITIES,
+                   metavar="N",
+                   help="evidence screen: observations at T >= 1 a new KC must "
+                        f"have (default: {MIN_OPPORTUNITIES}); 0 disables")
+    p.add_argument("--no-screen-separation", action="store_true",
+                   help="accept moves whose KC parameters have no finite "
+                        "estimate — reproduces the reference, including its "
+                        "selection of such models")
+    p.add_argument("--merges", choices=MERGES, default="lineage",
+                   help="which merge operators to offer (default: lineage). "
+                        "'pairwise' joins any two of a state's skills and "
+                        "reaches KC models no sequence of splits can; "
+                        "'lineage' undoes a recorded split; 'both' offers "
+                        "each, since neither subsumes the other")
+    p.add_argument("--beam", type=int, default=BEAM, metavar="N",
+                   help=f"unexpanded states retained (default: {BEAM})")
+    p.add_argument("--no-warm-start", action="store_true",
+                   help="fit every state from zero instead of from its parent")
+    p.add_argument("--learnsphere-compat", action="store_true",
+                   help="score with the reference's conventions rather than "
+                        "rank(X); reproduction only")
+    p.add_argument("--method", default="TNC", help="TNC or L-BFGS-B")
+    p.add_argument("--max-fun", type=int, default=None, metavar="N")
+    p.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                   help="processes to score an expansion across; -1 is every "
+                        "core. A wall-clock knob only")
+
+    p.add_argument("--validate", type=int, default=5, metavar="N",
+                   help="cross-validate the top N states on shared folds "
+                        "(default: 5); 0 to skip")
+    p.add_argument("--compare", action="append", dest="compare_models",
+                   metavar="NAME",
+                   help="an authored KC model to score alongside them; "
+                        "repeatable")
+    p.add_argument("--cv", default="item_blocked", choices=SCHEMES,
+                   help="fold scheme for the validation (default: item_blocked)")
+    p.add_argument("--folds", type=int, default=3)
+    p.add_argument("--seeds", metavar="LO:HI|a,b,c",
+                   help="repeat the validation over these seeds")
+    p.add_argument("--convention", choices=CONVENTIONS, default="pooled")
+    p.add_argument("--baseline", metavar="NAME",
+                   help="what the paired contrasts difference against "
+                        "(default: root, the model the search began from)")
+
+    p.add_argument("--top", type=int, default=10, metavar="N",
+                   help="frontier rows to print (default: 10)")
+    p.add_argument("--out", metavar="FILE", help="the ranked frontier, as CSV")
+    p.add_argument("--refusals", metavar="FILE",
+                   help="the moves the screens refused and why, as CSV")
+    p.add_argument("--validation", metavar="FILE",
+                   help="the held-out comparison, as CSV")
+    p.add_argument("--qmatrix", metavar="FILE",
+                   help="the winning labelling, one row per step, ready to "
+                        "join for a DataShop KC-model import")
+    p.add_argument("--kc-model-name", default="LFA_search", metavar="NAME",
+                   help="what to call the discovered model in --qmatrix and "
+                        "--predictions (default: LFA_search)")
+    p.add_argument("--predictions", metavar="FILE",
+                   help="the export plus a Predicted Error Rate column for the "
+                        "winning model")
+    return p
+
+
+def _eligible_factor_models(export: str, wanted: list[str]) -> tuple[dict, list]:
+    """Load the requested models and drop the ones P cannot be built from.
+
+    The reference aborts on an ineligible model. Reporting which ones and why,
+    then proceeding with the rest, is more useful and no less explicit — the
+    exclusions are printed, so a run never quietly searches a smaller space
+    than was asked for.
+    """
+    loaded, excluded = {}, []
+    for name in wanted:
+        data = load_student_step(export, kc_model=name)
+        if max((len(row) for row in data.kcs), default=0) > 1:
+            excluded.append((name, "tags more than one KC on some rows"))
+            continue
+        loaded[name] = data
+    if not loaded:
+        return loaded, excluded
+
+    coverage: dict[int, list[str]] = {}
+    for name, data in loaded.items():
+        coverage.setdefault(len(data), []).append(name)
+    if len(coverage) > 1:
+        keep = max(coverage.values(), key=len)
+        for size, names in coverage.items():
+            if names is keep:
+                continue
+            for name in names:
+                majority = len(loaded[keep[0]])
+                reason = (f"covers {size:,} observations, not "
+                          f"{majority:,} like the majority")
+                excluded.append((name, reason))
+                del loaded[name]
+    return loaded, excluded
+
+
+def _qmatrix_frame(data, labels_by_step: dict, kc_name: str) -> pd.DataFrame:
+    """One row per step: how it is identified in the export, plus its KC."""
+    source = data.source.iloc[data.source_rows]
+    columns = [c for c in ("Problem Hierarchy", "Problem Name", "Step Name")
+               if c in source.columns]
+    frame = source[columns].copy()
+    frame[f"KC ({kc_name})"] = [labels_by_step[item] for item in data.items]
+    return frame.drop_duplicates().reset_index(drop=True)
+
+
+def main_lfa(argv: list[str] | None = None) -> int:
+    """The ``leapfit-lfa`` console script."""
+    args = build_lfa_parser().parse_args(argv)
+
+    available = list_kc_models(args.export)
+    if args.list_models:
+        print("\n".join(available) or "(no KC models found)")
+        return 0
+    if not available:
+        print(f"No 'KC (...)' columns in {args.export}", file=sys.stderr)
+        return 1
+
+    wanted = args.factor_models or available
+    if unknown := [m for m in wanted if m not in available]:
+        print(f"Unknown KC model(s) {unknown}. Available: {available}",
+              file=sys.stderr)
+        return 1
+    for name in args.compare_models or []:
+        if name not in available:
+            print(f"--compare {name!r} is not a KC model in the export. "
+                  f"Available: {available}", file=sys.stderr)
+            return 1
+
+    loaded, excluded = _eligible_factor_models(args.export, wanted)
+    for name, reason in excluded:
+        print(f"excluding {name!r} from the difficulty factors: {reason}",
+              file=sys.stderr)
+    if not loaded:
+        print("No KC model in the export can supply difficulty factors.",
+              file=sys.stderr)
+        return 1
+
+    factors = build_factor_matrix(loaded)
+    # Any eligible model serves as the observations: they share rows, and the
+    # search replaces the labelling anyway.
+    data = loaded[next(iter(loaded))]
+    print(f"factors from {list(loaded)}: {factors.summary()}", file=sys.stderr)
+    for column, reason in zip(factors.dropped, factors.reasons):
+        print(f"  dropped {column}: {reason}", file=sys.stderr)
+
+    root = None
+    if args.root:
+        if args.root not in available:
+            print(f"--root {args.root!r} is not a KC model in the export. "
+                  f"Available: {available}", file=sys.stderr)
+            return 1
+        root = load_student_step(args.export, kc_model=args.root)
+        print(f"root: {args.root} ({len(root.kc_names)} KCs)", file=sys.stderr)
+
+    result = lfa_search(
+        data, factors, root=root, heuristic=args.heuristic,
+        max_iterations=args.max_iterations, patience=args.patience,
+        min_opportunities=args.min_opportunities,
+        screen_separation=not args.no_screen_separation,
+        merges=args.merges, beam=args.beam,
+        warm_start=not args.no_warm_start,
+        learnsphere_compat=args.learnsphere_compat,
+        method=args.method, max_fun=args.max_fun, n_jobs=args.jobs)
+
+    print()
+    print(result.summary())
+    frame = result.frame()
+    print()
+    print(frame.head(args.top).to_string(
+        index=False, float_format=lambda v: f"{v:.4f}", max_colwidth=52))
+    if len(frame) > args.top:
+        print(f"({len(frame) - args.top} further state(s); --top N for more, "
+              "--out FILE for all)")
+
+    validation = None
+    if args.validate:
+        extra = {name: load_student_step(args.export, kc_model=name)
+                 for name in args.compare_models or []}
+        seeds = parse_seeds(args.seeds) or [0]
+        print(f"\n=== held-out check of the top {args.validate}, folds shared "
+              f"by every candidate ===", file=sys.stderr)
+        validation = validate_top(
+            result, data, n=args.validate, extra=extra, baseline=args.baseline,
+            scheme=args.cv, n_folds=args.folds, seeds=seeds,
+            convention=args.convention, method=args.method,
+            max_fun=args.max_fun, n_jobs=args.jobs)
+        print()
+        print(validation.summary())
+
+    if args.out:
+        frame.to_csv(args.out, index=False)
+        print(f"\nwrote {args.out}", file=sys.stderr)
+    if args.refusals:
+        # Written even when empty: "the screens refused nothing" is a result,
+        # and a missing file cannot be told from a run that never asked.
+        pd.DataFrame({"move": result.rejected.moves,
+                      "reason": result.rejected.reasons}).to_csv(
+            args.refusals, index=False)
+        print(f"wrote {args.refusals}", file=sys.stderr)
+    if args.validation:
+        if validation is None:
+            print(f"not writing {args.validation}: --validate 0 skipped it",
+                  file=sys.stderr)
+        else:
+            validation.frame().to_csv(args.validation, index=False)
+            print(f"wrote {args.validation}", file=sys.stderr)
+    if args.qmatrix:
+        _qmatrix_frame(data, result.best.kc_model(factors.steps),
+                       args.kc_model_name).to_csv(
+            args.qmatrix, sep="\t", index=False, lineterminator="\n")
+        print(f"wrote {args.qmatrix}", file=sys.stderr)
+    if args.predictions:
+        scored = relabel(data, factors.steps, result.best.labels)
+        scored = dataclasses.replace(scored, kc_model=args.kc_model_name)
+        design = build_afm_design(scored,
+                                  learnsphere_compat=args.learnsphere_compat,
+                                  recompute_opportunities=False)
+        fit = fit_afm(design, scored.y, method=args.method,
+                      max_fun=args.max_fun, warn_separated=False)
+        fit.annotate(scored).to_csv(args.predictions, sep="\t", index=False,
+                                    float_format="%.6f", lineterminator="\n")
+        print(f"wrote {args.predictions}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":

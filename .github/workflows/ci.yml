@@ -77,5 +77,8 @@ jobs:
           assert fit.is_optimal, fit.summary()
           print("ok:", leapfit.__version__, fit.aic)
           PY
-      - name: Console script is on PATH
-        run: /tmp/venv/bin/leapfit-afm --help
+      - name: Console scripts are on PATH
+        run: |
+          /tmp/venv/bin/leapfit-afm --help
+          /tmp/venv/bin/leapfit-pfa --help
+          /tmp/venv/bin/leapfit-lfa --help
