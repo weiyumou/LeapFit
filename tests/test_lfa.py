@@ -20,6 +20,8 @@ instead would have passed all three.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -502,6 +504,51 @@ def test_a_state_reports_its_kc_model_as_step_to_label():
     mapping = res.best.kc_model(P.steps)
     assert set(mapping) == set(P.steps)
     assert set(mapping.values()) == set(res.best.labels)
+
+
+# --------------------------------------------------------------------------
+# Scoring across processes
+# --------------------------------------------------------------------------
+
+
+def test_the_worker_count_does_not_move_a_single_digit():
+    """``n_jobs`` is a wall-clock knob, not a modelling one.
+
+    The candidates of one expansion are independent and their parent is fixed,
+    so how the work is partitioned cannot reach a score. Results come back in
+    submission order, so the frontier is built in the same sequence whatever
+    the worker count — which is what makes this an equality rather than an
+    approximation.
+    """
+    models, P = _example_factors()
+    one = lfa_search(models["Topics"], P, max_iterations=4, n_jobs=1)
+    two = lfa_search(models["Topics"], P, max_iterations=4, n_jobs=2)
+    assert [s.bic for s in one.states] == [s.bic for s in two.states]
+    assert [s.ll for s in one.states] == [s.ll for s in two.states]
+    assert [s.labels for s in one.states] == [s.labels for s in two.states]
+    assert one.rejected.moves == two.rejected.moves
+    assert one.n_evaluated == two.n_evaluated
+    assert one.stopped == two.stopped
+    assert one.frame().equals(two.frame())
+
+
+def test_n_jobs_follows_joblibs_convention():
+    from leapfit.lfa import _worker_count
+    cores = os.cpu_count() or 1
+    assert _worker_count(1, 100) == 1
+    assert _worker_count(None, 100) == 1, "None is serial, as in crossval"
+    assert _worker_count(0, 100) == 1
+    assert _worker_count(3, 100) == 3
+    assert _worker_count(-1, 100) == cores, "-1 is every core"
+    assert _worker_count(-2, 100) == max(1, cores - 1), "-2 is all but one"
+
+
+def test_a_serial_search_leaves_no_observations_pinned_in_the_caller():
+    """The serial path shares the worker's globals; it must not keep them."""
+    from leapfit.lfa import _WORKER
+    models, P = _example_factors()
+    lfa_search(models["Topics"], P, max_iterations=2, n_jobs=1)
+    assert not _WORKER, "the module-level scratch space is cleared on exit"
 
 
 # --------------------------------------------------------------------------

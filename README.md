@@ -111,7 +111,9 @@ search reached; held-out RMSE prefers `Topics`, the planted truth, which BIC
 ranks *below* it. Choosing a KC model by an information criterion and checking
 it out of sample are different questions, and `validate_top` reports the
 disagreement instead of hiding it — the protocol the reference's own follow-up
-prescribes. LFA is Python-only for now; there is no `leapfit-lfa` yet.
+prescribes. Pass `n_jobs=-1` to score each expansion across cores — a 5×
+wall-clock win on a real export, and bitwise the same answer. LFA is
+Python-only for now; there is no `leapfit-lfa` yet.
 
 The same comparisons from the command line:
 
