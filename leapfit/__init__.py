@@ -22,7 +22,8 @@ model families never means reshaping data.
     print(fit.summary())
     print(cross_validate(design, data, scheme="item_blocked").summary())
 
-Layout — shared infrastructure, then one module per model family:
+Layout — shared infrastructure, one module per model family, then searches
+over the KC model a family conditions on:
 
     leapfit.data      the export -> StepData (parsing rules, practice order)
     leapfit.design    Block / Design: columns carrying their own penalty+bounds
@@ -30,6 +31,8 @@ Layout — shared infrastructure, then one module per model family:
     leapfit.crossval  fold schemes and both RMSE conventions
     leapfit.afm       Additive Factors Model
     leapfit.pfa       Performance Factors Analysis
+    leapfit.lfa       Learning Factors Analysis: a search over KC models,
+                      scored by AFM
 """
 
 __version__ = "0.4.0"
@@ -67,6 +70,17 @@ from leapfit.design import (
     coefficient_frame,
 )
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
+from leapfit.lfa import (
+    HEURISTICS,
+    MIN_OPPORTUNITIES,
+    FactorMatrix,
+    LFAResult,
+    LFAState,
+    Move,
+    Rejected,
+    build_factor_matrix,
+    lfa_search,
+)
 from leapfit.pfa import (
     PFAFit,
     build_pfa_design,
@@ -78,6 +92,8 @@ __all__ = [
     "CONVENTIONS",
     "DEFAULT_METHOD",
     "FIRST_ATTEMPT_VALUES",
+    "HEURISTICS",
+    "MIN_OPPORTUNITIES",
     "SCHEMES",
     "STUDENT_L2",
     "AFMFit",
@@ -85,13 +101,19 @@ __all__ = [
     "Block",
     "CVResult",
     "Design",
+    "FactorMatrix",
+    "LFAResult",
+    "LFAState",
     "LogisticFit",
+    "Move",
     "PFAFit",
+    "Rejected",
     "Separated",
     "StepData",
     "__version__",
     "accumulator_block",
     "build_afm_design",
+    "build_factor_matrix",
     "build_pfa_design",
     "coefficient_frame",
     "cross_validate",
@@ -99,6 +121,7 @@ __all__ = [
     "fit_logistic",
     "fit_pfa",
     "from_frame",
+    "lfa_search",
     "list_kc_models",
     "load_student_step",
     "make_folds",

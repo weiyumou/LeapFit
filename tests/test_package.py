@@ -26,9 +26,14 @@ REPO = Path(__file__).resolve().parent.parent
 SHARED = ["leapfit.data", "leapfit.design", "leapfit.fit", "leapfit.crossval"]
 FAMILIES = ["leapfit.afm", "leapfit.pfa"]
 
+#: Modules that sit *above* a family rather than beside it. A search over KC
+#: models is scored by AFM's own AIC/BIC, so ``leapfit.lfa`` imports
+#: ``leapfit.afm`` deliberately — and nothing below it may import back.
+CONSUMERS = ["leapfit.lfa"]
+
 
 def test_every_promised_module_imports():
-    for name in [*SHARED, *FAMILIES, "leapfit.cli"]:
+    for name in [*SHARED, *FAMILIES, *CONSUMERS, "leapfit.cli"]:
         assert importlib.import_module(name) is not None, name
 
 
@@ -95,6 +100,30 @@ def test_the_family_modules_do_not_import_each_other():
                 continue
             assert f"import {other}" not in source and f"from {other}" not in source, (
                 f"{name} imports {other}")
+
+
+def test_nothing_below_a_search_imports_it():
+    """The edge into ``leapfit.lfa`` runs one way only.
+
+    A search consumes a model family; if the shared layer or a family ever
+    imports the search back, the layering that keeps a new model family a new
+    file has inverted, and `leapfit.lfa` becomes load-bearing for fits that
+    have nothing to do with a search.
+    """
+    for name in [*SHARED, *FAMILIES]:
+        source = (REPO / f"{name.replace('.', '/')}.py").read_text()
+        for consumer in CONSUMERS:
+            assert (f"import {consumer}" not in source
+                    and f"from {consumer}" not in source), (
+                f"{name} imports {consumer}; a search sits above a family, "
+                "never below one")
+
+
+def test_a_search_module_may_import_the_family_it_scores_with():
+    """The complement, stated so the one-way rule is not read as "no edge"."""
+    source = (REPO / "leapfit/lfa.py").read_text()
+    assert "from leapfit.afm import" in source, (
+        "leapfit.lfa scores states with AFM; that import is the design")
 
 
 @pytest.mark.parametrize("entry", ["leapfit.cli"])

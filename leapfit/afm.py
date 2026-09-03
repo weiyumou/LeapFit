@@ -181,6 +181,7 @@ class AFMFit(LogisticFit):
 
 def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
             max_fun: int | None = None, tol: float | None = None,
+            w0: np.ndarray | None = None,
             warn_not_converged: bool = True,
             warn_separated: bool = True) -> AFMFit:
     """Fit AFM by penalized maximum likelihood under box constraints.
@@ -196,10 +197,13 @@ def fit_afm(design: Design, y, *, method: str = DEFAULT_METHOD,
     :param max_fun: budget in function evaluations. ``None`` uses the solver's
         default, which is what every published AFM fit effectively used (see
         :mod:`leapfit.fit` on the reference's inert ``maxiter``).
+    :param w0: starting point, defaulting to zeros. :mod:`leapfit.lfa` seeds
+        each searched KC model from its parent's coefficients; see
+        :func:`~leapfit.fit.fit_logistic` for why that cannot corrupt a score.
     :param warn_separated: warn when some coefficient has no finite MLE (see
         :meth:`~leapfit.design.Design.separated`).
     """
     return fit_logistic(design, y, method=method, max_fun=max_fun, tol=tol,
-                        warn_not_converged=warn_not_converged,
+                        w0=w0, warn_not_converged=warn_not_converged,
                         warn_separated=warn_separated, result_type=AFMFit,
                         label="AFM", stacklevel=3)  # 3: attribute past this wrapper
