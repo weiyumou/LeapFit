@@ -25,7 +25,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit@v0.4.0"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 180 pass, 11 skip in ~21s; extras need R / LearnSphere artifacts
+uv run pytest          # 180 pass, 29 skip in ~21s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
@@ -229,8 +229,9 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 180 pass, 11 skip, ~21s
-AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 LearnSphere equivalence tests
+uv run pytest                                       # 180 pass, 29 skip, ~21s
+AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
+LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 ```
 
 With `Rscript` on `PATH`, three more tests fit the same designs through R's
