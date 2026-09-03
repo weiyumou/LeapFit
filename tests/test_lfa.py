@@ -658,3 +658,88 @@ def test_rank_correlation_needs_three_candidates():
     val = validate_top(res, models["Topics"], n=1, include_root=True)
     assert val.rank_correlation() != val.rank_correlation(), "NaN for two"
     assert "undefined" in val.summary()
+
+
+# --------------------------------------------------------------------------
+# The leapfit-lfa console script
+# --------------------------------------------------------------------------
+
+
+def _lfa_cli(*extra, export=EXAMPLE):
+    from leapfit.cli import main_lfa
+    return main_lfa([export, "--max-iterations", "2", "--validate", "0", *extra])
+
+
+def test_cli_lfa_writes_the_frontier_and_the_refusals(tmp_path):
+    frontier, refusals = tmp_path / "f.csv", tmp_path / "r.csv"
+    assert _lfa_cli("--out", str(frontier), "--refusals", str(refusals)) == 0
+    table = pd.read_csv(frontier)
+    assert {"rank", "n_kcs", "n_params", "bic", "is_optimal", "history"} <= set(table.columns)
+    assert table["rank"].tolist() == list(range(1, len(table) + 1))
+    # Written even when nothing was refused: an empty file is a result, a
+    # missing one cannot be told from a run that never asked.
+    assert set(pd.read_csv(refusals).columns) == {"move", "reason"}
+
+
+def test_cli_lfa_writes_a_kc_model_ready_to_join(tmp_path):
+    out = tmp_path / "q.txt"
+    assert _lfa_cli("--qmatrix", str(out), "--kc-model-name", "Discovered") == 0
+    table = pd.read_csv(out, sep="\t", dtype=str)
+    assert list(table.columns) == ["Problem Name", "Step Name", "KC (Discovered)"]
+    assert len(table) == 40, "one row per step, not per observation"
+    assert table["KC (Discovered)"].nunique() >= 2, "the search split something"
+
+
+def test_cli_lfa_annotates_the_export_under_the_discovered_model(tmp_path):
+    out = tmp_path / "annotated.txt"
+    assert _lfa_cli("--predictions", str(out), "--kc-model-name", "Found") == 0
+    written = pd.read_csv(out, sep="\t", dtype=str, keep_default_na=False)
+    assert "Predicted Error Rate (Found)" in written.columns
+    assert (written["Predicted Error Rate (Found)"] != "").all()
+    assert "KC (Topics)" in written.columns, "the export round-trips verbatim"
+
+
+def test_cli_lfa_validates_the_shortlist_and_writes_it(tmp_path):
+    from leapfit.cli import main_lfa
+    out = tmp_path / "v.csv"
+    assert main_lfa([EXAMPLE, "--max-iterations", "2", "--validate", "2",
+                     "--compare", "Topics", "--validation", str(out)]) == 0
+    table = pd.read_csv(out)
+    assert {"cv_rmse", "search_rank", "cv_rank"} <= set(table.columns)
+    assert "Topics" in set(table["model"]), "--compare joins the comparison"
+    assert "root" in set(table["model"])
+
+
+def test_cli_lfa_says_so_rather_than_writing_an_empty_validation(tmp_path, capsys):
+    out = tmp_path / "v.csv"
+    assert _lfa_cli("--validation", str(out)) == 0
+    assert not out.exists()
+    assert "--validate 0 skipped it" in capsys.readouterr().err
+
+
+def test_cli_lfa_excludes_a_multi_kc_model_from_the_factors(tmp_path, capsys):
+    """The reference aborts; this reports and proceeds with what is eligible."""
+    rows = _mixed("s1", "a", "X", 4) + _mixed("s1", "b", "Y", 4) + \
+        _mixed("s2", "a", "X", 4) + _mixed("s2", "b", "Y", 4)
+    df = _frame(rows, "clean")
+    df["KC (wide)"] = "P~~Q"
+    df["Opportunity (wide)"] = df["Opportunity (clean)"] + "~~1"
+    export = tmp_path / "export.txt"
+    df.to_csv(export, sep="\t", index=False, lineterminator="\n")
+
+    assert _lfa_cli("--min-opportunities", "1", export=str(export)) == 0
+    err = capsys.readouterr().err
+    assert "excluding 'wide'" in err and "more than one KC" in err
+
+
+def test_cli_lfa_refuses_an_unknown_model_name(tmp_path, capsys):
+    assert _lfa_cli("--factors", "Nope") == 1
+    assert "Unknown KC model" in capsys.readouterr().err
+    assert _lfa_cli("--compare", "Nope") == 1
+    assert "is not a KC model" in capsys.readouterr().err
+
+
+def test_cli_lfa_lists_the_models_and_exits(capsys):
+    from leapfit.cli import main_lfa
+    assert main_lfa([EXAMPLE, "--list-models"]) == 0
+    assert capsys.readouterr().out.split() == ["Skills", "Topics"]

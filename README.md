@@ -112,8 +112,16 @@ ranks *below* it. Choosing a KC model by an information criterion and checking
 it out of sample are different questions, and `validate_top` reports the
 disagreement instead of hiding it — the protocol the reference's own follow-up
 prescribes. Pass `n_jobs=-1` to score each expansion across cores — a 5×
-wall-clock win on a real export, and bitwise the same answer. LFA is
-Python-only for now; there is no `leapfit-lfa` yet.
+wall-clock win on a real export, and bitwise the same answer.
+
+The same search from the command line, writing the labelling it found back out
+in a form DataShop can import:
+
+```bash
+leapfit-lfa examples/student-step.txt \
+    --factors Topics --factors Skills --validate 5 --compare Topics \
+    --seeds 0:3 -j -1 --out frontier.csv --qmatrix discovered-kc-model.txt
+```
 
 The same comparisons from the command line:
 

@@ -137,8 +137,20 @@ def test_the_cli_entry_point_runs(entry):
     assert "--kc-model" in result.stdout
 
 
+def test_the_search_entry_point_runs():
+    """``leapfit-lfa`` is a separate entry point, so it needs its own check."""
+    script = "import leapfit.cli as c; raise SystemExit(c.main_lfa(['--help']))"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, cwd=REPO, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--factors" in result.stdout and "--qmatrix" in result.stdout
+
+
 def test_console_scripts_are_declared():
     with (REPO / "pyproject.toml").open("rb") as fh:
         scripts = tomllib.load(fh)["project"]["scripts"]
     assert scripts["leapfit-afm"] == "leapfit.cli:main"
     assert scripts["leapfit-pfa"] == "leapfit.cli:main_pfa"
+    assert scripts["leapfit-lfa"] == "leapfit.cli:main_lfa"
