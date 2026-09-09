@@ -3,6 +3,65 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## Unreleased
+
+### Added
+
+- **Logistic Knowledge Tracing, static features** (`leapfit/lkt.py`). A model
+  is a list of `Term`s, each pairing a *component* (any factor the export
+  carries — student, item, KC, or a column of the source table) with a
+  *feature* of that component's practice history for that student; the
+  reference's `$` suffix fits one coefficient per level instead of one shared.
+  `lkt_terms` takes the reference's own parallel `components`/`features`
+  vectors so a specification can be copied out of a paper unchanged, and
+  `LKTFit.component_values` generalizes `AFMFit.kc_values` to any component.
+
+  AFM and PFA turn out to be single LKT specifications, and
+  `build_lkt_design` reproduces both designs column for column — including the
+  aliasing, the parameter count and the likelihood. Both identities are pinned
+  by tests, with the AFM one against `recompute_opportunities=True`, because
+  LKT counts practice from the ordering rather than reading DataShop's
+  `Opportunity` column.
+
+  Implemented are the features that are pure functions of prior success and
+  failure counts: `intercept`, `lineafm`, `logafm`, `powafm` (at a fixed
+  exponent), `linesuc`, `logsuc`, `linefail`, `logfail`, `linecomp`, `prop`
+  and `numer`. `history_counts` is `success_failure_counts` with the KC
+  hardcoding lifted to an arbitrary component. Everything else the reference
+  computes is **refused by name with the reason** — a clock it does not have,
+  or a decay parameter nothing here fits — because a spec silently missing a
+  term is worse than one that will not build.
+
+- **`cost=`, the reference's penalty, expressed exactly.** LKT solves through
+  `LiblineaR(type = 0, cost = 512)`, which is this package's objective with
+  `l2 = 1/cost` on every column. The default stays `l2 = 0` with an identified
+  design: that ridge is an identification device, and `Design.identify`
+  removes the redundancy exactly instead. `test_the_reference_ridge_hides_a_separation_the_default_reports`
+  pins what the difference costs.
+
+- **Equivalence against the reference's published output**
+  (`tests/test_lkt_equivalence.py`), without an R interpreter. The CRAN
+  tarball ships both halves of a fixture — `largerawsample.rda` and a
+  precompiled vignette printing each model's log-likelihood to eight decimals
+  — which is the same kind of artifact as LearnSphere's `model_values.xml`.
+  On the vignette's AFM chunk leapfit reaches **-27346.740** against its
+  published **-27347.207**: 0.47 nats better, from a KKT-certified optimum, so
+  by the two-sided criterion this suite already uses the gap is the
+  reference's optimizer stopping early. The test decomposes it rather than
+  asserting it — the ridge accounts for 0.036 nats and the choice of reference
+  level for 0.015, leaving `LiblineaR`'s default `epsilon = 1e-4`.
+
+### Known limitations
+
+- Per-level intercepts on any combination of components other than
+  student + KC are **refused**, not fitted. `m` such blocks carry `m - 1`
+  redundant directions and `Design.identify` breaks exactly one; fitting the
+  rest would make AIC and BIC charge for parameters that do not exist. Pass
+  `identify=False` to take the parameter count on yourself.
+- No global intercept (`interc=TRUE`), no `*` or `:` connectors, no
+  `interacts`, no `autoKC`, no `@` random effects, and no `leapfit-lkt`
+  console script yet.
+
 ## 0.5.0 — 2026-09-03
 
 ### Added

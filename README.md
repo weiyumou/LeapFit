@@ -2,10 +2,11 @@
 
 Student models for learning analytics and educational data mining, fitted
 directly from [DataShop](https://pslcdatashop.web.cmu.edu/) student-step
-exports. Today that is the **Additive Factors Model (AFM)** and **Performance
-Factors Analysis (PFA)**, plus **Learning Factors Analysis (LFA)** — a search
-for the KC model itself, scored by AFM. Bayesian Knowledge Tracing (BKT) is on
-the [roadmap](#roadmap).
+exports. Today that is the **Additive Factors Model (AFM)**, **Performance
+Factors Analysis (PFA)** and **Logistic Knowledge Tracing (LKT)** — of which
+the first two turn out to be single specifications — plus **Learning Factors
+Analysis (LFA)**, a search for the KC model itself, scored by AFM. Bayesian
+Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
@@ -63,6 +64,27 @@ from leapfit import build_pfa_design, fit_pfa
 
 pfa = fit_pfa(build_pfa_design(data), data.y)   # per-KC success/failure slopes
 ```
+
+**A model is a list of terms.** LKT pairs a *component* — a factor whose levels
+partition the data — with a *feature* of that component's practice history, and
+`$` fits one coefficient per level instead of one shared. AFM and PFA are two
+points in that space (`build_lkt_design` reproduces both designs column for
+column, which is a test); the interesting specifications are the other ones.
+
+```python
+from leapfit import build_lkt_design, fit_lkt, lkt_terms
+
+terms = lkt_terms(components=("student", "student", "kc", "kc"),
+                  features=("intercept", "logsuc", "intercept", "lineafm$"))
+lkt = fit_lkt(build_lkt_design(data, terms), data.y)
+
+print(lkt.notation())                        # the spec it fitted, in LKT notation
+print(lkt.component_values(data, "kc"))      # one row per level, one column per feature
+```
+
+Features that need a clock (`recency`, `base`, `ppe`) or a fitted decay rate
+(`logitdec`, `propdec`) are refused by name with the reason rather than
+silently dropped; see the [roadmap](#roadmap).
 
 **Which KC model?** LFA turns that into a search. It is not another student
 model — the states *are* KC labellings, and each is scored by fitting AFM to
@@ -229,6 +251,8 @@ producing compatible files from your own data.
 | **AFM** | shipped | validated for equivalence against LearnSphere workflow output |
 | **PFA** | shipped | canonical fixed-effects PFA (Pavlik, Cen & Koedinger 2009) with strictly-prior counts; per-KC or pooled slopes, optional student intercepts. The audited reference builds its counts *including* each attempt's own outcome — that construction is reproducible here via an explicit option that warns, never silently |
 | **LFA** | shipped | a search over KC models rather than a model: greedy best-first on AFM's BIC or AIC, reproducing the reference's fit statistics to 1e-9. Every candidate move is screened for estimability and evidence — the reference's own selection contained a KC whose slope has no finite estimate, and that one move then appeared in all 99 states it reported — and the top states are validated out of sample on identical folds |
+| **LKT** | shipped, static features | components x features, of which AFM and PFA are single specifications — both identities are pinned by tests. Implemented are the features that are pure functions of prior success and failure counts (`intercept`, `lineafm`, `logafm`, `powafm` at a fixed exponent, `linesuc/fail`, `logsuc/fail`, `linecomp`, `prop`, `numer`), over any component the export carries. Validated against the reference's own published output: the CRAN package's precompiled vignette prints the log-likelihood of each model it fits, and leapfit reaches the AFM chunk's **-27347.207** within 0.5 nats — on the better side of it, from a certified optimum, because the reference's `LiblineaR` stops at `epsilon = 1e-4`. Written clean-room: the reference is GPL-3, so this module is validated against it rather than adapted from it |
+| LKT, time and decay features | planned | `recency`, `base`, `ppe` need numeric time in `StepData`; `logitdec`, `propdec` and friends make the design a function of a fitted parameter, which needs an outer optimizer over the profile likelihood and an honest `nPars = rank + k` |
 | BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
 
 ## Development
@@ -239,10 +263,16 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 180 pass, 29 skip, ~21s
+uv run pytest                                       # 273 pass, 36 skip, ~26s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
+LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 7 LKT equivalence tests
 ```
+
+The LKT fixture is built from the CRAN tarball rather than shipped, because the
+reference package is GPL-3 and this one is MIT —
+`results/lkt-vignette/scripts/make_fixture.py` converts it and
+`tests/test_lkt_equivalence.py` documents the two commands.
 
 With `Rscript` on `PATH`, three more tests fit the same designs through R's
 `stats::glm` and require agreement to numerical precision (~1e-8 in
@@ -252,3 +282,10 @@ log-likelihood) — any R works, e.g.
 ## License
 
 [MIT](LICENSE)
+
+One provenance note, because the distinction matters. AFM, PFA and LFA are
+*adapted from* LearnSphere's reference components. `leapfit.lkt` is not: its
+reference, the CRAN package [LKT](https://CRAN.R-project.org/package=LKT), is
+GPL-3, so that module is written from the published equations and the
+reference's documented feature semantics, and then **validated against** its
+output. No LKT source is translated here.

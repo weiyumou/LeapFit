@@ -31,6 +31,8 @@ over the KC model a family conditions on:
     leapfit.crossval  fold schemes and both RMSE conventions
     leapfit.afm       Additive Factors Model
     leapfit.pfa       Performance Factors Analysis
+    leapfit.lkt       Logistic Knowledge Tracing: components x features, of
+                      which AFM and PFA are two specifications
     leapfit.lfa       Learning Factors Analysis: a search over KC models,
                       scored by AFM
 """
@@ -85,6 +87,18 @@ from leapfit.lfa import (
     root_labels,
     validate_top,
 )
+from leapfit.lkt import (
+    REFERENCE_COST,
+    STATIC_FEATURES,
+    LKTFit,
+    Term,
+    build_lkt_design,
+    component_labels,
+    design_terms,
+    fit_lkt,
+    history_counts,
+    lkt_terms,
+)
 from leapfit.pfa import (
     PFAFit,
     build_pfa_design,
@@ -99,7 +113,9 @@ __all__ = [
     "HEURISTICS",
     "MERGES",
     "MIN_OPPORTUNITIES",
+    "REFERENCE_COST",
     "SCHEMES",
+    "STATIC_FEATURES",
     "STUDENT_L2",
     "AFMFit",
     "Aliased",
@@ -110,25 +126,33 @@ __all__ = [
     "LFAResult",
     "LFAState",
     "LFAValidation",
+    "LKTFit",
     "LogisticFit",
     "Move",
     "PFAFit",
     "Rejected",
     "Separated",
     "StepData",
+    "Term",
     "__version__",
     "accumulator_block",
     "build_afm_design",
     "build_factor_matrix",
+    "build_lkt_design",
     "build_pfa_design",
     "coefficient_frame",
+    "component_labels",
     "cross_validate",
+    "design_terms",
     "fit_afm",
+    "fit_lkt",
     "fit_logistic",
     "fit_pfa",
     "from_frame",
+    "history_counts",
     "lfa_search",
     "list_kc_models",
+    "lkt_terms",
     "load_student_step",
     "make_folds",
     "paired_contrasts",
