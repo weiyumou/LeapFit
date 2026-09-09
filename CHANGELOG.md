@@ -7,6 +7,62 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Added
 
+- **`fit_lkt_pars`: fitting LKT's feature parameters, not just choosing them.**
+  A profile likelihood over the design builder — each candidate parameter
+  vector recomputes the features, rebuilds the design and fits the
+  coefficients to convergence, and an outer L-BFGS-B walks the resulting
+  surface. That is the reference's own procedure; three things around it are
+  not.
+
+  *The parameters are counted.* `LKTFit.n_params` becomes `rank(X) + k`, so a
+  searched model's AIC and BIC are charged for the search. The reference
+  reports no parameter count at all.
+
+  *Stationarity is measured, not inferred.* The profile is **not** convex, so
+  the inner KKT certificate — which does prove a global optimum over the
+  coefficients — says nothing about the parameters. After the optimizer stops,
+  every parameter is stepped by `PARAMETER_STEP` in both directions and
+  refitted; `LKTProfile.max_gain` is the best improvement any of those found,
+  in nats, and `is_stationary` compares it against `PARAMETER_TOLERANCE`. It is
+  reported next to, not instead of, the optimizer's own `converged` flag,
+  because they answer different questions.
+
+  *Restarts turn an assumption into a measurement.* Pass several `starts` and
+  the summary reports how many distinct optima they reached and how far apart.
+  One start says nothing about other basins, and the summary says so.
+
+  Identification is decided once at the seed and held for every evaluation
+  (`_conform`), for the reason `Design.take` already holds it across CV folds:
+  a parameter value that made one more column identically zero would change
+  the parameter count mid-search and make one evaluation's AIC incomparable
+  with the next's.
+
+- **`objective=`, because the reference profiles a surface it is not
+  maximizing.** `"penalized"` (the default) profiles the objective the inner
+  solver actually maximizes, so the pair (parameters, coefficients) maximizes
+  one function. `"likelihood"` profiles the plain Bernoulli log-likelihood of a
+  *ridged* fit, which is the reference's choice and is not a single objective;
+  the two coincide whenever `l2 = 0`, and part company as soon as `cost` is
+  finite.
+
+- **The reference's RPFA search reproduced, path and endpoint.** Its vignette
+  prints every evaluation, so the whole `optim` trajectory is visible.
+  `test_the_references_search_path_is_reproduced_point_by_point` checks four
+  of the points it visited (agreement around 0.05 nats — tighter than any
+  other chunk, because the spec has no time features), and
+  `test_the_parameter_search_reaches_the_references_optimum` runs the loop:
+  the reference stops at `propdec2 = 0.3736667`, leapfit reaches `0.37338`
+  with a better likelihood from a stationary point. Worth knowing why it can:
+  R's `optim` at `factr = 1e12` stops once the objective improves by less than
+  about 6 nats, and the reference's own next probe already reported a better
+  value than the one it returned.
+
+  Two defaults follow the reference deliberately. `PARAMETER_BOUNDS` is its
+  `(1e-5, 0.99999)`, recycled across every parameter whatever it means; and
+  the outer differencing step is R's `ndeps = 1e-3` rather than scipy's `1e-8`,
+  because the profile is only as smooth as the inner solve is tight and a step
+  that small differentiates the inner optimizer's own noise.
+
 - **LKT features that read the clock and the outcome history**, at parameters
   the caller fixes. Thirty-one features now, up from eleven: decayed histories
   (`expdecafm`, `expdecsuc`, `expdecfail`, `propdec`, `propdec2`, `logitdec`),
@@ -125,9 +181,11 @@ while the major version is 0, a minor bump may change the public API.
   inside the span, so it is a reparameterization rather than a new direction,
   and the three time-feature chunks reproduced here pass `interc=TRUE` while
   this package fits the same span without it.
-- Nothing fits a decay rate. Every parametric feature is held where the caller
-  puts it, so a search over rates — the reference's outer `optim` — is the next
-  stage, along with `nPars = rank + k` and a certificate for the outer loop.
+- No search over *terms*. `fit_lkt_pars` fits a specification's parameters;
+  choosing which features on which components to include is the reference's
+  `buildLKTModel`, and that is a consumer of the family — the shape
+  `leapfit.lfa` already has over `leapfit.afm` — rather than more of
+  `leapfit.lkt`.
 
 ## 0.5.0 — 2026-09-03
 

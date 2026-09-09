@@ -100,14 +100,15 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.optimize import minimize
 
 from leapfit.data import StepData
-from leapfit.design import Block, Design
+from leapfit.design import Aliased, Block, Design
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
 
 #: ``LiblineaR``'s cost in the reference's own default call, as ``l2 = 1/cost``.
@@ -959,9 +960,23 @@ class LKTFit(LogisticFit):
     """A fitted LKT model: everything :class:`~leapfit.fit.LogisticFit`
     reports, plus a per-component view of the coefficients."""
 
+    #: Nonlinear feature parameters fitted alongside the coefficients, by
+    #: :func:`fit_lkt_pars`. Zero when the parameters were held where the
+    #: caller put them. They are **counted in** :attr:`n_params`, and therefore
+    #: in AIC and BIC, because they were estimated from the same data.
+    n_fitted_pars: int = 0
+
     @property
     def terms(self) -> tuple[Term, ...]:
         return design_terms(self.design)
+
+    def summary(self) -> str:
+        text = super().summary()
+        if self.n_fitted_pars:
+            text += (f"\n  profile        {self.n_fitted_pars} feature parameter(s) "
+                     "fitted too, and counted above; the profile is not convex, so "
+                     "the inner certificate does not extend to them")
+        return text
 
     def notation(self) -> str:
         """The fitted model as the reference would write it."""
@@ -1027,3 +1042,327 @@ def fit_lkt(design: Design, y, *, method: str = DEFAULT_METHOD,
                         w0=w0, warn_not_converged=warn_not_converged,
                         warn_separated=warn_separated, result_type=LKTFit,
                         label="LKT", stacklevel=3)  # 3: attribute past this wrapper
+
+
+# --------------------------------------------------------------------------
+# Fitting the feature parameters: a profile likelihood over the design builder
+# --------------------------------------------------------------------------
+
+#: The reference's own bounds on every nonlinear parameter (``lowb``, ``highb``),
+#: recycled across all of them regardless of what they mean. Kept as the default
+#: so a search here starts from the same feasible set the published searches did.
+PARAMETER_BOUNDS = (1e-5, 0.99999)
+
+#: Step for the central differences the outer optimizer works from. R's
+#: ``optim`` uses ``ndeps = 1e-3``; scipy's L-BFGS-B defaults to ``1e-8``, which
+#: is the wrong order here — the profile is only as smooth as the inner solve is
+#: tight, so a step that small differentiates the inner optimizer's own noise.
+PARAMETER_STEP = 1e-3
+
+#: A step of :data:`PARAMETER_STEP` that buys less than this many nats is
+#: treated as no improvement. Nats rather than a gradient norm because it is
+#: the quantity a reader can act on: "no single parameter moved by 0.001
+#: improves the fit by more than this".
+PARAMETER_TOLERANCE = 1e-2
+
+#: What the outer loop maximizes. ``"penalized"`` profiles the objective the
+#: inner solver actually maximizes, so the pair (parameters, coefficients) is a
+#: maximizer of one function. ``"likelihood"`` profiles the plain Bernoulli
+#: log-likelihood of a penalized fit, which is what the reference does and is
+#: not a single objective at all; the two coincide whenever ``l2 = 0``.
+OBJECTIVES = ("penalized", "likelihood")
+
+
+def _flat_parameters(terms: Sequence[Term]) -> tuple[list[tuple[int, int]], list[str]]:
+    """Every parameter of every term, flattened, with a label apiece."""
+    slots, labels = [], []
+    for t_index, term in enumerate(terms):
+        for p_index in range(len(term.pars)):
+            slots.append((t_index, p_index))
+            suffix = f"[{p_index}]" if len(term.pars) > 1 else ""
+            labels.append(f"{term.component}:{term.notation()}{suffix}")
+    return slots, labels
+
+
+def _with_parameters(terms: Sequence[Term], slots: Sequence[tuple[int, int]],
+                     values: np.ndarray) -> tuple[Term, ...]:
+    """``terms`` with the parameters at ``slots`` replaced by ``values``."""
+    pars = [list(term.pars) for term in terms]
+    for (t_index, p_index), value in zip(slots, values):
+        pars[t_index][p_index] = float(value)
+    return tuple(replace(term, pars=tuple(row)) for term, row in zip(terms, pars))
+
+
+def _conform(design: Design, template: Design) -> Design:
+    """Cut ``design`` down to the columns ``template`` kept, block by block.
+
+    Identification runs **once**, at the seed, and the column set it chose is
+    then held fixed for every other parameter value. Two reasons, and they
+    point the same way. It is a dense ``p x p`` eigendecomposition, so running
+    it per evaluation would dominate the search; and a parameter value that
+    happened to make one more column identically zero would change the
+    parameter count mid-search, which would make the AIC of one evaluation
+    incomparable with the next. This is the choice
+    :meth:`~leapfit.design.Design.take` already makes for cross-validation
+    folds, for the same reason.
+
+    Blocks are matched by position rather than by name, because a term's
+    parameters are part of its block name and these are exactly the blocks
+    whose parameters are moving.
+    """
+    blocks, dropped, reasons = [], [], []
+    for block, kept in zip(design.blocks, template.blocks):
+        wanted = set(kept.columns)
+        mask = np.array([c in wanted for c in block.columns], dtype=bool)
+        for column in np.asarray(block.columns, dtype=object)[~mask]:
+            dropped.append(f"{block.name}:{column}")
+            reasons.append("not estimable at the seed parameters (identification "
+                           "is decided once and held)")
+        blocks.append(block.keep(mask))
+    return Design(tuple(blocks), Aliased(tuple(dropped), tuple(reasons)))
+
+
+@dataclass(frozen=True)
+class LKTProfile:
+    """A fitted LKT model **including** its feature parameters.
+
+    What separates this from :func:`fit_lkt` is one certificate. The inner
+    problem is convex, so :attr:`LogisticFit.is_optimal` certifies a *global*
+    maximum over the coefficients. The profile over the feature parameters is
+    **not** convex — a decay rate enters the design nonlinearly — so
+    :attr:`is_stationary` certifies only that no small step improves the fit.
+    Whether some distant parameter value is better is a question this cannot
+    answer, and :attr:`restarts` is how to ask it.
+    """
+
+    terms: tuple[Term, ...]
+    fit: LKTFit
+    labels: tuple[str, ...]
+    seeds: np.ndarray
+    pars: np.ndarray
+    bounds: tuple[tuple[float, float], ...]
+    objective: str
+    n_evaluations: int
+    converged: bool
+    message: str
+    max_gain: float
+    gains: np.ndarray
+    trajectory: pd.DataFrame
+    restarts: pd.DataFrame
+    inner_not_optimal: int
+
+    @property
+    def n_free(self) -> int:
+        return len(self.labels)
+
+    @property
+    def is_stationary(self) -> bool:
+        """No single-parameter step of :data:`PARAMETER_STEP` improves the fit.
+
+        A local statement, and deliberately weaker than the inner certificate.
+        """
+        return bool(self.max_gain <= PARAMETER_TOLERANCE)
+
+    def frame(self) -> pd.DataFrame:
+        """One row per fitted parameter: where it started, where it landed."""
+        lower, upper = zip(*self.bounds)
+        return pd.DataFrame({
+            "parameter": list(self.labels),
+            "seed": self.seeds,
+            "estimate": self.pars,
+            "lower": lower,
+            "upper": upper,
+            "at_bound": [p <= lo + 1e-12 or p >= hi - 1e-12
+                         for p, (lo, hi) in zip(self.pars, self.bounds)],
+            "gain_from_stepping": self.gains,
+        })
+
+    def summary(self) -> str:
+        flag = "" if self.is_stationary else "  *** NOT STATIONARY ***"
+        at_bound = int(self.frame()["at_bound"].sum())
+        lines = [
+            (f"LKT profile over {self.n_free} feature parameter(s), "
+             f"{self.n_evaluations} evaluation(s), objective '{self.objective}'"),
+            "  " + " | ".join(f"{name} {value:.6g}"
+                              for name, value in zip(self.labels, self.pars)),
+            (f"  stationarity   best single-parameter step buys {self.max_gain:.3g} "
+             f"nats (tol {PARAMETER_TOLERANCE:g}){flag}"),
+        ]
+        if at_bound:
+            lines.append(f"  {at_bound} parameter(s) resting on a bound — the estimate is "
+                         "the bound, not an interior maximum")
+        if len(self.restarts) > 1:
+            spread = self.restarts["objective"].max() - self.restarts["objective"].min()
+            reached = self.restarts["objective"].round(6).nunique()
+            lines.append(f"  restarts       {len(self.restarts)} start(s) reached "
+                         f"{reached} distinct optimum/optima, spread {spread:.4g} nats")
+        else:
+            lines.append("  restarts       1 start; the profile is not convex, so this "
+                         "says nothing about other basins")
+        if self.inner_not_optimal:
+            lines.append(f"  *** {self.inner_not_optimal} inner fit(s) did not reach a "
+                         "certified optimum; the profile is noisy where they did not")
+        lines.append(self.fit.summary())
+        return "\n".join(lines)
+
+
+def fit_lkt_pars(data: StepData, terms: Iterable[Term], *,
+                 free: Sequence[bool] | None = None,
+                 bounds: tuple[float, float] | Sequence[tuple[float, float]] = PARAMETER_BOUNDS,
+                 starts: Sequence[Sequence[float]] | None = None,
+                 objective: str = "penalized",
+                 l2: float = 0.0, cost: float | None = None, identify: bool = True,
+                 max_iterations: int = 100, warm_start: bool = True,
+                 method: str = DEFAULT_METHOD, max_fun: int | None = None,
+                 tol: float | None = None) -> LKTProfile:
+    """Fit an LKT model's feature parameters along with its coefficients.
+
+    A profile likelihood. For each candidate parameter vector the features are
+    recomputed, the design is rebuilt, and the coefficients are fitted to
+    convergence; the outer optimizer moves the parameters over the resulting
+    surface. That is the reference's own procedure
+    (``optim(method = "L-BFGS-B")`` around a full refit), and it is expensive
+    for the same reason: every outer evaluation is an entire model fit.
+
+    Three things this does that the reference does not, all of which follow
+    from the same place — the profile is not the convex problem the inner
+    solver is certified on:
+
+    * **The parameters are counted.** ``fit.n_params`` is ``rank(X)`` plus the
+      number fitted here, so the AIC and BIC of a searched model are charged
+      for the search. The reference reports no parameter count at all.
+    * **Stationarity is checked, not assumed.** After the optimizer stops,
+      every parameter is stepped by :data:`PARAMETER_STEP` in both directions
+      and refitted; :attr:`LKTProfile.max_gain` is the best improvement any of
+      those found. See :attr:`LKTProfile.is_stationary` for what that does and
+      does not certify.
+    * **Restarts are available and reported.** Pass several ``starts`` and the
+      spread of the optima they reach is a measurement of how much the
+      non-convexity matters on your data, rather than an assumption that it
+      does not.
+
+    :param terms: the specification. Each term's ``pars`` are its **seeds**.
+    :param free: a boolean per parameter, flattened over terms in order — the
+        analogue of the reference's ``fixedpars``, where ``NA`` means "fit it".
+        Defaults to fitting every parameter. :meth:`LKTProfile.frame` names
+        them in the same order.
+    :param bounds: one ``(lower, upper)`` pair for every parameter, or one per
+        fitted parameter. Defaults to :data:`PARAMETER_BOUNDS`, the reference's,
+        which are recycled across parameters whatever they mean — an exponent
+        and a decay rate get the same box.
+    :param starts: parameter vectors to start from, each of length ``free``.
+        Defaults to a single start at the seeds. The best optimum is returned
+        and all of them are reported in :attr:`LKTProfile.restarts`.
+    :param objective: which surface to profile — see :data:`OBJECTIVES`.
+    :param warm_start: seed each inner fit from the previous one's
+        coefficients. Safe to do aggressively because the inner problem is
+        convex and every inner fit certifies itself independently of where it
+        started; worth doing because neighbouring parameter values give
+        neighbouring fits.
+    :param max_iterations: outer iteration cap, the reference's ``maxitv``.
+    """
+    terms = tuple(terms)
+    if objective not in OBJECTIVES:
+        raise ValueError(f"objective must be one of {OBJECTIVES}, got {objective!r}")
+    slots, all_labels = _flat_parameters(terms)
+    if not slots:
+        raise ValueError(
+            "No term in this specification takes a parameter, so there is nothing to "
+            "fit here — use fit_lkt(build_lkt_design(...), y)."
+        )
+
+    if free is None:
+        free = [True] * len(slots)
+    if len(free) != len(slots):
+        raise ValueError(
+            f"free has {len(free)} entr(ies) for {len(slots)} parameter(s): "
+            f"{', '.join(all_labels)}"
+        )
+    chosen = [i for i, keep in enumerate(free) if keep]
+    if not chosen:
+        raise ValueError("free selects no parameter; every one is held fixed")
+
+    fitted_slots = [slots[i] for i in chosen]
+    labels = tuple(all_labels[i] for i in chosen)
+    seeds = np.array([terms[t].pars[p] for t, p in fitted_slots], dtype=float)
+
+    pairs = list(bounds)
+    box = ([tuple(map(float, bounds))] * len(chosen)
+           if len(pairs) == 2 and np.isscalar(pairs[0]) else
+           [tuple(map(float, b)) for b in pairs])
+    if len(box) != len(chosen):
+        raise ValueError(f"{len(box)} bound pair(s) for {len(chosen)} fitted parameter(s)")
+
+    y = np.asarray(data.y, dtype=float)
+    inner = {"method": method, "max_fun": max_fun, "tol": tol,
+             "warn_not_converged": False, "warn_separated": False}
+
+    # Identification is decided here, once, and held for every evaluation.
+    template = build_lkt_design(data, _with_parameters(terms, fitted_slots, seeds),
+                                l2=l2, cost=cost, identify=identify)
+
+    history: list[dict] = []
+    state = {"w": None, "not_optimal": 0}
+
+    def evaluate(values: np.ndarray) -> tuple[float, LKTFit, Design]:
+        at = _with_parameters(terms, fitted_slots, values)
+        design = _conform(build_lkt_design(data, at, l2=l2, cost=cost, identify=False),
+                          template)
+        fit = fit_lkt(design, y, w0=state["w"] if warm_start else None, **inner)
+        if warm_start:
+            state["w"] = fit.weights
+        if not fit.is_optimal:
+            state["not_optimal"] += 1
+        value = fit.ll if objective == "penalized" else fit.ll_unpenalized
+        history.append({"evaluation": len(history), **dict(zip(labels, map(float, values))),
+                        "objective": value, "inner_optimal": fit.is_optimal})
+        return value, fit, design
+
+    def negated(values: np.ndarray) -> float:
+        return -evaluate(np.asarray(values, dtype=float))[0]
+
+    attempts = [np.asarray(s, dtype=float) for s in (starts or [seeds])]
+    for start in attempts:
+        if start.shape != (len(chosen),):
+            raise ValueError(f"a start has {start.size} value(s) for {len(chosen)} parameter(s)")
+
+    outcomes, best = [], None
+    for start in attempts:
+        state["w"] = None
+        clipped = np.clip(start, [lo for lo, _ in box], [hi for _, hi in box])
+        result = minimize(negated, clipped, method="L-BFGS-B", bounds=box,
+                          options={"maxiter": max_iterations, "eps": PARAMETER_STEP})
+        value, fit, design = evaluate(result.x)
+        outcomes.append({"start": tuple(float(v) for v in start),
+                         "estimate": tuple(float(v) for v in result.x),
+                         "objective": value, "converged": bool(result.success),
+                         "message": str(result.message)})
+        if best is None or value > best[0]:
+            best = (value, result, fit, design)
+
+    _, result, fit, design = best
+
+    # Stationarity, measured rather than inferred: step each parameter both ways
+    # and see whether anything better is within reach.
+    gains = np.zeros(len(chosen))
+    for j in range(len(chosen)):
+        for direction in (-1.0, 1.0):
+            probe = np.array(result.x, dtype=float)
+            probe[j] = float(np.clip(probe[j] + direction * PARAMETER_STEP, *box[j]))
+            if probe[j] == result.x[j]:
+                continue
+            gains[j] = max(gains[j], evaluate(probe)[0] - best[0])
+
+    fit.n_fitted_pars = len(chosen)
+    fit.n_params = design.n_params + len(chosen)
+
+    return LKTProfile(
+        terms=_with_parameters(terms, fitted_slots, result.x),
+        fit=fit, labels=labels, seeds=seeds,
+        pars=np.asarray(result.x, dtype=float), bounds=tuple(box),
+        objective=objective, n_evaluations=len(history),
+        converged=bool(result.success), message=str(result.message),
+        max_gain=float(gains.max()), gains=gains,
+        trajectory=pd.DataFrame(history), restarts=pd.DataFrame(outcomes),
+        inner_not_optimal=state["not_optimal"],
+    )

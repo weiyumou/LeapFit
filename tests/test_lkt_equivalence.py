@@ -42,6 +42,7 @@ from leapfit import (
     REFERENCE_COST,
     build_lkt_design,
     fit_lkt,
+    fit_lkt_pars,
     lkt_terms,
     load_student_step,
 )
@@ -267,3 +268,90 @@ def test_the_cost_parameter_is_the_references_ridge(data, fit):
     # objective as if it were a likelihood. Both are available here.
     assert fitted.ll == pytest.approx(fitted.ll_unpenalized - fitted.penalty)
     assert fitted.ll_unpenalized > fitted.ll
+
+
+# --------------------------------------------------------------------------
+# The one vignette chunk that searches: RPFA seeds propdec2 and fits it
+# --------------------------------------------------------------------------
+
+RPFA_SPEC = (("student", "kc", "kc", "kc"),
+             ("intercept", "intercept", "propdec2", "linefail"))
+RPFA_SEED = 0.9
+
+#: The reference prints every evaluation, so its whole search is visible:
+#: ``seedpars=c(.9)``, then ``optim`` walks to the lower bound and back. These
+#: are four of the points it visited, with the log-likelihood it reported at
+#: each. Checking the *path* rather than only the endpoint is what separates
+#: "we agree about this model" from "we happened to land nearby".
+RPFA_TRACE = {
+    0.9: -26461.64297989,
+    1e-05: -26441.79143124,
+    0.7212721: -26377.50586470,
+    0.3736667: -26231.53205027,
+}
+
+#: Where the reference stopped. Its own next probe, at 0.3726667, reported a
+#: *better* likelihood — ``optim`` at ``factr = 1e12`` stops once the objective
+#: improves by less than about 6 nats, so this is a stopping point rather than
+#: an optimum, and the tolerance below is against the parameter, not the fit.
+RPFA_OPTIMUM = 0.3736667
+
+
+@pytest.mark.parametrize("parameter", list(RPFA_TRACE))
+def test_the_references_search_path_is_reproduced_point_by_point(data, parameter):
+    """Four points along the reference's own printed trajectory.
+
+    Cheap, exact, and it validates ``propdec2`` at four settings rather than
+    one — the agreement here is tighter than any other chunk's, around 0.05
+    nats, because the spec has no time features and nothing depends on how the
+    export's timestamps were derived.
+    """
+    terms = lkt_terms(*RPFA_SPEC, (None, None, parameter, None))
+    fitted = fit_lkt(build_lkt_design(data, terms, cost=REFERENCE_COST), data.y, **TIGHT)
+    gap = fitted.ll_unpenalized - RPFA_TRACE[parameter]
+    assert fitted.is_optimal
+    assert 0.0 < gap < 0.5, (
+        f"at propdec2 = {parameter}: ours {fitted.ll_unpenalized:.8f}, "
+        f"published {RPFA_TRACE[parameter]:.8f}"
+    )
+
+
+def test_the_parameter_search_reaches_the_references_optimum(data):
+    """The whole Stage 3 loop against the only chunk that exercises it.
+
+    ``objective="likelihood"`` because that is the surface the reference
+    profiles — the plain log-likelihood of a ridged fit — and the two surfaces
+    part company as soon as ``cost`` is finite.
+    """
+    terms = lkt_terms(*RPFA_SPEC, (None, None, RPFA_SEED, None))
+    profile = fit_lkt_pars(data, terms, cost=REFERENCE_COST, objective="likelihood",
+                           **TIGHT)
+
+    assert profile.n_free == 1
+    assert profile.is_stationary, profile.summary()
+    assert profile.converged
+
+    # Within the reference's own differencing step of 1e-3, which is the
+    # resolution at which it can tell two parameter values apart at all.
+    assert profile.pars[0] == pytest.approx(RPFA_OPTIMUM, abs=1e-2)
+
+    published = RPFA_TRACE[RPFA_OPTIMUM]
+    gap = profile.fit.ll_unpenalized - published
+    assert 0.0 < gap < NAT_TOLERANCE, (
+        f"ours {profile.fit.ll_unpenalized:.8f} at {profile.pars[0]:.7f}, "
+        f"published {published:.8f} at {RPFA_OPTIMUM}"
+    )
+
+
+def test_the_searched_model_is_charged_for_the_parameter_it_searched(data):
+    """The reference reports no parameter count, so nothing there charges for
+    the search. Here the fitted decay rate is one more parameter in AIC and
+    BIC than the same design fitted at a value the caller chose."""
+    terms = lkt_terms(*RPFA_SPEC, (None, None, RPFA_SEED, None))
+    held = fit_lkt(build_lkt_design(data, terms, cost=REFERENCE_COST), data.y, **TIGHT)
+    searched = fit_lkt_pars(data, terms, cost=REFERENCE_COST, objective="likelihood",
+                            **TIGHT)
+
+    assert searched.fit.design.n_params == held.n_params
+    assert searched.fit.n_params == held.n_params + 1
+    assert searched.fit.bic > -2 * searched.fit.ll + held.n_params * np.log(len(data))

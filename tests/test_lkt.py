@@ -23,6 +23,7 @@ import pytest
 
 from leapfit import (
     LOGITDEC_WINDOW,
+    PARAMETER_TOLERANCE,
     REFERENCE_COST,
     LKTFit,
     Term,
@@ -34,6 +35,7 @@ from leapfit import (
     design_terms,
     fit_afm,
     fit_lkt,
+    fit_lkt_pars,
     fit_pfa,
     from_frame,
     history_counts,
@@ -850,3 +852,176 @@ def test_time_on_task_refuses_a_duration_it_cannot_accumulate_past():
             for i in range(3)]
     with pytest.raises(ValueError, match="1 of 3 rows have no 'Step Duration"):
         _data(rows).time_on_task()
+
+
+# --------------------------------------------------------------------------
+# Fitting the feature parameters: the profile likelihood
+# --------------------------------------------------------------------------
+
+
+PROFILE_SPEC = (("student", "kc", "kc", "kc"),
+                ("intercept", "intercept", "logitdec", "recency"))
+
+
+def _profile_terms(logitdec=0.9, recency=0.5):
+    return lkt_terms(*PROFILE_SPEC, (None, None, logitdec, recency))
+
+
+@pytest.fixture(scope="module")
+def profile(example):
+    return fit_lkt_pars(example, _profile_terms())
+
+
+def test_the_profile_improves_on_its_own_seed(example, profile):
+    """The weakest thing a search must do, and the one that catches a sign
+    error in the objective: end no worse than where it started."""
+    seeded = fit_lkt(build_lkt_design(example, _profile_terms()), example.y,
+                     warn_not_converged=False)
+    assert profile.fit.ll >= seeded.ll - 1e-9
+    assert profile.n_free == 2
+    assert profile.n_evaluations > profile.n_free
+
+
+def test_the_fitted_parameters_are_counted_as_parameters(example, profile):
+    """The reference reports no parameter count at all, so this is ours to get
+    right: a decay rate estimated from the data is a parameter, and AIC and BIC
+    have to be charged for it."""
+    columns = profile.fit.design.n_params
+    assert profile.fit.n_fitted_pars == 2
+    assert profile.fit.n_params == columns + 2
+    assert profile.fit.aic == pytest.approx(-2 * profile.fit.ll + 2 * (columns + 2))
+    assert "feature parameter(s) fitted too" in profile.fit.summary()
+
+
+def test_identification_is_decided_at_the_seed_and_held(example):
+    """A parameter value that made one more column identically zero would
+    change the parameter count mid-search, and the AIC of one evaluation would
+    stop being comparable with the next."""
+    seed = build_lkt_design(example, _profile_terms())
+    result = fit_lkt_pars(example, _profile_terms())
+    assert result.fit.design.n_params == seed.n_params
+    assert len(result.fit.design.aliased) == len(seed.aliased)
+
+
+def test_max_gain_bounds_what_any_single_parameter_step_actually_buys(example, profile):
+    """The certificate is a measurement: every parameter is stepped both ways
+    and refitted. So no step it did not take can beat the number it reports."""
+    for j in range(profile.n_free):
+        for direction in (-1.0, 1.0):
+            probe = np.array(profile.pars, dtype=float)
+            lower, upper = profile.bounds[j]
+            probe[j] = float(np.clip(probe[j] + direction * 1e-3, lower, upper))
+            if probe[j] == profile.pars[j]:
+                continue
+            terms = _profile_terms(*probe)
+            stepped = fit_lkt(build_lkt_design(example, terms), example.y,
+                              warn_not_converged=False)
+            assert stepped.ll - profile.fit.ll <= profile.max_gain + 1e-9
+    assert profile.is_stationary
+    assert profile.max_gain <= PARAMETER_TOLERANCE
+
+
+def test_the_optimizers_own_flag_is_not_the_certificate(example):
+    """They answer different questions, so both are reported. Capped at one
+    outer iteration the optimizer says it stopped early — and on this data it
+    had already reached a corner from which no step improves, which is what
+    ``is_stationary`` is for and what ``converged`` cannot tell you."""
+    stopped = fit_lkt_pars(example, _profile_terms(), max_iterations=1)
+    assert not stopped.converged
+    assert "ITERATIONS" in stopped.message.upper()
+    assert stopped.is_stationary
+
+    settled = fit_lkt_pars(example, _profile_terms())
+    assert settled.converged
+    assert settled.fit.ll == pytest.approx(stopped.fit.ll, abs=1e-9)
+
+
+def test_free_holds_the_parameters_it_does_not_select(example):
+    result = fit_lkt_pars(example, _profile_terms(logitdec=0.7, recency=0.4),
+                          free=(True, False))
+    assert result.n_free == 1
+    assert result.labels == ("kc:logitdec",)
+    held = next(t for t in result.terms if t.feature == "recency")
+    assert held.pars == (0.4,)
+    assert result.fit.n_fitted_pars == 1
+
+
+def test_a_parameter_resting_on_a_bound_is_reported_as_such(example):
+    """The estimate is then the bound, not an interior maximum, and a reader
+    who cannot see that will read it as an estimate of the decay rate."""
+    result = fit_lkt_pars(example, _profile_terms(), bounds=(0.80, 0.81))
+    frame = result.frame()
+    assert frame["at_bound"].any()
+    assert "resting on a bound" in result.summary()
+    assert np.all(frame["estimate"] >= 0.80 - 1e-12)
+    assert np.all(frame["estimate"] <= 0.81 + 1e-12)
+
+
+def test_restarts_measure_the_non_convexity_instead_of_assuming_it_away(example):
+    """One start says nothing about other basins; the summary says so, and
+    several starts turn that into a measurement."""
+    one = fit_lkt_pars(example, _profile_terms())
+    assert len(one.restarts) == 1
+    assert "says nothing about other basins" in one.summary()
+
+    several = fit_lkt_pars(example, _profile_terms(),
+                           starts=[(0.9, 0.5), (0.2, 0.2), (0.99, 0.99)])
+    assert len(several.restarts) == 3
+    assert several.fit.ll == pytest.approx(several.restarts["objective"].max())
+    assert "restarts       3 start(s)" in several.summary()
+
+
+def test_the_two_objectives_coincide_when_nothing_is_penalized(example):
+    """``penalized`` profiles what the inner solver maximizes and
+    ``likelihood`` profiles what the reference reports; with no ridge there is
+    only one function."""
+    penalized = fit_lkt_pars(example, _profile_terms(), objective="penalized")
+    likelihood = fit_lkt_pars(example, _profile_terms(), objective="likelihood")
+    np.testing.assert_allclose(penalized.pars, likelihood.pars, atol=1e-9)
+
+
+def test_a_ridge_separates_the_two_objectives(example):
+    """And then they are genuinely different questions: one maximizes a single
+    function over parameters and coefficients together, the other maximizes one
+    function over the coefficients and a different one over the parameters."""
+    penalized = fit_lkt_pars(example, _profile_terms(), cost=2.0,
+                             objective="penalized")
+    likelihood = fit_lkt_pars(example, _profile_terms(), cost=2.0,
+                              objective="likelihood")
+    assert penalized.fit.ll >= likelihood.fit.ll - 1e-9
+    assert likelihood.fit.ll_unpenalized >= penalized.fit.ll_unpenalized - 1e-9
+
+
+def test_warm_starting_does_not_change_where_the_search_lands(example):
+    """Safe to do aggressively because the inner problem is convex and every
+    inner fit certifies itself independently of where it started."""
+    warm = fit_lkt_pars(example, _profile_terms(), warm_start=True)
+    cold = fit_lkt_pars(example, _profile_terms(), warm_start=False)
+    np.testing.assert_allclose(warm.pars, cold.pars, atol=1e-6)
+    assert warm.fit.ll == pytest.approx(cold.fit.ll, abs=1e-6)
+
+
+def test_the_trajectory_records_every_evaluation(example, profile):
+    trajectory = profile.trajectory
+    assert len(trajectory) == profile.n_evaluations
+    assert list(trajectory.columns[:1]) == ["evaluation"]
+    assert set(profile.labels) <= set(trajectory.columns)
+    assert trajectory["inner_optimal"].all()
+    assert trajectory["objective"].max() == pytest.approx(profile.fit.ll)
+
+
+def test_a_specification_with_nothing_to_fit_is_refused(example):
+    with pytest.raises(ValueError, match="nothing to fit"):
+        fit_lkt_pars(example, lkt_terms(("kc", "kc"), ("intercept", "lineafm$")))
+
+
+@pytest.mark.parametrize("kwargs,message", [
+    ({"objective": "nonsense"}, "objective must be one of"),
+    ({"free": (True,)}, "free has 1 entr"),
+    ({"free": (False, False)}, "selects no parameter"),
+    ({"starts": [(0.5,)]}, "1 value"),
+    ({"bounds": [(0.1, 0.9)]}, "1 bound pair"),
+])
+def test_the_search_checks_its_own_arguments(example, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        fit_lkt_pars(example, _profile_terms(), **kwargs)
