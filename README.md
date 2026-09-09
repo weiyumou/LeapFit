@@ -82,9 +82,22 @@ print(lkt.notation())                        # the spec it fitted, in LKT notati
 print(lkt.component_values(data, "kc"))      # one row per level, one column per feature
 ```
 
-Features that need a clock (`recency`, `base`, `ppe`) or a fitted decay rate
-(`logitdec`, `propdec`) are refused by name with the reason rather than
-silently dropped; see the [roadmap](#roadmap).
+Features that read the clock or a decayed history are here too, at parameters
+you fix — `recency`, `base`, `base2`, `base4`, `ppe`, `dashafm`, `logitdec`,
+`propdec`, `expdec*`. Nothing here *searches* for a decay rate, so a parametric
+feature requires its `pars`:
+
+```python
+terms = lkt_terms(components=("student", "kc", "kc", "kc"),
+                  features=("intercept", "intercept", "logitdec", "recency"),
+                  pars=(None, None, 0.9, 0.5))
+```
+
+Time features need `First Transaction Time`, and the `base2` family also needs
+`Step Duration (sec)`; an export without one is refused rather than defaulted.
+Features the reference computes that are not implemented are refused by name
+with the reason — three of them because the reference cannot compute them
+either. See the [roadmap](#roadmap).
 
 **Which KC model?** LFA turns that into a search. It is not another student
 model — the states *are* KC labellings, and each is scored by fitting AFM to
@@ -192,8 +205,14 @@ a full DataShop export is ignored.
 | `KC (<model>)` | the step's knowledge component(s), `~~`-separated when there are several |
 | `Opportunity (<model>)` | how many times the student has met each KC, numbered from 1, aligned by position |
 
-Optional: `First Transaction Time` defines the practice order, letting
-`recompute_opportunities=True` correct a miscounted `Opportunity` column.
+Two optional columns, read only by the models that need them.
+`First Transaction Time` defines the practice order — which lets
+`recompute_opportunities=True` correct a miscounted `Opportunity` column — and,
+parsed to seconds by `StepData.epoch_times()`, supplies the intervals an LKT
+recency, forgetting or spacing feature measures. `Step Duration (sec)`
+accumulates into `StepData.time_on_task()`, the clock that ignores the gaps
+between sessions. A model that needs one and does not have it is refused, not
+defaulted: every substitute value is a different model.
 
 A file may carry any number of KC models; `list_kc_models(path)` enumerates
 them, and each fits independently. Malformed input raises with the row number
@@ -251,8 +270,8 @@ producing compatible files from your own data.
 | **AFM** | shipped | validated for equivalence against LearnSphere workflow output |
 | **PFA** | shipped | canonical fixed-effects PFA (Pavlik, Cen & Koedinger 2009) with strictly-prior counts; per-KC or pooled slopes, optional student intercepts. The audited reference builds its counts *including* each attempt's own outcome — that construction is reproducible here via an explicit option that warns, never silently |
 | **LFA** | shipped | a search over KC models rather than a model: greedy best-first on AFM's BIC or AIC, reproducing the reference's fit statistics to 1e-9. Every candidate move is screened for estimability and evidence — the reference's own selection contained a KC whose slope has no finite estimate, and that one move then appeared in all 99 states it reported — and the top states are validated out of sample on identical folds |
-| **LKT** | shipped, static features | components x features, of which AFM and PFA are single specifications — both identities are pinned by tests. Implemented are the features that are pure functions of prior success and failure counts (`intercept`, `lineafm`, `logafm`, `powafm` at a fixed exponent, `linesuc/fail`, `logsuc/fail`, `linecomp`, `prop`, `numer`), over any component the export carries. Validated against the reference's own published output: the CRAN package's precompiled vignette prints the log-likelihood of each model it fits, and leapfit reaches the AFM chunk's **-27347.207** within 0.5 nats — on the better side of it, from a certified optimum, because the reference's `LiblineaR` stops at `epsilon = 1e-4`. Written clean-room: the reference is GPL-3, so this module is validated against it rather than adapted from it |
-| LKT, time and decay features | planned | `recency`, `base`, `ppe` need numeric time in `StepData`; `logitdec`, `propdec` and friends make the design a function of a fitted parameter, which needs an outer optimizer over the profile likelihood and an honest `nPars = rank + k` |
+| **LKT** | shipped, parameters fixed | components x features, of which AFM and PFA are single specifications — both identities are pinned by tests. Thirty-one features over any component the export carries: prior counts, decayed outcome histories, recency, power-law forgetting, and the two four-parameter spacing models (`base4`, `ppe`). Nothing here searches for a decay rate, so every parametric feature is held at a value you pass. Validated against the reference's own published output — the CRAN package's precompiled vignette prints the log-likelihood of each model it fits — on **four** of its chunks, spanning the whole implemented surface: **-27347.207** (AFM), **-25474.531** (logitdec + recency), **-24695.586** (PPE) and **-25969.925** (base4), each reproduced within 0.5 nats and each on the better side, from a certified optimum, because the reference's `LiblineaR` stops at `epsilon = 1e-4`. Written clean-room: the reference is GPL-3, so this module is validated against it rather than adapted from it |
+| LKT, fitted decay rates | planned | the reference fits its decay rates with an outer optimizer that rebuilds every feature and refits the whole regression at each evaluation. That needs a profile-likelihood loop, an honest `nPars = rank + k`, and its own convergence certificate — the inner KKT check covers only the inner problem |
 | BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
 
 ## Development
@@ -263,10 +282,10 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 273 pass, 36 skip, ~26s
+uv run pytest                                       # 294 pass, 39 skip, ~27s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
-LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 7 LKT equivalence tests
+LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 10 LKT equivalence tests
 ```
 
 The LKT fixture is built from the CRAN tarball rather than shipped, because the

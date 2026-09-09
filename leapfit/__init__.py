@@ -88,8 +88,9 @@ from leapfit.lfa import (
     validate_top,
 )
 from leapfit.lkt import (
+    FEATURE_NAMES,
+    LOGITDEC_WINDOW,
     REFERENCE_COST,
-    STATIC_FEATURES,
     LKTFit,
     Term,
     build_lkt_design,
@@ -109,13 +110,14 @@ from leapfit.pfa import (
 __all__ = [
     "CONVENTIONS",
     "DEFAULT_METHOD",
+    "FEATURE_NAMES",
     "FIRST_ATTEMPT_VALUES",
     "HEURISTICS",
+    "LOGITDEC_WINDOW",
     "MERGES",
     "MIN_OPPORTUNITIES",
     "REFERENCE_COST",
     "SCHEMES",
-    "STATIC_FEATURES",
     "STUDENT_L2",
     "AFMFit",
     "Aliased",

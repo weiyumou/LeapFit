@@ -33,27 +33,31 @@ reference's documented feature semantics and then **validated against** its
 output. Nothing here is a translation of its source, and the distinction is
 load-bearing rather than decorative.
 
-**What this module covers, and what it does not.** The reference computes
-roughly fifty features. Implemented here are the ones that are pure functions
-of prior success and failure counts — no clock, no fitted shape parameter:
+**Features.** Everything the reference computes from prior counts, from decayed
+outcome histories, or from the clock, at parameters the caller **fixes**:
 
-    intercept  lineafm  logafm  powafm  linesuc  logsuc  linefail  logfail
-    linecomp  prop  numer
+===============  ======  ========================================================
+family           pars    features
+===============  ======  ========================================================
+counts           0       ``intercept`` ``lineafm`` ``logafm`` ``linesuc``
+                         ``logsuc`` ``linefail`` ``logfail`` ``linecomp`` ``prop``
+counts, shaped   1       ``powafm`` ``logit``
+decayed history  1       ``expdecafm`` ``expdecsuc`` ``expdecfail`` ``propdec``
+                         ``propdec2`` ``logitdec``
+recency          1       ``recency`` ``recencysuc`` ``recencyfail``
+forgetting       1       ``base`` ``basesuc`` ``basefail`` ``dashafm`` ``dashsuc``
+forgetting, 2    2       ``base2`` ``base2suc`` ``base2fail``
+spacing          4       ``base4`` ``ppe``
+covariate        0       ``numer``
+===============  ======  ========================================================
 
-The rest are refused by name with the reason, because a spec silently missing a
-term is worse than one that will not build. Two things they need that this
-package does not yet have:
-
-* **Numeric time.** ``recency``, ``base``, ``base2/4/5``, ``dash*``, ``ppe`` and
-  the spacing features need ``CF..Time.`` in seconds, and the ``base2`` family
-  additionally needs time-on-task accumulated from ``Step Duration (sec)``.
-  :attr:`leapfit.data.StepData.times` holds timestamp *strings*, read only to
-  order :meth:`~leapfit.data.StepData.practice_order`.
-* **A fitted shape parameter.** ``propdec``, ``logitdec``, ``expdec*``,
-  ``recency`` and friends make the design a function of a decay rate, which the
-  reference fits by an outer ``optim`` refitting the whole regression at every
-  evaluation. ``powafm`` is here only because its exponent can be *fixed*
-  (pass ``par=``); nothing in this module searches for one.
+**Nothing here searches for a parameter.** The reference fits its decay rates
+with an outer ``optim`` that rebuilds every feature and refits the whole
+regression at each evaluation; that is a different fitter and it is not in this
+module. Every parametric feature therefore *requires* ``pars=``, and a fit at
+fixed parameters is what it says it is. Features the reference computes that
+are not here are refused **by name with the reason** — see :data:`DEFERRED` —
+because a spec silently missing a term is worse than one that will not build.
 
 Also deferred: a global intercept (``interc=TRUE``), the ``*`` and ``:``
 connectors, ``interacts``, ``autoKC`` clustering, and ``@`` random effects.
@@ -82,6 +86,13 @@ log-likelihood of predictions clipped to ``[1e-5, 1-1e-5]``, and reports no
 parameter count, no AIC and no BIC. Here the likelihood is unclipped and
 ``n_params`` is the rank of the design, so AIC and BIC exist and mean what they
 mean for every other family in this package.
+
+DIVERGENCE (non-finite features are refused): several of the reference's
+time-based features divide by an elapsed time. Where two attempts on one level
+carry the same timestamp that elapsed time is zero, and the reference's
+``baselevel`` raises it to a negative power and produces ``Inf`` — which
+``LiblineaR`` will happily consume. :func:`build_lkt_design` checks every
+assembled column and raises instead, naming the feature and the rows.
 """
 
 from __future__ import annotations
@@ -107,48 +118,367 @@ REFERENCE_COST = 512.0
 #: only one that can carry several levels on one row.
 COMPONENTS = ("student", "item", "kc")
 
-#: Feature value from prior success and failure counts, with an optional fixed
-#: parameter. Written from the reference's documented semantics; the branch
-#: names match ``computefeatures`` so a spec reads the same in both systems.
-FEATURES: dict[str, Callable[[int, int, float | None], float]] = {
-    "intercept": lambda s, f, p: 1.0,
-    "lineafm": lambda s, f, p: float(s + f),
-    "logafm": lambda s, f, p: math.log1p(s + f),
-    "powafm": lambda s, f, p: float(s + f) ** p,
-    "linesuc": lambda s, f, p: float(s),
-    "logsuc": lambda s, f, p: math.log1p(s),
-    "linefail": lambda s, f, p: float(f),
-    "logfail": lambda s, f, p: math.log1p(f),
-    "linecomp": lambda s, f, p: float(s - f),
-    # The reference seeds an unpractised level at .5 (a 0/0 guarded by ifelse).
-    "prop": lambda s, f, p: 0.5 if s + f == 0 else s / (s + f),
-}
+#: ``slidelogitdec`` looks back over ``x[max(1, i - 60):i]`` — at most 61
+#: trials. Undocumented in the paper and load-bearing at slow decay rates
+#: (``d = .99`` still weights the 61st trial back at 0.54), so it is named here
+#: rather than buried in the implementation.
+LOGITDEC_WINDOW = 61
 
-#: Features taking a fixed shape parameter. Required for these, refused for the
-#: rest; nothing here searches for one.
-PARAMETRIC = ("powafm",)
+#: ``dash``'s decay scale is expressed in days.
+_DAY = 86_400.0
 
 #: The component's own column read as a number rather than as a factor.
-#: Handled outside :data:`FEATURES` because it consults no history at all.
+#: Handled apart from the registry because it consults no history at all.
 NUMERIC_FEATURE = "numer"
 
-STATIC_FEATURES = (*sorted(FEATURES), NUMERIC_FEATURE)
+
+class _View:
+    """One (student, component level) practice sequence, in order.
+
+    Everything a feature is allowed to see about one level of one student:
+    the outcomes, the prior counts, and — where the export supports it — the
+    clock. Positions are practice positions, so index 0 is that student's
+    first encounter with that level.
+    """
+
+    __slots__ = ("f", "on_task", "s", "time", "y")
+
+    def __init__(self, y, s, f, time, on_task):
+        self.y, self.s, self.f = y, s, f
+        self.time, self.on_task = time, on_task
+
+    def __len__(self) -> int:
+        return len(self.y)
+
+
+# --------------------------------------------------------------------------
+# Sequence primitives. Each takes one practice sequence and returns one value
+# per position, and each is written from the reference function it is named
+# after rather than translated from it.
+# --------------------------------------------------------------------------
+
+
+def _lag(values: np.ndarray, seed: float = 0.0) -> np.ndarray:
+    """``c(seed, head(x, -1))`` — the value from the previous position."""
+    out = np.empty_like(values, dtype=float)
+    out[0] = seed
+    out[1:] = values[:-1]
+    return out
+
+
+def _slide_expdec(x: np.ndarray, d: float) -> np.ndarray:
+    """``slideexpdec``: position ``i`` decays ``x[:i]``, most recent weighted 1.
+
+    Zero at the first position — the reference lags the running total by one,
+    so nothing here sees its own trial.
+    """
+    out = np.zeros(len(x), dtype=float)
+    acc = 0.0
+    for i in range(1, len(x)):
+        acc = d * acc + x[i - 1]
+        out[i] = acc
+    return out
+
+
+def _decayed_counts(y: np.ndarray, d: float) -> tuple[np.ndarray, np.ndarray]:
+    """The reference's ``corv``/``incorv``: decayed successes and failures over
+    ``y[:i]``, each seeded with one ghost trial.
+
+    ``propdec`` and ``logitdec`` are two readings of the same pair. The ghosts
+    are what make position 0 well defined — a proportion of 0.5 and a logit of
+    0 — rather than 0/0.
+    """
+    n = len(y)
+    corv = np.ones(n, dtype=float)
+    incorv = np.ones(n, dtype=float)
+    c = i_ = 1.0
+    for k in range(1, n):
+        c = d * c + y[k - 1]
+        i_ = d * i_ + (1.0 - y[k - 1])
+        corv[k], incorv[k] = c, i_
+    return corv, incorv
+
+
+def _windowed_decayed_counts(y: np.ndarray, d: float,
+                             window: int) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`_decayed_counts` over a trailing window of at most ``window``.
+
+    The recurrence cannot express a window, so this is the direct sum. It is
+    only reached on sequences longer than the window: below that the window
+    never truncates and the recurrence is exact.
+    """
+    n = len(y)
+    corv = np.ones(n, dtype=float)
+    incorv = np.ones(n, dtype=float)
+    for k in range(1, n):
+        a = max(0, k - window)
+        chunk = y[a:k]
+        w = len(chunk)
+        weights = d ** np.arange(w - 1, -1, -1.0)
+        ghost = d ** w
+        corv[k] = ghost + float(chunk @ weights)
+        incorv[k] = ghost + float((1.0 - chunk) @ weights)
+    return corv, incorv
+
+
+def _baselevel(age: np.ndarray, d: float) -> np.ndarray:
+    """``baselevel``: age since the level's first encounter, to the power ``-d``.
+
+    Zero at the first position, where the age is zero and the power undefined.
+    """
+    out = np.zeros(len(age), dtype=float)
+    if len(age) > 1:
+        with np.errstate(divide="ignore"):
+            out[1:] = np.asarray(age[1:], dtype=float) ** -d
+    return out
+
+
+def _spacing(time: np.ndarray) -> np.ndarray:
+    """``componentspacing``: elapsed time since this level's previous encounter."""
+    out = np.zeros(len(time), dtype=float)
+    out[1:] = np.diff(np.asarray(time, dtype=float))
+    return out
+
+
+def _mean_spacing(spacing: np.ndarray) -> np.ndarray:
+    """``meanspacingf``: the running mean of prior spacings, with a sentinel.
+
+    Position 0 is 0 and position 1 is **-1**, both of which the features that
+    read this treat as "no spacing to speak of yet" — the sentinel is the
+    reference's, and ``base4`` branches on it rather than on the position.
+    From position 2 on it is the mean of the spacings at positions 1..i-1;
+    position 0's spacing is structurally zero and is excluded.
+    """
+    n = len(spacing)
+    out = np.zeros(n, dtype=float)
+    if n > 1:
+        out[1] = -1.0
+    if n > 2:
+        out[2:] = np.cumsum(spacing[1:n - 1]) / np.arange(1, n - 1)
+    return out
+
+
+def _dash(time: np.ndarray, increments: np.ndarray, scale: float) -> np.ndarray:
+    """``countOutcomeDash``: a count of prior trials that decays with real time.
+
+    ``scale`` is in days. ``increments`` is 1 per trial for ``dashafm`` and the
+    outcome for ``dashsuc``.
+    """
+    n = len(time)
+    out = np.zeros(n, dtype=float)
+    carried = float(increments[0])
+    for i in range(1, n):
+        out[i] = carried * math.exp(-(time[i] - time[i - 1]) / (scale * _DAY))
+        carried = out[i] + float(increments[i])
+    return out
+
+
+def _ppe_weighted_time(age: np.ndarray, d: float) -> np.ndarray:
+    """``slideppetw``: PPE's recency-weighted mean time since prior practice.
+
+    At each position the times back to every earlier practice are weighted by
+    themselves to the power ``-d`` — recent practice counts for more — and
+    averaged. The first position, and any position where some earlier practice
+    carries the same timestamp, returns 1: the weights are then ``Inf/Inf`` and
+    the reference's own ``is.nan`` guard falls through to 1.
+    """
+    n = len(age)
+    out = np.ones(n, dtype=float)
+    age = np.asarray(age, dtype=float)
+    for i in range(1, n):
+        elapsed = age[i] - age[:i]
+        if not np.all(elapsed > 0.0):
+            continue
+        weights = elapsed ** -d
+        total = weights.sum()
+        if not np.isfinite(total) or total == 0.0:
+            continue
+        out[i] = float((weights / total) @ elapsed)
+    return out
+
+
+# --------------------------------------------------------------------------
+# The feature registry
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Feature:
+    """How one feature is computed, and what it needs to be computable.
+
+    ``flat`` features are pure functions of the prior counts and evaluate over
+    every observation at once. ``walk`` features read a whole practice sequence
+    — a decay, a spacing, an age — and are evaluated one sequence at a time.
+    """
+
+    arity: int
+    flat: Callable[[np.ndarray, np.ndarray, tuple[float, ...]], np.ndarray] | None = None
+    walk: Callable[[_View, tuple[float, ...]], np.ndarray] | None = None
+    needs: tuple[str, ...] = ()
+
+
+def _prop(s, f, _):
+    n = s + f
+    return np.where(n == 0, 0.5, s / np.where(n == 0, 1.0, n))
+
+
+def _propdec(view, pars):
+    corv, incorv = _decayed_counts(view.y, pars[0])
+    return corv / (corv + incorv)
+
+
+def _propdec2(view, pars):
+    d = pars[0]
+    n = len(view.y)
+    running = _slide_expdec(view.y, d)
+    w = np.arange(n, dtype=float)
+    # sum(d^0 .. d^(w+2)), the reference's three ghost failures.
+    denom = (np.full(n, w + 3.0) if d == 1.0
+             else (1.0 - d ** (w + 3.0)) / (1.0 - d))
+    out = running / denom
+    out[0] = 0.0
+    return out
+
+
+def _logitdec(view, pars):
+    d = pars[0]
+    counts = (_decayed_counts if len(view.y) <= LOGITDEC_WINDOW + 1
+              else lambda y, dd: _windowed_decayed_counts(y, dd, LOGITDEC_WINDOW))
+    corv, incorv = counts(view.y, d)
+    return np.log(corv / incorv)
+
+
+def _recency(view, pars, weight=None):
+    spacing = _spacing(view.time)
+    with np.errstate(divide="ignore"):
+        value = np.where(spacing == 0.0, 0.0, spacing ** -pars[0])
+    return value if weight is None else value * weight(view)
+
+
+def _age(view, pars) -> np.ndarray:
+    """``base``'s clock: real time since this level's first encounter."""
+    time = np.asarray(view.time, dtype=float)
+    return time - time[0]
+
+
+def _blended_age(view, pars) -> np.ndarray:
+    """``base2``'s clock: time away from the system counted at ``pars[1]``.
+
+    ``(real age - age on task) * w + age on task`` — with ``w = 1`` this is
+    real time and with ``w = 0`` it is time spent working, so the parameter
+    says how much a gap between sessions counts towards forgetting.
+    """
+    on_task = np.asarray(view.on_task, dtype=float)
+    intage = on_task - on_task[0]
+    return (_age(view, pars) - intage) * pars[1] + intage
+
+
+def _base(clock, amount):
+    def feature(view, pars):
+        return amount(view) * _baselevel(clock(view, pars), pars[0])
+    return feature
+
+
+def _base4(view, pars):
+    decay, session, spacing_power, unspaced = pars
+    level = _baselevel(_blended_age(view, pars), decay)
+    practice = np.log1p(view.s + view.f)
+    mean_real = _mean_spacing(_spacing(view.time))
+    mean_task = _mean_spacing(_spacing(view.on_task))
+    blended = session * (mean_real - mean_task) + mean_task
+    unspaced_here = mean_real <= 0.0
+    # Positions on the sentinel branch never reach the power, so a NaN out of
+    # it is a real negative mean spacing rather than the sentinel's own -1.
+    spaced = np.where(unspaced_here, 1.0, blended) ** spacing_power
+    return np.where(unspaced_here, unspaced, spaced) * practice * level
+
+
+def _ppe(view, pars):
+    count_power, base_decay, spacing_decay, weight_decay = pars
+    n = view.s + view.f
+    lagged = _lag(_spacing(view.time))
+    with np.errstate(divide="ignore"):
+        contribution = np.where(lagged == 0.0, 0.0, 1.0 / np.log(lagged + math.e))
+    spacing = np.cumsum(contribution)
+    spacing = np.where(n <= 1, 0.0, spacing / np.where(n <= 1, 1.0, n - 1))
+    weighted = _ppe_weighted_time(_age(view, pars), weight_decay)
+    return n.astype(float) ** count_power * weighted ** -(base_decay + spacing_decay * spacing)
+
+
+#: Every implemented feature, keyed by the reference's own name.
+_FEATURES: dict[str, _Feature] = {
+    # Pure functions of the prior counts.
+    "intercept": _Feature(0, flat=lambda s, f, p: np.ones(len(s))),
+    "lineafm": _Feature(0, flat=lambda s, f, p: (s + f).astype(float)),
+    "logafm": _Feature(0, flat=lambda s, f, p: np.log1p(s + f)),
+    "linesuc": _Feature(0, flat=lambda s, f, p: s.astype(float)),
+    "logsuc": _Feature(0, flat=lambda s, f, p: np.log1p(s)),
+    "linefail": _Feature(0, flat=lambda s, f, p: f.astype(float)),
+    "logfail": _Feature(0, flat=lambda s, f, p: np.log1p(f)),
+    "linecomp": _Feature(0, flat=lambda s, f, p: (s - f).astype(float)),
+    "prop": _Feature(0, flat=_prop),
+    "powafm": _Feature(1, flat=lambda s, f, p: (s + f).astype(float) ** p[0]),
+    "logit": _Feature(1, flat=lambda s, f, p: np.log(
+        (0.1 + 30.0 * p[0] + s) / (0.1 + 30.0 * p[0] + f))),
+
+    # Decayed outcome histories — no clock, just practice order.
+    "expdecafm": _Feature(1, walk=lambda v, p: _slide_expdec(np.ones(len(v)), p[0])),
+    "expdecsuc": _Feature(1, walk=lambda v, p: _slide_expdec(v.y, p[0])),
+    "expdecfail": _Feature(1, walk=lambda v, p: _slide_expdec(1.0 - v.y, p[0])),
+    "propdec": _Feature(1, walk=_propdec),
+    "propdec2": _Feature(1, walk=_propdec2),
+    "logitdec": _Feature(1, walk=_logitdec),
+
+    # Recency: the interval since the previous encounter, and nothing older.
+    "recency": _Feature(1, walk=_recency, needs=("time",)),
+    "recencysuc": _Feature(
+        1, walk=lambda v, p: _recency(v, p, weight=lambda v: _lag(v.y)), needs=("time",)),
+    "recencyfail": _Feature(
+        1, walk=lambda v, p: _recency(v, p, weight=lambda v: 1.0 - _lag(v.y)),
+        needs=("time",)),
+
+    # Forgetting: practice scaled by a power-law decay of its age.
+    "base": _Feature(1, walk=_base(_age, lambda v: np.log1p(v.s + v.f)), needs=("time",)),
+    "basesuc": _Feature(1, walk=_base(_age, lambda v: np.log1p(v.s)), needs=("time",)),
+    "basefail": _Feature(1, walk=_base(_age, lambda v: np.log1p(v.f)), needs=("time",)),
+    "base2": _Feature(2, walk=_base(_blended_age, lambda v: np.log1p(v.s + v.f)),
+                      needs=("time", "on_task")),
+    "base2suc": _Feature(2, walk=_base(_blended_age, lambda v: np.log1p(v.s)),
+                         needs=("time", "on_task")),
+    "base2fail": _Feature(2, walk=_base(_blended_age, lambda v: np.log1p(v.f)),
+                          needs=("time", "on_task")),
+    "dashafm": _Feature(1, needs=("time",), walk=lambda v, p: np.log1p(
+        _dash(v.time, np.ones(len(v)), p[0]))),
+    "dashsuc": _Feature(1, needs=("time",), walk=lambda v, p: np.log1p(
+        _dash(v.time, v.y, p[0]))),
+
+    # Spacing: forgetting scaled by how spread out the practice was.
+    "base4": _Feature(4, walk=_base4, needs=("time", "on_task")),
+    "ppe": _Feature(4, walk=_ppe, needs=("time",)),
+}
+
+#: Every feature name this module implements, including :data:`NUMERIC_FEATURE`.
+FEATURE_NAMES = (*sorted(_FEATURES), NUMERIC_FEATURE)
 
 #: Reference features this module refuses, and why. Named individually so a
 #: spec copied out of a paper fails with the reason rather than with
-#: "unknown feature".
+#: "unknown feature". Three of these are refusals to reproduce a defect: the
+#: reference cannot compute them either.
 DEFERRED: dict[str, str] = {
-    **dict.fromkeys(
-        ("recency", "recencysuc", "recencyfail", "recencystudy", "recencytest",
-         "base", "base2", "base4", "basesuc", "basefail", "base2suc", "base2fail",
-         "base5suc", "base5fail", "ppe", "dashafm", "dashsuc"),
-        "needs numeric time; StepData carries timestamp strings only",
-    ),
-    **dict.fromkeys(
-        ("propdec", "propdec2", "logitdec", "logitdecevol", "logit", "errordec",
-         "expdecafm", "expdecsuc", "expdecfail", "baseratepropdec"),
-        "needs a fitted decay parameter; the design would depend on it",
-    ),
+    "errordec": ("the reference reads data$pred_ed (LKTfunctions.R:891), which nothing "
+                 "in the package ever assigns"),
+    "recencystudy": ("the reference reads <component>previousstudy, whose assignment is "
+                     "commented out in computeSpacingPredictors (LKTfunctions.R:25)"),
+    "recencytest": ("the reference reads <component>previousstudy, whose assignment is "
+                    "commented out in computeSpacingPredictors (LKTfunctions.R:25)"),
+    "dashfail": ("the reference counts it in parlength (LKTfunctions.R:543) but has no "
+                 "branch for it in computefeatures"),
+    "logitdecevol": ("indexes by component level across students, a grouping this module "
+                     "does not build"),
+    "baseratepropdec": ("indexes by student over component labels, a grouping this module "
+                        "does not build"),
+    "base5suc": "not implemented; base4 with a fifth parameter",
+    "base5fail": "not implemented; base4 with a fifth parameter",
     **dict.fromkeys(
         ("diffcor1", "diffcor2", "diffincor1", "diffincor2", "diffall1", "diffall2",
          "diffcorComp", "diffincorComp", "diffallComp", "diffrelcor1", "diffrelcor2"),
@@ -156,12 +486,18 @@ DEFERRED: dict[str, str] = {
     ),
 }
 
-_BLOCK_NAME = re.compile(r"^(?P<feature>[A-Za-z]+)(?P<per_level>\$?)"
-                         r"(?:\((?P<par>[^)]*)\))?\[(?P<component>.+)]$")
+_BLOCK_NAME = re.compile(r"^(?P<feature>[A-Za-z][A-Za-z0-9]*)(?P<per_level>\$?)"
+                         r"(?:\((?P<pars>[^)]*)\))?\[(?P<component>.+)]$")
 
 #: Per-level intercepts on these two components are named the way the shared
 #: identification pass expects; see the module docstring's block-name divergence.
 _SHARED_BLOCK_NAME = {"student": "student", "kc": "kc_intercept"}
+
+#: Component names the reference uses, mapped onto this package's. Only the
+#: student is fixed by LKT's own contract; a KC model is chosen when the export
+#: is loaded, so ``KC..Default.`` has no general translation and stays a
+#: source-column lookup.
+_ALIASES = {"Anon.Student.Id": "student", "Anon Student Id": "student"}
 
 
 @dataclass(frozen=True)
@@ -173,49 +509,62 @@ class Term:
     per-level (a factor is expanded whether or not it is written with a ``$``),
     so the flag is forced on for them, as in the reference.
 
-    ``par`` is a *fixed* shape parameter, accepted only by the features in
-    :data:`PARAMETRIC`. It is part of the term's identity and of its block
-    name, so two ``powafm`` terms on one component at different exponents do
-    not collide.
+    ``pars`` are the feature's shape parameters, **fixed** — nothing in this
+    module fits one. A scalar is accepted for the single-parameter features.
+    They are part of the term's identity and of its block name, so two
+    ``powafm`` terms on one component at different exponents do not collide.
     """
 
     component: str
     feature: str
     per_level: bool = False
-    par: float | None = None
+    pars: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.feature in DEFERRED:
             raise NotImplementedError(
                 f"Feature {self.feature!r} is not implemented here: "
                 f"{DEFERRED[self.feature]}. Implemented features are "
-                f"{', '.join(STATIC_FEATURES)}."
+                f"{', '.join(FEATURE_NAMES)}."
             )
-        if self.feature not in FEATURES and self.feature != NUMERIC_FEATURE:
+        if self.feature not in _FEATURES and self.feature != NUMERIC_FEATURE:
             raise ValueError(
                 f"Unknown feature {self.feature!r}. Implemented: "
-                f"{', '.join(STATIC_FEATURES)}."
+                f"{', '.join(FEATURE_NAMES)}."
             )
         if self.feature == NUMERIC_FEATURE and self.per_level:
             raise ValueError(
                 "'numer' reads its component as a number, not as a factor, so "
                 "'numer$' has no levels to extend over. Drop the '$'."
             )
-        needs_par = self.feature in PARAMETRIC
-        if needs_par and self.par is None:
+        if not isinstance(self.pars, tuple):
+            scalar = (float(self.pars),) if np.isscalar(self.pars) else tuple(self.pars)
+            object.__setattr__(self, "pars", scalar)
+
+        arity = self.arity
+        if len(self.pars) != arity:
+            fits = ("takes no parameter" if arity == 0
+                    else f"takes {arity} fixed parameter{'s' if arity > 1 else ''}")
             raise ValueError(
-                f"Feature {self.feature!r} takes a shape parameter and nothing here "
-                "fits one. Pass par=<value> to hold it fixed."
+                f"Feature {self.feature!r} {fits}, got {len(self.pars)}. Nothing in "
+                "this module searches for a parameter — the reference fits its decay "
+                "rates with an outer optimizer that is not implemented here — so a "
+                "parametric feature has to be held at a value you choose."
             )
-        if not needs_par and self.par is not None:
-            raise ValueError(f"Feature {self.feature!r} takes no parameter, got par={self.par!r}")
         # Frozen, but the reference's own normalization: a factor is expanded
         # whether or not the spec writes the '$'.
         if self.feature == "intercept" and not self.per_level:
             object.__setattr__(self, "per_level", True)
 
+    @property
+    def arity(self) -> int:
+        """How many fixed parameters this term's feature takes."""
+        spec = _FEATURES.get(self.feature)
+        return 0 if spec is None else spec.arity
+
     @classmethod
-    def parse(cls, component: str, feature: str, par: float | None = None) -> Term:
+    def parse(cls, component: str, feature: str,
+              pars: float | Sequence[float] | None = None) -> Term:
         """Build from the reference's own strings, ``$`` suffix included."""
         text = feature.strip()
         per_level = text.endswith("$")
@@ -226,8 +575,12 @@ class Term:
                 "mixed-effects fit is a different estimator whose AIC/BIC are not "
                 "comparable with these."
             )
+        if pars is None:
+            pars = ()
+        elif np.isscalar(pars):
+            pars = (float(pars),)
         return cls(component=_ALIASES.get(component, component),
-                   feature=text.rstrip("$"), per_level=per_level, par=par)
+                   feature=text.rstrip("$"), per_level=per_level, pars=tuple(pars))
 
     def notation(self) -> str:
         """The feature as the reference writes it: ``lineafm$``.
@@ -239,28 +592,23 @@ class Term:
         marker = "$" if self.per_level and self.feature != "intercept" else ""
         return f"{self.feature}{marker}"
 
+    def _pars_suffix(self) -> str:
+        return "" if not self.pars else "(" + ",".join(f"{p:g}" for p in self.pars) + ")"
+
     def __str__(self) -> str:
-        par = "" if self.par is None else f"({self.par:g})"
-        return f"{self.component}:{self.notation()}{par}"
+        return f"{self.component}:{self.notation()}{self._pars_suffix()}"
 
     @property
     def block_name(self) -> str:
         """Design block this term contributes — see the block-name divergence."""
         if self.feature == "intercept" and self.component in _SHARED_BLOCK_NAME:
             return _SHARED_BLOCK_NAME[self.component]
-        par = "" if self.par is None else f"({self.par:g})"
-        return f"{self.notation()}{par}[{self.component}]"
-
-
-#: Component names the reference uses, mapped onto this package's. Only the
-#: student is fixed by LKT's own contract; a KC model is chosen when the export
-#: is loaded, so ``KC..Default.`` has no general translation and stays a
-#: source-column lookup.
-_ALIASES = {"Anon.Student.Id": "student", "Anon Student Id": "student"}
+        return f"{self.notation()}{self._pars_suffix()}[{self.component}]"
 
 
 def lkt_terms(components: Sequence[str], features: Sequence[str],
-              pars: Sequence[float | None] | None = None) -> tuple[Term, ...]:
+              pars: Sequence[float | Sequence[float] | None] | None = None,
+              ) -> tuple[Term, ...]:
     """Terms from the reference's parallel ``components``/``features`` vectors.
 
     Exists so a specification can be copied out of a paper unchanged::
@@ -268,11 +616,14 @@ def lkt_terms(components: Sequence[str], features: Sequence[str],
         lkt_terms(components=("student", "kc", "kc"),
                   features=("intercept", "intercept", "lineafm$"))
 
-    ``pars`` parallels the same vectors and holds a fixed parameter for the
-    features that take one (``None`` elsewhere) — deliberately positional like
-    the reference's ``fixedpars``, but *per term* rather than a single flat
-    vector consumed in feature order, because the flat form is what makes the
-    reference's own parameter bookkeeping hard to read.
+    ``pars`` parallels the same vectors: one entry per term, holding that
+    feature's fixed parameters (a scalar for the single-parameter features, a
+    tuple for the rest, ``None`` where the feature takes none). Deliberately
+    *per term* rather than the reference's single flat vector consumed in
+    feature order — the flat form is what makes its own parameter bookkeeping
+    hard to read, and hard enough that two of its branches
+    (``LKTfunctions.R:155-156``, ``:163-218``) silently stop recomputing the
+    features that share a parameter.
     """
     if len(components) != len(features):
         raise ValueError(
@@ -282,7 +633,7 @@ def lkt_terms(components: Sequence[str], features: Sequence[str],
     if pars is None:
         pars = [None] * len(features)
     elif len(pars) != len(features):
-        raise ValueError(f"{len(pars)} par(s) for {len(features)} feature(s)")
+        raise ValueError(f"{len(pars)} par entr(ies) for {len(features)} feature(s)")
     return tuple(Term.parse(c, f, p) for c, f, p in zip(components, features, pars))
 
 
@@ -299,12 +650,17 @@ def design_terms(design: Design) -> tuple[Term, ...]:
         elif block.name == "kc_intercept":
             out.append(Term("kc", "intercept"))
         elif m := _BLOCK_NAME.match(block.name):
+            pars = () if m["pars"] is None else tuple(float(p) for p in m["pars"].split(","))
             out.append(Term(component=m["component"], feature=m["feature"],
-                            per_level=bool(m["per_level"]),
-                            par=None if m["par"] is None else float(m["par"])))
+                            per_level=bool(m["per_level"]), pars=pars))
         else:
             raise ValueError(f"Block {block.name!r} was not built by leapfit.lkt")
     return tuple(out)
+
+
+# --------------------------------------------------------------------------
+# Components and their practice histories
+# --------------------------------------------------------------------------
 
 
 def component_labels(data: StepData, component: str) -> list[tuple[str, ...]]:
@@ -342,6 +698,71 @@ def _source_column(data: StepData, component: str) -> np.ndarray:
     return data.source[component].to_numpy()[data.source_rows]
 
 
+@dataclass(frozen=True)
+class _Layout:
+    """Every (observation, component level) pair, grouped into practice sequences.
+
+    The pairs are stored flat and ordered so that each (student, level) history
+    is one contiguous run — ``starts[k]:starts[k+1]``, in practice order. That
+    is the shape both kinds of feature want: a count feature reads
+    :attr:`prior_s` and :attr:`prior_f` straight across, and a decay or
+    forgetting feature walks one run at a time.
+
+    ``slots`` records which of an observation's own labels a pair came from, so
+    a per-observation view can be rebuilt in the row's label order — the order
+    everything outside this module aligns to.
+    """
+
+    n_obs: int
+    rows: np.ndarray          # (m,) observation index
+    columns: np.ndarray       # (m,) level index into `levels`
+    slots: np.ndarray         # (m,) label position within that observation
+    starts: np.ndarray        # (n_sequences + 1,)
+    levels: list[str]
+    y: np.ndarray             # (m,) outcome at each pair
+    prior_s: np.ndarray       # (m,) prior successes within its own sequence
+    prior_f: np.ndarray       # (m,)
+
+
+def _layout(data: StepData, labels: Sequence[tuple[str, ...]]) -> _Layout:
+    """Group every (observation, level) pair by (student, level), in practice order.
+
+    The reference forms the same grouping by pasting the level onto the student
+    id and grouping on the concatenated string (``LKTfunctions.R:296``), which
+    is why two (student, level) pairs whose names differ only in where the
+    boundary falls collide there and not here.
+    """
+    levels = sorted({label for row in labels for label in row})
+    index = {label: j for j, label in enumerate(levels)}
+
+    sequences: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    for student, rows in data.practice_order().items():
+        for i in rows:
+            for slot, label in enumerate(labels[i]):
+                sequences.setdefault((student, label), []).append((i, slot))
+
+    pairs = [pair for run in sequences.values() for pair in run]
+    rows_flat = np.fromiter((i for i, _ in pairs), dtype=int, count=len(pairs))
+    slots = np.fromiter((s for _, s in pairs), dtype=int, count=len(pairs))
+    columns = np.fromiter(
+        (index[label] for (_, label), run in sequences.items() for _ in run),
+        dtype=int, count=len(pairs))
+    starts = np.concatenate(
+        [[0], np.cumsum([len(run) for run in sequences.values()], dtype=int)]).astype(int)
+
+    y = np.asarray(data.y, dtype=float)[rows_flat]
+
+    # Prior counts: an exclusive cumulative sum that restarts at every sequence.
+    totals = np.concatenate([[0.0], np.cumsum(y)])
+    at_start = np.repeat(starts[:-1], np.diff(starts))
+    prior_s = totals[:-1] - totals[at_start]
+    prior_f = (np.arange(len(y)) - at_start) - prior_s
+
+    return _Layout(n_obs=len(data), rows=rows_flat, columns=columns, slots=slots,
+                   starts=starts, levels=levels, y=y,
+                   prior_s=prior_s, prior_f=prior_f)
+
+
 def history_counts(data: StepData, labels: Sequence[tuple[str, ...]],
                    ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]]]:
     """Prior successes and failures per observation, per level of a component.
@@ -357,69 +778,95 @@ def history_counts(data: StepData, labels: Sequence[tuple[str, ...]],
     Passing ``data.kcs`` reproduces
     :func:`~leapfit.pfa.success_failure_counts` exactly; passing the student's
     own labels gives that student's whole prior history, which is what a
-    feature on the student component means.
+    feature on the student component means. Element ``n`` is aligned with
+    ``labels[n]`` by position, as :attr:`~leapfit.data.StepData.opportunities`
+    is aligned with :attr:`~leapfit.data.StepData.kcs`.
     """
     if len(labels) != len(data):
         raise ValueError(f"{len(data)} observations but {len(labels)} label rows")
-    s_out: list[tuple[int, ...]] = [()] * len(data)
-    f_out: list[tuple[int, ...]] = [()] * len(data)
-    for rows in data.practice_order().values():
-        s_seen: dict[str, int] = {}
-        f_seen: dict[str, int] = {}
-        for i in rows:
-            correct = int(data.y[i])
-            s_row, f_row = [], []
-            for label in labels[i]:
-                s_row.append(s_seen.get(label, 0))
-                f_row.append(f_seen.get(label, 0))
-                s_seen[label] = s_seen.get(label, 0) + correct
-                f_seen[label] = f_seen.get(label, 0) + (1 - correct)
-            s_out[i], f_out[i] = tuple(s_row), tuple(f_row)
-    return s_out, f_out
+    layout = _layout(data, labels)
+    s_out: list[list[int]] = [[0] * len(row) for row in labels]
+    f_out: list[list[int]] = [[0] * len(row) for row in labels]
+    for i, slot, s, f in zip(layout.rows, layout.slots, layout.prior_s, layout.prior_f):
+        s_out[i][slot] = int(s)
+        f_out[i][slot] = int(f)
+    return [tuple(v) for v in s_out], [tuple(v) for v in f_out]
 
 
-def _term_values(term: Term, data: StepData, labels: Sequence[tuple[str, ...]],
-                 counts: tuple[list[tuple[int, ...]], list[tuple[int, ...]]] | None,
-                 ) -> list[tuple[float, ...]]:
-    """One value per (observation, level), aligned with ``labels``."""
+# --------------------------------------------------------------------------
+# Assembling a design
+# --------------------------------------------------------------------------
+
+
+class _Clock:
+    """The time series a term may need, resolved once per design and shared."""
+
+    def __init__(self, data: StepData):
+        self._data = data
+        self._cache: dict[str, np.ndarray] = {}
+
+    def get(self, what: str, term: Term) -> np.ndarray:
+        if what not in self._cache:
+            source = {"time": self._data.epoch_times,
+                      "on_task": self._data.time_on_task}[what]
+            try:
+                self._cache[what] = np.asarray(source(), dtype=float)
+            except ValueError as exc:
+                raise ValueError(f"Term {term} cannot be computed: {exc}") from exc
+        return self._cache[what]
+
+
+def _term_values(term: Term, data: StepData, layout: _Layout, clock: _Clock) -> np.ndarray:
+    """One value per (observation, level) pair, in ``layout`` order."""
     if term.feature == NUMERIC_FEATURE:
         column = pd.to_numeric(pd.Series(_source_column(data, term.component)),
                                errors="coerce").to_numpy(dtype=float)
         if np.isnan(column).any():
-            bad = int(np.isnan(column).sum())
             raise ValueError(
-                f"'numer' reads component {term.component!r} as a number, but {bad:,} "
-                "of its values do not parse as one."
+                f"'numer' reads component {term.component!r} as a number, but "
+                f"{int(np.isnan(column).sum()):,} of its values do not parse as one."
             )
-        return [(v,) * len(row) for v, row in zip(column, labels)]
+        return column[layout.rows]
 
-    value = FEATURES[term.feature]
-    s_counts, f_counts = counts  # type: ignore[misc]
-    return [tuple(value(s, f, term.par) for s, f in zip(s_row, f_row))
-            for s_row, f_row in zip(s_counts, f_counts)]
+    spec = _FEATURES[term.feature]
+    if spec.flat is not None:
+        return np.asarray(spec.flat(layout.prior_s, layout.prior_f, term.pars), dtype=float)
+
+    time = clock.get("time", term)[layout.rows] if "time" in spec.needs else None
+    on_task = clock.get("on_task", term)[layout.rows] if "on_task" in spec.needs else None
+
+    out = np.empty(len(layout.rows), dtype=float)
+    for a, b in zip(layout.starts[:-1], layout.starts[1:]):
+        view = _View(layout.y[a:b], layout.prior_s[a:b], layout.prior_f[a:b],
+                     None if time is None else time[a:b],
+                     None if on_task is None else on_task[a:b])
+        out[a:b] = spec.walk(view, term.pars)
+    return out
 
 
-def _term_block(term: Term, labels: Sequence[tuple[str, ...]],
-                values: Sequence[tuple[float, ...]], l2: float) -> Block:
-    n = len(labels)
+def _term_block(term: Term, layout: _Layout, values: np.ndarray, l2: float) -> Block:
+    if not np.isfinite(values).all():
+        bad = int((~np.isfinite(values)).sum())
+        raise ValueError(
+            f"Term {term} produced {bad:,} non-finite value(s). The usual cause is two "
+            "attempts on one level carrying the same timestamp, which makes an elapsed "
+            "time zero and a negative power of it infinite. The reference produces Inf "
+            "here and fits on it; check the export's times before choosing between "
+            "dropping those rows and using a feature that does not divide by an interval."
+        )
+
     if not term.per_level:
         # One shared coefficient. A row carrying several levels contributes the
         # sum over them, which is what an additive multi-KC step means here and
         # what leapfit.pfa's pooled slopes already do.
-        totals = np.array([float(sum(row)) for row in values])
+        totals = np.zeros(layout.n_obs, dtype=float)
+        np.add.at(totals, layout.rows, values)
         return Block.build(term.block_name, totals[:, None], [term.notation()], l2=l2)
 
-    levels = sorted({label for row in labels for label in row})
-    index = {label: j for j, label in enumerate(levels)}
-    rows, cols, vals = [], [], []
-    for i, (row_labels, row_values) in enumerate(zip(labels, values)):
-        for label, value in zip(row_labels, row_values):
-            rows.append(i)
-            cols.append(index[label])
-            vals.append(float(value))
-    matrix = sparse.csr_matrix((vals, (rows, cols)), shape=(n, len(levels)))
+    matrix = sparse.csr_matrix((values, (layout.rows, layout.columns)),
+                               shape=(layout.n_obs, len(layout.levels)))
     matrix.eliminate_zeros()  # a zero count is a structural zero, not a datum
-    return Block.build(term.block_name, matrix, levels, l2=l2)
+    return Block.build(term.block_name, matrix, layout.levels, l2=l2)
 
 
 def _refuse_unbreakable_redundancy(terms: Sequence[Term]) -> None:
@@ -470,7 +917,9 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         the design redundant.
 
     :raises NotImplementedError: for a spec whose intercepts carry a redundancy
-        the shared pass cannot break. See :func:`_refuse_unbreakable_redundancy`.
+        the shared pass cannot break.
+    :raises ValueError: for a term whose feature needs a clock the export does
+        not carry, or whose values come out non-finite.
     """
     terms = tuple(terms)
     if not terms:
@@ -490,21 +939,16 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         # identify=False the caller has taken the parameter count on themselves.
         _refuse_unbreakable_redundancy(terms)
 
-    label_cache: dict[str, list[tuple[str, ...]]] = {}
-    count_cache: dict[str, tuple[list[tuple[int, ...]], list[tuple[int, ...]]]] = {}
-
+    clock = _Clock(data)
+    layouts: dict[str, _Layout] = {}
     blocks = []
     for term in terms:
-        labels = label_cache.get(term.component)
-        if labels is None:
-            labels = label_cache[term.component] = component_labels(data, term.component)
-        counts = None
-        if term.feature != NUMERIC_FEATURE:
-            counts = count_cache.get(term.component)
-            if counts is None:
-                counts = count_cache[term.component] = history_counts(data, labels)
-        blocks.append(_term_block(term, labels,
-                                  _term_values(term, data, labels, counts), l2))
+        layout = layouts.get(term.component)
+        if layout is None:
+            layout = layouts[term.component] = _layout(
+                data, component_labels(data, term.component))
+        blocks.append(_term_block(term, layout,
+                                  _term_values(term, data, layout, clock), l2))
 
     design = Design(tuple(blocks))
     return design.identify() if identify else design
@@ -555,12 +999,12 @@ class LKTFit(LogisticFit):
 
         for term in here:
             values = self._block_values(term.block_name)
+            header = term.notation() + term._pars_suffix()
             if term.per_level:
-                frame[term.notation()] = [values.get(level, np.nan) for level in levels]
+                frame[header] = [values.get(level, np.nan) for level in levels]
                 diverging |= set(by_block.get(term.block_name, ()))
             else:
-                shared = next(iter(values.values()), np.nan)
-                frame[term.notation()] = [shared] * len(levels)
+                frame[header] = [next(iter(values.values()), np.nan)] * len(levels)
 
         frame["Separated"] = [level in diverging for level in levels]
         return pd.DataFrame(frame)

@@ -7,6 +7,53 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Added
 
+- **LKT features that read the clock and the outcome history**, at parameters
+  the caller fixes. Thirty-one features now, up from eleven: decayed histories
+  (`expdecafm`, `expdecsuc`, `expdecfail`, `propdec`, `propdec2`, `logitdec`),
+  recency (`recency`, `recencysuc`, `recencyfail`), power-law forgetting
+  (`base`, `basesuc`, `basefail`, `base2`, `base2suc`, `base2fail`, `dashafm`,
+  `dashsuc`) and the two four-parameter spacing models (`base4`, `ppe`).
+
+  Nothing here searches for a decay rate — the reference fits its rates with an
+  outer optimizer that rebuilds every feature and refits the whole regression
+  at each evaluation, which is a different fitter — so a parametric feature
+  *requires* its `pars`, and `Term.par` becomes `Term.pars`, a tuple, scalar
+  accepted.
+
+  Two reference behaviours are reproduced deliberately and are worth knowing
+  about. `logitdec` truncates at a **60-trial window** (`slidelogitdec`'s
+  `max(1, i - 60)`), undocumented in the paper and worth 0.06 logits at
+  `d = .97` over 200 trials; `LOGITDEC_WINDOW` names it. And the mean-spacing
+  sentinel of `-1` at a level's second practice is what selects `base4`'s
+  unspaced branch, rather than the position doing it.
+
+- **A clock on `StepData`.** `epoch_times()` parses `First Transaction Time` to
+  seconds, and `time_on_task()` accumulates `Step Duration (sec)` — lagged, per
+  student, over `practice_order()` — into the clock that ignores gaps between
+  sessions. Both **refuse** when the export lacks the column instead of
+  substituting a row number or a constant, because every substitute is a
+  different model. Neither column is required by anything that ran before.
+
+- **Three more of the reference's published chunks reproduced**, spanning the
+  whole implemented surface: `logitdec + recency` at **-25474.531**, `PPE` at
+  **-24695.586** and `base4` at **-25969.925**, each within 0.2 nats and each
+  on the better side of the published value from a KKT-certified optimum. With
+  the AFM chunk that is four, and `test_every_chunk_lands_on_the_better_side_of_its_published_value`
+  checks the *shape* of all four together: a sign that flipped between them
+  would say the agreement is noise around a wrong design.
+
+  The equivalence fixture now also carries `Step Duration (sec)`, derived the
+  way the vignette derives it — `(end latency + review latency + 500)/1000`,
+  overwriting the export's own duration column — because that is what the
+  published `base4` number was produced from.
+
+- **Features are refused by name with the reason, and three of those reasons
+  are reference defects.** `errordec` reads `data$pred_ed`, which nothing in
+  the package ever assigns; `recencystudy` and `recencytest` read
+  `<component>previousstudy`, whose assignment is commented out in
+  `computeSpacingPredictors`; `dashfail` is counted in `parlength` but has no
+  branch in `computefeatures`. The reference cannot compute any of them either.
+
 - **Logistic Knowledge Tracing, static features** (`leapfit/lkt.py`). A model
   is a list of `Term`s, each pairing a *component* (any factor the export
   carries — student, item, KC, or a column of the source table) with a
@@ -51,6 +98,19 @@ while the major version is 0, a minor bump may change the public API.
   asserting it — the ridge accounts for 0.036 nats and the choice of reference
   level for 0.015, leaving `LiblineaR`'s default `epsilon = 1e-4`.
 
+### Fixed
+
+- A term whose feature divides by an elapsed time now **raises** when the
+  assembled column is non-finite, naming the feature. Two attempts on one level
+  sharing a timestamp make an age of zero, and the reference raises it to a
+  negative power and hands `Inf` to its solver.
+
+### Changed
+
+- `Term.par` -> `Term.pars` (a tuple; a scalar is accepted for the
+  single-parameter features), and `STATIC_FEATURES` -> `FEATURE_NAMES`. Both
+  from the same release, both unreleased.
+
 ### Known limitations
 
 - Per-level intercepts on any combination of components other than
@@ -60,7 +120,14 @@ while the major version is 0, a minor bump may change the public API.
   `identify=False` to take the parameter count on yourself.
 - No global intercept (`interc=TRUE`), no `*` or `:` connectors, no
   `interacts`, no `autoKC`, no `@` random effects, and no `leapfit-lkt`
-  console script yet.
+  console script yet. `interc` waits on the same generalization as the point
+  above: with a per-level intercept already in the spec the all-ones column is
+  inside the span, so it is a reparameterization rather than a new direction,
+  and the three time-feature chunks reproduced here pass `interc=TRUE` while
+  this package fits the same span without it.
+- Nothing fits a decay rate. Every parametric feature is held where the caller
+  puts it, so a search over rates — the reference's outer `optim` — is the next
+  stage, along with `nPars = rank + k` and a certificate for the outer loop.
 
 ## 0.5.0 — 2026-09-03
 

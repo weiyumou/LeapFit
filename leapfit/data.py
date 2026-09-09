@@ -23,6 +23,14 @@ The rules, in the reference's own order:
 5. The item label — the unit of item-blocked cross-validation — is
    ``Problem Name ## Step Name``.
 
+Two further columns are read when the export carries them, and only because
+models beyond AFM need them: ``First Transaction Time`` orders
+:meth:`StepData.practice_order` and, parsed by :meth:`StepData.epoch_times`,
+supplies the intervals a spacing or forgetting term measures; ``Step Duration
+(sec)`` accumulates into :meth:`StepData.time_on_task`. Neither is required,
+and a model that needs one and does not have it is refused rather than
+defaulted — every substitute value is a different model.
+
 DIVERGENCE (unrecognized outcome labels): the reference compares ``First
 Attempt`` to the literal ``"correct"``, so any export writing ``"Correct"``, or
 any non-DataShop file coding the outcome as ``1``/``0``, silently yields a
@@ -81,6 +89,7 @@ class StepData:
     opportunities: list[tuple[int, ...]]  # (n_obs,) zero-based counts
     kc_model: str
     times: list[str] | None = None      # (n_obs,) First Transaction Time, if present
+    durations: np.ndarray | None = None  # (n_obs,) Step Duration (sec), if present
     skipped_no_kc: int = 0
     duplicate_kc_rows: int = 0
 
@@ -127,6 +136,68 @@ class StepData:
             s: np.asarray(sorted(v, key=lambda i: (self.times[i], i)), dtype=int)
             for s, v in order.items()
         }
+
+    def epoch_times(self) -> np.ndarray:
+        """``First Transaction Time`` as seconds, for models that need a clock.
+
+        :meth:`practice_order` only ever needs to *order* the timestamps, so
+        they are kept as the strings the export wrote and parsed here on
+        demand. A model with a forgetting or spacing term needs the intervals
+        themselves, and an export without the column cannot supply them —
+        which is a refusal, not a default, because every value that could be
+        substituted (row number, a constant) is a different model.
+
+        :raises ValueError: when the export carried no time column, or when a
+            value in it does not parse, naming the offenders.
+        """
+        if self.times is None:
+            raise ValueError(
+                "This export carried no 'First Transaction Time' column, so there "
+                "are no times to measure intervals between. A spacing, recency or "
+                "forgetting term cannot be computed from it."
+            )
+        parsed = pd.to_datetime(pd.Series(self.times), errors="coerce", format="mixed")
+        if (bad := parsed.isna()).any():
+            examples = ", ".join(map(repr, pd.Series(self.times)[bad].unique()[:3]))
+            raise ValueError(
+                f"{int(bad.sum()):,} 'First Transaction Time' value(s) do not parse as "
+                f"a timestamp, for example {examples}."
+            )
+        # Explicitly to seconds: the parsed dtype's own unit is a pandas
+        # version detail (nanoseconds once, microseconds now), and dividing an
+        # int64 view by a hardcoded 10**9 silently scales every interval.
+        return parsed.to_numpy(dtype="datetime64[s]").astype(np.int64)
+
+    def time_on_task(self) -> np.ndarray:
+        """Seconds a student had spent working *before* each observation.
+
+        The cumulative ``Step Duration (sec)`` over :meth:`practice_order`,
+        lagged so the first step of a student enters at zero. It is the clock
+        that ignores the gaps between sessions, and the difference between it
+        and :meth:`epoch_times` is what a model has to work with if it wants
+        to treat time away from the system differently from time at it.
+
+        :raises ValueError: when the export carried no duration column.
+        """
+        if self.durations is None:
+            raise ValueError(
+                "This export carried no 'Step Duration (sec)' column, so time on "
+                "task cannot be accumulated."
+            )
+        if (missing := int(np.isnan(self.durations).sum())):
+            # DataShop writes "." where it could not compute one. Accumulating
+            # past it would make every later step of that student NaN, and the
+            # model that reads this would then fail complaining about timestamps.
+            raise ValueError(
+                f"{missing:,} of {len(self):,} rows have no 'Step Duration (sec)', so "
+                "time on task cannot be accumulated past them. Drop those rows or use "
+                "a feature that reads the wall clock instead."
+            )
+        out = np.zeros(len(self), dtype=float)
+        for rows in self.practice_order().values():
+            spent = np.asarray(self.durations[rows], dtype=float)
+            out[rows] = np.concatenate([[0.0], np.cumsum(spent)[:-1]])
+        return out
 
     def recomputed_opportunities(self) -> list[tuple[int, ...]]:
         """Opportunity counts derived from :meth:`practice_order`.
@@ -195,6 +266,7 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
     required = ["Anon Student Id", "Problem Name", "Step Name", "First Attempt",
                 kc_col, opp_col]
     time_col = "First Transaction Time" if "First Transaction Time" in df.columns else None
+    duration_col = "Step Duration (sec)" if "Step Duration (sec)" in df.columns else None
     if missing := [c for c in required if c not in df.columns]:
         available = sorted(m.group("name") for c in df.columns if (m := KC_COLUMN.match(c)))
         raise KeyError(
@@ -203,6 +275,11 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
 
     cols = {c: df[c].astype(str).to_list() for c in required}
     time_values = df[time_col].astype(str).to_list() if time_col else None
+    # Optional, and only some models read it. DataShop writes "." for a step
+    # whose duration it could not compute, so this is deliberately permissive
+    # here and strict in StepData.time_on_task, where a gap actually matters.
+    durations = (pd.to_numeric(df[duration_col], errors="coerce").to_numpy(dtype=float)
+                 if duration_col else None)
 
     successes = {v.strip().lower() for v in success_values}
     failures = {v.strip().lower() for v in failure_values}
@@ -283,10 +360,12 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
             "DataShop numbers opportunities from 1, so the export looks malformed."
         )
 
+    source_rows = np.asarray(src, dtype=int)
     return StepData(
         y=np.asarray(y, dtype=np.int8),
         students=students, items=items, kcs=kcs, opportunities=opps,
         kc_model=kc_model, times=(times if time_col else None),
+        durations=(durations[source_rows] if durations is not None else None),
         skipped_no_kc=skipped, duplicate_kc_rows=duplicates,
-        source=df, source_rows=np.asarray(src, dtype=int),
+        source=df, source_rows=source_rows,
     )
