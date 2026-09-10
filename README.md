@@ -249,11 +249,14 @@ producing compatible files from your own data.
   25% of its BIC penalty. Three sources, all removed exactly rather than
   numerically: a KC no student practises twice; two KCs that tag identical
   steps (one keeps the estimate, the other reports `NaN` rather than a number
-  that is really its twin's); and the student/KC sum redundancy — *once per
-  connected component*, because an export whose cohorts never met the same
-  material carries one of them per cohort, and their intercept levels are then
-  comparable only within a cohort. Anything left over raises instead of being
-  counted, so a collinear block added later cannot slip through.
+  that is really its twin's); and sum redundancies between blocks that
+  partition the rows — *all of them, per connected component*. Any block whose
+  rows sum to one positive constant spans the all-ones direction, so `m` of
+  them (student and KC intercepts, or those plus an item or cohort factor)
+  carry `m - 1` dependencies, and an export whose cohorts never met the same
+  material carries a set per cohort. Their intercept levels are then comparable
+  only within a cohort. Anything left over raises instead of being counted, so
+  a collinear block added later cannot slip through.
 - **Separation detection.** A KC answered correctly by everyone has no finite
   intercept estimate; leapfit reports it (`fit.separated`, a `Separated` flag
   in `kc_values`) instead of printing the arbitrary number the optimizer
@@ -301,7 +304,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 312 pass, 45 skip, ~27s
+uv run pytest                                       # 319 pass, 45 skip, ~27s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 16 LKT equivalence tests

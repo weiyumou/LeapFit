@@ -73,13 +73,14 @@ that :meth:`leapfit.design.Design.identify` replaces with an exact drop. The
 default here is ``l2 = 0`` and an identified design, as everywhere else.
 
 DIVERGENCE (block names): two block names are fixed by the shared layer rather
-than by this module's scheme. ``Design.identify`` finds the student/KC sum
-redundancy by looking for blocks literally named ``student`` and
-``kc_intercept``, so a per-level intercept on those two components uses those
-names and every other term is named ``feature[component]``. The shared pass
-breaks exactly *one* such redundancy, so a spec carrying per-level intercepts on
-any other combination of components is refused rather than fitted with a
-parameter count that overstates the model — see :func:`build_lkt_design`.
+than by this module's scheme. ``Design.identify`` *detects* sum redundancies
+from the row sums, so any number of intercept components identifies correctly;
+but it takes its reference level from the block named ``prefer_drop``
+(``"student"``), and ``Design.recentring_is_valid`` looks for ``kc_intercept``.
+A per-level intercept on those two components therefore uses those names, and
+every other term is named ``feature[component]`` — which also makes an LKT AFM
+spec produce a design identical to :func:`~leapfit.afm.build_afm_design`'s,
+block names included.
 
 DIVERGENCE (fit statistics): the reference reports the unpenalized
 log-likelihood of predictions clipped to ``[1e-5, 1-1e-5]``, and reports no
@@ -870,31 +871,6 @@ def _term_block(term: Term, layout: _Layout, values: np.ndarray, l2: float) -> B
     return Block.build(term.block_name, matrix, layout.levels, l2=l2)
 
 
-def _refuse_unbreakable_redundancy(terms: Sequence[Term]) -> None:
-    """Refuse specs whose parameter count this package cannot state honestly.
-
-    Per-level intercept blocks each sum to the all-ones vector, so ``m`` of them
-    carry ``m - 1`` redundant directions per connected component.
-    :meth:`~leapfit.design.Design.identify` breaks exactly one, between the
-    blocks named ``student`` and ``kc_intercept``. Anything else would leave a
-    design whose ``rank`` is below its column count — caught by ``identify``'s
-    own check, but caught there with a message about collinear blocks rather
-    than about the spec that produced them.
-    """
-    intercepts = {t.component for t in terms if t.feature == "intercept"}
-    if len(intercepts) > 1 and intercepts != {"student", "kc"}:
-        listed = ", ".join(sorted(intercepts))
-        extra = len(intercepts) - 1
-        raise NotImplementedError(
-            f"Per-level intercepts on {len(intercepts)} components ({listed}) carry "
-            f"{extra} redundant direction{'s' if extra > 1 else ''}, and the shared "
-            "identification pass breaks only the student/KC one. Reduce to a single "
-            "intercept component, use student+kc, or pass identify=False and count "
-            "parameters yourself — leaving them in would make AIC and BIC charge for "
-            "parameters that do not exist."
-        )
-
-
 def build_lkt_design(data: StepData, terms: Iterable[Term], *,
                      l2: float = 0.0, cost: float | None = None,
                      identify: bool = True) -> Design:
@@ -913,12 +889,13 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
     :param identify: drop aliased columns, so ``n_params == rank(X)``. A level
         nobody practises twice has an identically-zero ``lineafm`` column and
         no estimable coefficient, exactly as a never-repeated KC does in AFM;
-        two levels tagging the same rows share a column; and one student is
-        dropped as the reference level when a student and a KC intercept make
-        the design redundant.
+        two levels tagging the same rows share a column; and a reference level
+        is dropped for each redundancy between blocks that partition the rows.
+        Per-level intercepts on ``m`` components carry ``m - 1`` of those, and
+        all of them are broken — the student's level goes first, then the
+        latest-declared component's, so the component named first in ``terms``
+        keeps every level.
 
-    :raises NotImplementedError: for a spec whose intercepts carry a redundancy
-        the shared pass cannot break.
     :raises ValueError: for a term whose feature needs a clock the export does
         not carry, or whose values come out non-finite.
     """
@@ -935,11 +912,6 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         if (first := seen.get(term.block_name)) is not None:
             raise ValueError(f"Term {term} is specified twice (first as {first})")
         seen[term.block_name] = term
-    if identify:
-        # Only when we are the ones promising n_params == rank(X). Under
-        # identify=False the caller has taken the parameter count on themselves.
-        _refuse_unbreakable_redundancy(terms)
-
     clock = _Clock(data)
     layouts: dict[str, _Layout] = {}
     blocks = []

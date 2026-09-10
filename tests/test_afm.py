@@ -25,6 +25,7 @@ from scipy.optimize import minimize
 
 from leapfit import (
     Block,
+    Design,
     StepData,
     accumulator_block,
     build_afm_design,
@@ -801,6 +802,78 @@ def _two_cohort_data(n_per_cohort=4, n_steps=4):
                              "First Attempt": "correct" if (i + j) % 3 else "incorrect",
                              "kc": kcs[j % 2], "opp": f"{j // 2 + 1}"})
     return from_frame(_rollup_frame(rows), "M")
+
+
+def _one_hot(labels: list[str], name: str) -> Block:
+    """A crossed factor as a design block: one column per level, one per row."""
+    levels = sorted(set(labels))
+    index = {v: j for j, v in enumerate(levels)}
+    matrix = np.zeros((len(labels), len(levels)))
+    matrix[np.arange(len(labels)), [index[v] for v in labels]] = 1.0
+    return Block.build(name, matrix, levels)
+
+
+def test_a_third_partitioning_block_carries_a_second_redundancy():
+    """``m`` blocks that each cover every row span the all-ones direction ``m``
+    times over, so they carry ``m - 1`` dependencies rather than one.
+
+    The third block here is crossed with both students and KCs — every
+    combination occurs — so the all-ones relation is the *only* thing relating
+    it to them, which is exactly what the pass models.
+    """
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=11, n_reps=6)
+    third = _one_hot([f"g{i % 4}" for i in range(len(data))], "cohort")
+
+    two = build_afm_design(data, identify=False)
+    three = two.with_blocks(third)
+    assert three.rank() == three.n_params - 2, "two redundancies to break, not one"
+
+    identified = three.identify()
+    assert identified.n_params == identified.rank()
+    assert len(identified.aliased) == 2
+    blocks = {c.split(":")[0] for c in identified.aliased.columns}
+    assert blocks == {"student", "cohort"}, "prefer_drop first, then latest-declared"
+
+
+def test_the_kc_block_keeps_every_level_however_many_blocks_partition():
+    """The reason for dropping a student rather than a KC does not weaken when
+    a third factor joins: the KC intercepts are still the reported output."""
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=12, n_reps=6)
+    design = build_afm_design(data, identify=False).with_blocks(
+        _one_hot([f"g{i % 4}" for i in range(len(data))], "cohort")).identify()
+    kc = next(b for b in design.blocks if b.name == "kc_intercept")
+    assert sorted(kc.columns) == sorted(data.kc_names)
+
+
+def test_partitioning_is_detected_from_the_row_sums_not_from_a_block_name():
+    """The old pass looked for blocks literally named ``student`` and
+    ``kc_intercept``. Two blocks named neither, both covering every row, are
+    just as dependent and are now identified as such."""
+    labels_a = [f"a{i % 3}" for i in range(60)]
+    labels_b = [f"b{i % 4}" for i in range(60)]
+    design = Design((_one_hot(labels_a, "left"), _one_hot(labels_b, "right")))
+    assert design.rank() == design.n_params - 1
+
+    identified = design.identify()
+    assert identified.n_params == identified.rank()
+    assert len(identified.aliased) == 1
+    assert identified.aliased.columns[0].startswith("right:"), "latest-declared gives way"
+    assert "sum redundancy across left, right" in identified.aliased.reasons[0]
+
+
+def test_a_block_that_leaves_a_row_at_zero_does_not_partition():
+    """Covering every row is what makes a block span the all-ones direction.
+    One that misses a row cannot, so it neither carries a redundancy nor joins
+    the graph the components are cut from."""
+    labels = [f"a{i % 3}" for i in range(30)]
+    partial = np.zeros((30, 2))
+    partial[: 20, 0] = 1.0
+    partial[20:29, 1] = 1.0          # row 29 is left at zero
+    design = Design((_one_hot(labels, "left"),
+                     Block.build("sparse", partial, ["p", "q"])))
+    assert design._partition_blocks() == ["left"]
+    assert not design._has_sum_redundancy()
+    assert design.identify().n_params == design.n_params
 
 
 def test_row_components_separates_cohorts_that_share_no_material():

@@ -427,14 +427,52 @@ def test_the_student_kc_redundancy_is_broken_exactly_once(example):
     assert design.aliased.columns[0].startswith("student:")
 
 
-def test_intercepts_on_any_other_pair_of_components_are_refused(example):
-    with pytest.raises(NotImplementedError, match="redundant direction"):
-        build_lkt_design(example, [Term("student", "intercept"),
-                                   Term("item", "intercept")])
-    with pytest.raises(NotImplementedError, match="3 components"):
-        build_lkt_design(example, [Term("student", "intercept"),
-                                   Term("kc", "intercept"),
-                                   Term("item", "intercept")])
+def test_intercepts_on_two_crossed_components_are_identified(example):
+    """Students and items cross, so the only dependence between their two
+    intercept blocks is the all-ones one, and one reference level breaks it."""
+    design = build_lkt_design(example, [Term("student", "intercept"),
+                                        Term("item", "intercept")])
+    assert design.n_params == design.rank()
+    assert len(design.aliased) == 1
+    assert design.aliased.columns[0].startswith("student:")
+    assert "sum redundancy across student, intercept[item]" in design.aliased.reasons[0]
+
+
+def test_a_nested_component_gets_one_reference_level_per_component(example):
+    """Every item here belongs to exactly one KC, so the KC/item graph falls
+    apart into one component per KC and each carries its own redundancy. Four
+    KCs, four reference levels — which is the whole point of doing this per
+    component rather than once."""
+    design = build_lkt_design(example, [Term("kc", "intercept"),
+                                        Term("item", "intercept")])
+    assert design.n_params == design.rank()
+    assert len(design.aliased) == len(example.kc_names) == 4
+    assert all(c.startswith("intercept[item]:") for c in design.aliased.columns)
+    assert all("component" in reason for reason in design.aliased.reasons)
+
+
+def test_the_earliest_component_in_the_spec_keeps_every_level(example):
+    """``prefer_drop`` leads, then latest-declared first. Reversing the two
+    non-student components moves which one gives up a level."""
+    first = build_lkt_design(example, [Term("kc", "intercept"),
+                                       Term("item", "intercept")])
+    second = build_lkt_design(example, [Term("item", "intercept"),
+                                        Term("kc", "intercept")])
+    assert all(c.startswith("intercept[item]:") for c in first.aliased.columns)
+    assert all(c.startswith("kc_intercept:") for c in second.aliased.columns)
+
+
+def test_a_dependence_beyond_the_all_ones_one_still_raises(example):
+    """The pass models the sum redundancy exactly and nothing else. Add a
+    student intercept to the nested pair above and the KC/item graph becomes
+    one component again, so the nesting shows up as three dependencies the
+    pass cannot name — and it says so rather than undercounting parameters."""
+    spec = [Term("student", "intercept"), Term("kc", "intercept"),
+            Term("item", "intercept")]
+    unidentified = build_lkt_design(example, spec, identify=False)
+    assert unidentified.rank() < unidentified.n_params - 2, "the premise"
+    with pytest.raises(ValueError, match="still rank-deficient"):
+        build_lkt_design(example, spec)
 
 
 def test_a_single_intercept_on_any_component_is_fine(example):
@@ -443,9 +481,9 @@ def test_a_single_intercept_on_any_component_is_fine(example):
         assert design.n_params == design.rank()
 
 
-def test_identify_false_accepts_what_identification_refuses(example):
-    """The escape hatch the refusal advertises has to exist: the caller has
-    taken the parameter count on themselves."""
+def test_identify_false_leaves_the_parameter_count_to_the_caller(example):
+    """The escape hatch still exists, and still overstates the model — that is
+    what it is for."""
     design = build_lkt_design(example, [Term("student", "intercept"),
                                         Term("item", "intercept")], identify=False)
     assert design.n_params > design.rank()

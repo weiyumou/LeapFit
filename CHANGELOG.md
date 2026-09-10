@@ -5,6 +5,41 @@ while the major version is 0, a minor bump may change the public API.
 
 ## Unreleased
 
+### Changed
+
+- **The sum-redundancy pass is no longer written in terms of students and
+  KCs.** `Design.identify` detected its one redundancy by looking for blocks
+  literally named `student` and `kc_intercept`; it now detects *every* such
+  redundancy from the row sums. A block whose rows all sum to the same positive
+  constant spans the all-ones direction, so `m` of them carry `m - 1`
+  dependencies rather than one, and a reference level is dropped from each of
+  `m - 1` blocks — `prefer_drop` first, then latest-declared, so the block a
+  design names first keeps every level. The connected components are cut from
+  the graph over those blocks' levels rather than the student x KC one.
+
+  **AFM, PFA and LFA are unaffected, bit for bit.** In the two-block case the
+  new rule selects the same blocks, drops the same columns, and writes the same
+  `Aliased.reasons` strings, including the per-component wording; the design
+  matrices, column labels, parameter counts and ranks of every shipped model
+  builder are byte-identical, and both equivalence suites still pass. The one
+  behaviour that does change is `Design.row_components()` called on an
+  *already identified* design: the old mapping sent the dropped reference
+  student's rows to a phantom component of their own, because it labelled each
+  row through its student's now-empty column. They are now labelled by the
+  component they are actually in. Nothing reads that value internally — the
+  pass runs before any level is dropped.
+
+  What this unlocks: a specification with per-level intercepts on more than two
+  components. `leapfit.lkt` previously refused those rather than fit a
+  parameter count it could not state honestly; the refusal is gone.
+
+  What it does not: a dependence of any other shape. Nesting is the case worth
+  knowing. Where every item belongs to exactly one KC, an item intercept
+  alongside a KC intercept splits the graph into one component per KC and each
+  is identified exactly — but add a student intercept, the graph becomes one
+  component again, the nesting relations outnumber the all-ones ones, and
+  `identify` raises as it always did.
+
 ### Added
 
 - **`fit_lkt_pars`: fitting LKT's feature parameters, not just choosing them.**
@@ -169,18 +204,14 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Known limitations
 
-- Per-level intercepts on any combination of components other than
-  student + KC are **refused**, not fitted. `m` such blocks carry `m - 1`
-  redundant directions and `Design.identify` breaks exactly one; fitting the
-  rest would make AIC and BIC charge for parameters that do not exist. Pass
-  `identify=False` to take the parameter count on yourself.
 - No global intercept (`interc=TRUE`), no `*` or `:` connectors, no
   `interacts`, no `autoKC`, no `@` random effects, and no `leapfit-lkt`
-  console script yet. `interc` waits on the same generalization as the point
-  above: with a per-level intercept already in the spec the all-ones column is
-  inside the span, so it is a reparameterization rather than a new direction,
-  and the three time-feature chunks reproduced here pass `interc=TRUE` while
-  this package fits the same span without it.
+  console script yet. `interc` is now only a small step — the generalized
+  identification pass above is what it was waiting on, since an all-ones column
+  is just one more block that covers every row — but it is not implemented.
+  Where a spec already carries a per-level intercept it changes nothing but the
+  parameterization anyway, which is why the three `interc=TRUE` chunks
+  reproduced here match without it.
 - No search over *terms*. `fit_lkt_pars` fits a specification's parameters;
   choosing which features on which components to include is the reference's
   `buildLKTModel`, and that is a consumer of the family — the shape
