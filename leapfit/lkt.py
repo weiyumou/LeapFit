@@ -913,12 +913,16 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         carry ``m - 1`` of those, a component nested in another one per level
         of the coarser, and cohorts a set each, and all of them are broken —
         the student's level goes first, then the latest-declared component's,
-        so the component named first in ``terms`` keeps every level.
+        so the component named first in ``terms`` keeps every level. A nested
+        pair therefore names the coarser component first: ``kc`` before
+        ``item`` drops one item per KC, while ``item`` before ``kc`` would
+        drop every KC, and is refused instead.
 
     :raises ValueError: for a term whose feature needs a clock the export does
         not carry, or whose values come out non-finite; and, from
         identification, for a dependence it does not resolve — one component
-        entered twice under two names, or terms collinear in some other way.
+        entered twice under two names, a coarser component named after the one
+        nested in it, or terms collinear in some other way.
     """
     terms = tuple(terms)
     if not terms:

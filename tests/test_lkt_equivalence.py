@@ -10,13 +10,12 @@ and without the R package's dependency stack (``LiblineaR``, ``SparseM``,
 
 Skipped when the converted input is absent, so a bare clone stays green. The
 dataset is not vendored: it is GPL-3, this repository is MIT, and it is 1.5 MB.
-To produce it::
+Run as a script from the repository root, this module builds it::
 
     curl -O https://cran.r-project.org/src/contrib/LKT_1.7.0.tar.gz
-    uv run --with pyreadr python results/lkt-vignette/scripts/make_fixture.py \\
-        --tarball LKT_1.7.0.tar.gz
+    uv run --with pyreadr python tests/test_lkt_equivalence.py --tarball LKT_1.7.0.tar.gz
 
-Point it somewhere else with ``LKT_VIGNETTE_DIR``.
+It writes where the suite reads, and ``LKT_VIGNETTE_DIR`` moves both.
 
 **The acceptance criterion is the two-sided one this suite uses elsewhere**
 (see ``test_learnsphere_equivalence.py``): either we agree within a tolerance,
@@ -32,10 +31,15 @@ so that "half a nat" cannot quietly become something else.
 
 from __future__ import annotations
 
+import argparse
 import os
+import tarfile
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from leapfit import (
@@ -355,3 +359,79 @@ def test_the_searched_model_is_charged_for_the_parameter_it_searched(data):
     assert searched.fit.design.n_params == held.n_params
     assert searched.fit.n_params == held.n_params + 1
     assert searched.fit.bic > -2 * searched.fit.ll + held.n_params * np.log(len(data))
+
+
+# --------------------------------------------------------------------------
+# Building the fixture: only the transport. Read the .rda out of the CRAN
+# tarball, apply the vignette's own preparation (Examples.Rmd.orig:33-59), and
+# write a student-step file leapfit can load.
+# --------------------------------------------------------------------------
+
+
+def _load_sample(tarball: Path) -> pd.DataFrame:
+    import pyreadr  # building the fixture needs it; running the suite does not
+
+    with tempfile.TemporaryDirectory() as tmp, tarfile.open(tarball) as tar:
+        member = next(m for m in tar.getmembers()
+                      if m.name.endswith("data/largerawsample.rda"))
+        tar.extract(member, tmp, filter="data")
+        return pyreadr.read_r(Path(tmp) / member.name)["largerawsample"]
+
+
+def _to_student_step(raw: pd.DataFrame) -> pd.DataFrame:
+    """The vignette's preparation, in its order.
+
+    ``KC..Default.`` is overwritten with the problem name, rows are ordered by
+    student and then by time, and anything that is neither CORRECT nor
+    INCORRECT (this export's STUDY events) is dropped. ``Opportunity`` is
+    recomputed here rather than carried over: the reference never reads such a
+    column — it counts practice itself — and leapfit's LKT path does the same,
+    so writing the count the ordering implies keeps the file self-consistent.
+    """
+    raw = raw.copy()
+    raw["KC..Default."] = raw["Problem.Name"]
+    seconds = pd.to_datetime(raw["Time"], format="%Y-%m-%d %H:%M:%S").astype("int64")
+    raw["CF..Time."] = seconds // 10**9
+    raw = raw.sort_values(["Anon.Student.Id", "CF..Time."], kind="stable")
+    keep = raw["Outcome"].str.lower().isin(["correct", "incorrect"])
+    raw = raw[keep].reset_index(drop=True)
+
+    if raw["KC..Default."].str.contains("~~").any():
+        raise ValueError("a problem name contains '~~', which leapfit reads as a KC separator")
+
+    return pd.DataFrame({
+        "Anon Student Id": raw["Anon.Student.Id"],
+        "Problem Name": raw["Problem.Name"],
+        "Step Name": raw["Step.Name"],
+        "First Transaction Time": raw["Time"],
+        "First Attempt": raw["Outcome"].str.lower(),
+        "KC (Default)": raw["KC..Default."],
+        "Opportunity (Default)":
+            raw.groupby(["Anon.Student.Id", "KC..Default."]).cumcount() + 1,
+        # The vignette does not use this export's own Duration..sec. column: it
+        # overwrites it with (end latency + review latency + 500)/1000 before
+        # computing spacing predictors, so that is the duration the published
+        # base2/base4 numbers were produced from.
+        "Step Duration (sec)":
+            (raw["CF..End.Latency."] + raw["CF..Review.Latency."] + 500) / 1000,
+    })
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Build this suite's fixture from the LKT package's CRAN tarball.")
+    ap.add_argument("--tarball", type=Path, required=True,
+                    help="LKT_<version>.tar.gz from CRAN")
+    ap.add_argument("--out", type=Path, default=Path(EXPORT),
+                    help="where to write it (default: %(default)s, where the suite reads)")
+    args = ap.parse_args(argv)
+
+    step = _to_student_step(_load_sample(args.tarball))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    step.to_csv(args.out, sep="\t", index=False)
+    print(f"{len(step):,} rows -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

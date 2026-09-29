@@ -262,15 +262,9 @@ class Design:
         """Append blocks — the hook for accumulator terms and hierarchies.
 
         The existing aliasing record carries over, but the new columns are
-        unchecked: call :meth:`identify` again afterwards. An accumulator can
-        easily be collinear with what is already there, and that is exactly the
-        failure this machinery exists to catch. A hierarchical-parent block is
-        different — it is nested in the block it groups, and :meth:`identify`
-        resolves that as it resolves any nesting, one reference level per
-        parent. That is right for an unpenalized hierarchy; where a ridge on
-        the deviations is what identifies it, leave :meth:`identify` out, as
-        ``learnsphere_compat`` does for its student ridge, or it will drop the
-        deviations the ridge was meant to shrink.
+        unchecked: call :meth:`identify` again afterwards. An accumulator or
+        hierarchical-parent block can easily be collinear with what is already
+        there, and that is exactly the failure this machinery exists to catch.
         """
         return Design(self.blocks + tuple(extra), self.aliased)
 
@@ -370,11 +364,15 @@ class Design:
            rather than a number that is really some other KC's.
 
            Deliberately *within* a block only. A whole block that duplicates
-           another — an accumulator collinear with what is already there, or
-           one factor entered twice under two names — is a modelling error, not
-           a property of the data, and still raises under ``check``. A factor
-           *nested* in another, items within KCs, is a property of the data,
-           and is identified under point 3.
+           another — an accumulator or hierarchical-parent term collinear with
+           what is already there, or one factor entered twice under two names —
+           is a modelling error, not a property of the data, and still raises
+           under ``check``. A factor *nested* in another, items within KCs, is
+           a property of the data, and is identified under point 3 — provided
+           the coarser factor is declared first. Declared after the levels it
+           groups, it is the hierarchical parent just described: the finer
+           block already spans it, point 3 would drop it whole, and it is
+           refused instead.
         3. **Sum redundancies, pair by pair.** A block whose rows all sum to
            the same positive constant spans the all-ones direction: its
            columns add up to ``c * 1``. The student block always does (one
@@ -403,6 +401,10 @@ class Design:
            each from its last level back, so that the earliest block in the
            design keeps every level. Exactly as many columns go as the
            dependencies span, and with two blocks this is one per component.
+           A block other than ``prefer_drop`` that this would take whole is
+           the collinear block of point 2, and is refused rather than
+           dropped. ``prefer_drop`` alone may go whole: a cohort of one
+           student gives up its only student, as it always has.
 
         A student is dropped rather than a KC because the KC intercepts are
         the reported output — learning curves, difficulty tables, low-slope
@@ -416,8 +418,9 @@ class Design:
         relates two cohorts that never met the same material.
 
         :param check: verify numerically that the result is full rank, and
-            raise if it is not. Leave this on: it is the guard that catches
-            aliasing introduced by blocks added later.
+            raise if it is not, or if it would drop a whole block. Leave this
+            on: it is the guard that catches aliasing introduced by blocks
+            added later.
         """
         keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
         dropped, reasons = [], []
@@ -440,7 +443,7 @@ class Design:
             Aliased(tuple(self.aliased.columns) + tuple(dropped),
                     tuple(self.aliased.reasons) + tuple(reasons)),
         )
-        identified = reduced._drop_reference_levels(prefer_drop)
+        identified = reduced._drop_reference_levels(prefer_drop, check=check)
 
         if check:
             r = identified.rank()
@@ -465,7 +468,7 @@ class Design:
                 )
         return identified
 
-    def _drop_reference_levels(self, prefer_drop: str) -> Design:
+    def _drop_reference_levels(self, prefer_drop: str, *, check: bool = True) -> Design:
         """Break every sum redundancy, on the columns that survive.
 
         Deliberately decided *after* dead and duplicate columns are gone: a row
@@ -482,6 +485,12 @@ class Design:
         are independent redundancies. Each drop is reported against the
         smallest redundancy it takes part in, the one it most specifically
         stands for.
+
+        Under ``check``, a block other than ``prefer_drop`` that would lose
+        every column raises instead, naming the blocks those drops are
+        reported against: they span it, so it is not a factor with a reference
+        level but a block that adds nothing — a parent declared after the
+        levels it groups.
         """
         redundancies = self._sum_redundancies()
         if not redundancies:
@@ -512,6 +521,16 @@ class Design:
                     pivot = min(residual)
                     basis[pivot] = {k: v / residual[pivot] for k, v in residual.items()}
                     drops.append((min(vector, key=lambda k: (support[k], k)), name, j))
+
+        if check:
+            spanned_by: dict[str, set[str]] = {}
+            for k, name, _ in drops:
+                spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
+            for name, blocks in spanned_by.items():
+                taken = sum(drop[1] == name for drop in drops)
+                if name != prefer_drop and taken == by_name[name].matrix.shape[1]:
+                    raise ValueError(_whole_block_refusal(
+                        name, [b for b in by_name if b in blocks and b != name]))
 
         keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
         dropped, reasons = [], []
@@ -698,6 +717,19 @@ def _reference_reason(names: list[str], label: int, n_components: int) -> str:
             else "sum redundancy across " + ", ".join(names))
     where = "" if n_components == 1 else f", component {label + 1} of {n_components}"
     return f"reference level ({kind}{where})"
+
+
+def _whole_block_refusal(name: str, spanning: list[str]) -> str:
+    """Why a block that identification would drop whole is refused instead."""
+    return (
+        f"{name} adds nothing to this design: every column of it lies in the span "
+        f"of {' and '.join(spanning)}, the way a parent block's columns are sums of "
+        f"the levels it groups, so identification would drop it whole. A block "
+        f"collinear with what is already there is refused rather than silently "
+        f"dropped. Remove it; or, to keep it, declare it before the finer blocks, "
+        f"which then give up one reference level per level of {name} instead; and "
+        f"where a ridge is what identifies the hierarchy, leave identification out."
+    )
 
 
 @dataclass(frozen=True)

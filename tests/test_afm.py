@@ -735,6 +735,27 @@ def test_identify_raises_on_a_collinear_accumulator():
         design.with_blocks(duplicate).identify()
 
 
+def test_identify_raises_on_a_hierarchical_parent_block():
+    """The hook's other use. A parent appended over the KCs it groups is the
+    sum of their intercept columns, so the KC block already spans it, and the
+    elimination would take every column of it — as silent as dropping one copy
+    of a repeated factor, and refused the same way. Declared before the KCs,
+    the same parent keeps every level and its KCs give up one each instead."""
+    data = _synthetic(n_students=6, n_kcs=4, n_items=12, seed=36, n_reps=5)
+    design = build_afm_design(data, identify=False)
+    parent = _one_hot([f"g{int(kcs[0][2:]) // 2}" for kcs in data.kcs], "parent")
+    with pytest.raises(ValueError, match="parent adds nothing to this design: every column "
+                                         "of it lies in the span of kc_intercept"):
+        design.with_blocks(parent).identify()
+
+    student, kc_intercept, kc_slope = design.blocks
+    identified = Design((student, parent, kc_intercept, kc_slope)).identify()
+    assert identified.n_params == identified.rank()
+    dropped = identified.aliased.by_block()
+    assert len(dropped["student"]) == 1 and len(dropped["kc_intercept"]) == 2
+    assert "parent" not in dropped
+
+
 def _co_occurring_kc_data(pair_steps=3, solo_steps=3, n_students=6):
     """``A`` and ``B`` tag exactly the same steps; ``C`` tags the rest.
 
@@ -911,6 +932,17 @@ def test_identify_drops_one_reference_student_per_component():
     assert all("component" in reason for reason in ident.aliased.reasons
                if "reference level" in reason)
     assert ident.n_params == ident.rank()
+
+
+def test_a_cohort_of_one_student_gives_up_its_only_student():
+    """``prefer_drop`` is the one block allowed to go whole. One student per
+    cohort is still one reference level per component, as it always was;
+    refusing it would refuse every single-student export."""
+    data = _two_cohort_data(n_per_cohort=1, n_steps=6)
+    ident = build_afm_design(data, identify=False).identify()
+    assert ident.n_params == ident.rank()
+    assert len(ident.aliased.by_block()["student"]) == 2
+    assert next(b for b in ident.blocks if b.name == "student").matrix.shape[1] == 0
 
 
 def test_a_single_component_keeps_the_plain_reference_level_reason():

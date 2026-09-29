@@ -453,14 +453,28 @@ def test_a_nested_component_gets_one_reference_level_per_component(example):
 
 
 def test_the_earliest_component_in_the_spec_keeps_every_level(example):
-    """``prefer_drop`` leads, then latest-declared first. Reversing the two
-    non-student components moves which one gives up a level."""
-    first = build_lkt_design(example, [Term("kc", "intercept"),
-                                       Term("item", "intercept")])
-    second = build_lkt_design(example, [Term("item", "intercept"),
-                                        Term("kc", "intercept")])
-    assert all(c.startswith("intercept[item]:") for c in first.aliased.columns)
-    assert all(c.startswith("kc_intercept:") for c in second.aliased.columns)
+    """``prefer_drop`` leads, then latest-declared first, so the KCs named
+    before the items nested in them keep every level and the items give way."""
+    design = build_lkt_design(example, [Term("kc", "intercept"),
+                                        Term("item", "intercept")])
+    assert all(c.startswith("intercept[item]:") for c in design.aliased.columns)
+    assert "kc_intercept" not in design.aliased.by_block()
+
+
+def test_a_coarser_component_named_after_the_one_nested_in_it_is_refused(example):
+    """Reversed, the same rule would take *every* KC: each KC intercept is the
+    sum of its items', so the items already span the KC block. That is a
+    hierarchical parent declared after the levels it groups — a block that
+    adds nothing, not a factor with a reference level — and it is refused,
+    naming the block that spans it, rather than silently dropped whole."""
+    spec = [Term("item", "intercept"), Term("kc", "intercept")]
+    unidentified = build_lkt_design(example, spec, identify=False)
+    assert unidentified.rank() == unidentified.n_params - len(example.kc_names), "the premise"
+    with pytest.raises(ValueError, match=r"kc_intercept adds nothing to this design: every "
+                                         r"column of it lies in the span of intercept\[item\]"):
+        build_lkt_design(example, spec)
+    with pytest.raises(ValueError, match="kc_intercept adds nothing"):
+        build_lkt_design(example, [Term("student", "intercept"), *spec])
 
 
 def test_a_nested_component_is_identified_under_a_student_intercept_too(example):

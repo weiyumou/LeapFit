@@ -34,23 +34,32 @@ while the major version is 0, a minor bump may change the public API.
 
   What this unlocks is per-level intercepts on more than two components in the
   shapes real exports have. Crossed factors: students, KCs and a cohort or
-  condition column. Nested ones: items within KCs identify with one reference
-  item per KC, under a student intercept too, which used to be refused. Cohorts
-  that one pair of blocks separates while another connects them — students and
-  conditions never shared between classes that share KCs — each keep a
-  reference level of their own. And a feature that touches every row no longer
+  condition column. Nested ones: items declared after the KCs they sit in
+  identify with one reference item per KC, under a student intercept too,
+  which used to be refused. Cohorts that one pair of blocks separates while
+  another connects them — students and conditions never shared between
+  classes that share KCs — each keep a reference level of their own. And a
+  feature that touches every row no longer
   merges cohorts: `propdec` is positive from the first attempt, so the graph
   over the whole design counted its one column as a level every row shares, and
   `student + kc + kc:propdec` on an export with two cohorts was refused.
 
-  What it still refuses is one factor under two names. Two blocks that
-  partition the rows identically — the export's own `KC (...)` column beside
-  the parsed KC, or the vignette's KC, which *is* its problem name, beside
-  `Problem Name` — are a mistake in the specification rather than nesting, and
-  `identify` names the pair instead of silently dropping one copy whole. A
-  dependence that is not a sum redundancy between factors still raises as it
-  always did: an accumulator collinear with what is there, or `lineafm$` beside
-  `linesuc$` and `linefail$`.
+  What it still refuses is what 0.5.0 refused as a mistake in the
+  specification rather than a property of the data: a block the others
+  already span. The first case is one factor under two names — two blocks
+  that partition the rows identically, such as the export's own `KC (...)`
+  column beside the parsed KC, or the vignette's KC, which *is* its problem
+  name, beside `Problem Name` — and `identify` names the pair instead of
+  silently dropping one copy whole. The second is a hierarchical parent
+  declared after the levels it groups: topics appended with `with_blocks`
+  over the KCs they group, or `kc` after `item` in an LKT spec. Elimination
+  would take every column of it, so it is refused, naming the block that
+  spans it; declared first, the parent keeps every level and the finer block
+  gives up one per parent instead. `prefer_drop` alone may still go whole, so
+  a cohort of one student gives up its only student as before. A dependence
+  that is not a sum redundancy between factors still raises as it always did:
+  an accumulator collinear with what is there, or `lineafm$` beside `linesuc$`
+  and `linefail$`.
 
 - `Term.par` -> `Term.pars` (a tuple; a scalar is accepted for the
   single-parameter features), and `STATIC_FEATURES` -> `FEATURE_NAMES`. Both
@@ -201,7 +210,8 @@ while the major version is 0, a minor bump may change the public API.
   (`tests/test_lkt_equivalence.py`), without an R interpreter. The CRAN
   tarball ships both halves of a fixture — `largerawsample.rda` and a
   precompiled vignette printing each model's log-likelihood to eight decimals
-  — which is the same kind of artifact as LearnSphere's `model_values.xml`.
+  — which is the same kind of artifact as LearnSphere's `model_values.xml`,
+  and the module builds its own fixture from the tarball when run as a script.
   On the vignette's AFM chunk leapfit reaches **-27346.740** against its
   published **-27347.207**: 0.47 nats better, from a KKT-certified optimum, so
   by the two-sided criterion this suite already uses the gap is the

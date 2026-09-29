@@ -26,7 +26,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit@v0.5.0"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 327 pass, 45 skip in ~28s; extras need R / reference-run artifacts
+uv run pytest          # 330 pass, 45 skip in ~28s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
@@ -259,8 +259,9 @@ producing compatible files from your own data.
   blocks the dependencies overlap, and exact elimination drops just as many
   columns as they span. Intercept levels are then comparable only within a
   cohort. Anything left over raises instead of being counted, so a collinear
-  block added later cannot slip through — and one factor entered twice under
-  two names is refused by name.
+  block added later cannot slip through: one factor entered twice under two
+  names is refused by name, and so is a parent block declared after the levels
+  it groups, which they already span.
 - **Separation detection.** A KC answered correctly by everyone has no finite
   intercept estimate; leapfit reports it (`fit.separated`, a `Separated` flag
   in `kc_values`) instead of printing the arbitrary number the optimizer
@@ -308,7 +309,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 327 pass, 45 skip, ~28s
+uv run pytest                                       # 330 pass, 45 skip, ~28s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 16 LKT equivalence tests
@@ -316,8 +317,8 @@ LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 16 LKT equivalence tests
 
 The LKT fixture is built from the CRAN tarball rather than shipped, because the
 reference package is GPL-3 and this one is MIT —
-`results/lkt-vignette/scripts/make_fixture.py` converts it and
-`tests/test_lkt_equivalence.py` documents the two commands.
+`tests/test_lkt_equivalence.py` converts it when run as a script, and its
+docstring gives the two commands.
 
 With `Rscript` on `PATH`, three more tests fit the same designs through R's
 `stats::glm` and require agreement to numerical precision (~1e-8 in
