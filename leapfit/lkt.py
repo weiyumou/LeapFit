@@ -34,7 +34,7 @@ output. Nothing here is a translation of its source, and the distinction is
 load-bearing rather than decorative.
 
 **Features.** Everything the reference computes from prior counts, from decayed
-outcome histories, or from the clock, at parameters the caller **fixes**:
+outcome histories, or from the clock:
 
 ===============  ======  ========================================================
 family           pars    features
@@ -51,13 +51,14 @@ spacing          4       ``base4`` ``ppe``
 covariate        0       ``numer``
 ===============  ======  ========================================================
 
-**Nothing here searches for a parameter.** The reference fits its decay rates
-with an outer ``optim`` that rebuilds every feature and refits the whole
-regression at each evaluation; that is a different fitter and it is not in this
-module. Every parametric feature therefore *requires* ``pars=``, and a fit at
-fixed parameters is what it says it is. Features the reference computes that
-are not here are refused **by name with the reason** — see :data:`DEFERRED` —
-because a spec silently missing a term is worse than one that will not build.
+**Parameters are held or fitted, never defaulted.** Every parametric feature
+*requires* ``pars=``. :func:`build_lkt_design` holds them where they are, so a
+fit at fixed parameters is what it says it is; :func:`fit_lkt_pars` reads them
+as seeds and fits them by the reference's own procedure, an outer optimizer
+that rebuilds every feature and refits the whole regression at each
+evaluation. Features the reference computes that are not here are refused **by
+name with the reason** — see :data:`DEFERRED` — because a spec silently missing
+a term is worse than one that will not build.
 
 Also deferred: a global intercept (``interc=TRUE``), the ``*`` and ``:``
 connectors, ``interacts``, ``autoKC`` clustering, and ``@`` random effects.
@@ -85,8 +86,9 @@ block names included.
 DIVERGENCE (fit statistics): the reference reports the unpenalized
 log-likelihood of predictions clipped to ``[1e-5, 1-1e-5]``, and reports no
 parameter count, no AIC and no BIC. Here the likelihood is unclipped and
-``n_params`` is the rank of the design, so AIC and BIC exist and mean what they
-mean for every other family in this package.
+``n_params`` is the rank of the design — plus, after :func:`fit_lkt_pars`, the
+feature parameters it fitted — so AIC and BIC exist and mean what they mean for
+every other family in this package.
 
 DIVERGENCE (non-finite features are refused): several of the reference's
 time-based features divide by an elapsed time. Where two attempts on one level
@@ -502,6 +504,21 @@ _SHARED_BLOCK_NAME = {"student": "student", "kc": "kc_intercept"}
 _ALIASES = {"Anon.Student.Id": "student", "Anon Student Id": "student"}
 
 
+def _par_text(value: float) -> str:
+    """How a block name writes a parameter: the shortest text that reads back as
+    exactly ``value``.
+
+    Exact because the block name is where a design stores its specification —
+    :func:`design_terms` reads it back — and a fitted parameter written to six
+    significant digits would come back as a different number. ``repr`` of a
+    float is the shortest round-trip form; only a trailing ``.0`` is dropped, so
+    the values a specification is usually written with print as they were
+    written.
+    """
+    text = repr(float(value))
+    return text.removesuffix(".0")
+
+
 @dataclass(frozen=True)
 class Term:
     """One component paired with one feature — a group of design columns.
@@ -511,10 +528,12 @@ class Term:
     per-level (a factor is expanded whether or not it is written with a ``$``),
     so the flag is forced on for them, as in the reference.
 
-    ``pars`` are the feature's shape parameters, **fixed** — nothing in this
-    module fits one. A scalar is accepted for the single-parameter features.
-    They are part of the term's identity and of its block name, so two
-    ``powafm`` terms on one component at different exponents do not collide.
+    ``pars`` are the feature's shape parameters: :func:`build_lkt_design`
+    holds them where they are, and :func:`fit_lkt_pars` starts its search from
+    them. A scalar is accepted for the single-parameter features. They are part
+    of the term's identity and of its block name — written exactly, so that
+    :func:`design_terms` reads back the same numbers — and two ``powafm`` terms
+    on one component at different exponents do not collide.
     """
 
     component: str
@@ -546,12 +565,11 @@ class Term:
         arity = self.arity
         if len(self.pars) != arity:
             fits = ("takes no parameter" if arity == 0
-                    else f"takes {arity} fixed parameter{'s' if arity > 1 else ''}")
+                    else f"takes {arity} parameter{'s' if arity > 1 else ''}")
             raise ValueError(
-                f"Feature {self.feature!r} {fits}, got {len(self.pars)}. Nothing in "
-                "this module searches for a parameter — the reference fits its decay "
-                "rates with an outer optimizer that is not implemented here — so a "
-                "parametric feature has to be held at a value you choose."
+                f"Feature {self.feature!r} {fits}, got {len(self.pars)}. A parametric "
+                "feature needs a value even when it is to be fitted: build_lkt_design "
+                "holds it there, and fit_lkt_pars starts its search from it."
             )
         # Frozen, but the reference's own normalization: a factor is expanded
         # whether or not the spec writes the '$'.
@@ -560,7 +578,7 @@ class Term:
 
     @property
     def arity(self) -> int:
-        """How many fixed parameters this term's feature takes."""
+        """How many parameters this term's feature takes."""
         spec = _FEATURES.get(self.feature)
         return 0 if spec is None else spec.arity
 
@@ -595,7 +613,7 @@ class Term:
         return f"{self.feature}{marker}"
 
     def _pars_suffix(self) -> str:
-        return "" if not self.pars else "(" + ",".join(f"{p:g}" for p in self.pars) + ")"
+        return "" if not self.pars else "(" + ",".join(map(_par_text, self.pars)) + ")"
 
     def __str__(self) -> str:
         return f"{self.component}:{self.notation()}{self._pars_suffix()}"
@@ -619,8 +637,8 @@ def lkt_terms(components: Sequence[str], features: Sequence[str],
                   features=("intercept", "intercept", "lineafm$"))
 
     ``pars`` parallels the same vectors: one entry per term, holding that
-    feature's fixed parameters (a scalar for the single-parameter features, a
-    tuple for the rest, ``None`` where the feature takes none). Deliberately
+    feature's parameters (a scalar for the single-parameter features, a tuple
+    for the rest, ``None`` where the feature takes none). Deliberately
     *per term* rather than the reference's single flat vector consumed in
     feature order — the flat form is what makes its own parameter bookkeeping
     hard to read, and hard enough that two of its branches
@@ -890,14 +908,17 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         nobody practises twice has an identically-zero ``lineafm`` column and
         no estimable coefficient, exactly as a never-repeated KC does in AFM;
         two levels tagging the same rows share a column; and a reference level
-        is dropped for each redundancy between blocks that partition the rows.
-        Per-level intercepts on ``m`` components carry ``m - 1`` of those, and
-        all of them are broken — the student's level goes first, then the
-        latest-declared component's, so the component named first in ``terms``
-        keeps every level.
+        is dropped for each independent redundancy between blocks that
+        partition the rows. Per-level intercepts on ``m`` crossed components
+        carry ``m - 1`` of those, a component nested in another one per level
+        of the coarser, and cohorts a set each, and all of them are broken —
+        the student's level goes first, then the latest-declared component's,
+        so the component named first in ``terms`` keeps every level.
 
     :raises ValueError: for a term whose feature needs a clock the export does
-        not carry, or whose values come out non-finite.
+        not carry, or whose values come out non-finite; and, from
+        identification, for a dependence it does not resolve — one component
+        entered twice under two names, or terms collinear in some other way.
     """
     terms = tuple(terms)
     if not terms:
@@ -1025,9 +1046,11 @@ def fit_lkt(design: Design, y, *, method: str = DEFAULT_METHOD,
 #: so a search here starts from the same feasible set the published searches did.
 PARAMETER_BOUNDS = (1e-5, 0.99999)
 
-#: Step for the central differences the outer optimizer works from. R's
-#: ``optim`` uses ``ndeps = 1e-3``; scipy's L-BFGS-B defaults to ``1e-8``, which
-#: is the wrong order here — the profile is only as smooth as the inner solve is
+#: Step for the central differences the outer optimizer works from: R's
+#: ``optim`` default, ``ndeps = 1e-3``, taken the way ``optim`` takes it (see
+#: :func:`_central_differences`). scipy's L-BFGS-B would difference on its own
+#: when given no gradient, but forward only and at ``1e-8`` by default, which is
+#: the wrong order here — the profile is only as smooth as the inner solve is
 #: tight, so a step that small differentiates the inner optimizer's own noise.
 PARAMETER_STEP = 1e-3
 
@@ -1065,6 +1088,26 @@ def _with_parameters(terms: Sequence[Term], slots: Sequence[tuple[int, int]],
     return tuple(replace(term, pars=tuple(row)) for term, row in zip(terms, pars))
 
 
+def _central_differences(f: Callable[[np.ndarray], float], x: np.ndarray,
+                         box: Sequence[tuple[float, float]]) -> np.ndarray:
+    """The gradient R's ``optim`` takes when it is given none.
+
+    A central difference of :data:`PARAMETER_STEP` either side, one parameter
+    at a time. A side that would cross its bound stops at the bound, and the
+    quotient is taken over the span actually covered — so a parameter resting
+    on a bound gets a one-sided difference rather than a probe outside the box.
+    """
+    x = np.asarray(x, dtype=float)
+    gradient = np.zeros(len(x))
+    for j, (lower, upper) in enumerate(box):
+        above, below = x.copy(), x.copy()
+        above[j] = min(x[j] + PARAMETER_STEP, upper)
+        below[j] = max(x[j] - PARAMETER_STEP, lower)
+        if above[j] > below[j]:
+            gradient[j] = (f(above) - f(below)) / (above[j] - below[j])
+    return gradient
+
+
 def _conform(design: Design, template: Design) -> Design:
     """Cut ``design`` down to the columns ``template`` kept, block by block.
 
@@ -1080,18 +1123,29 @@ def _conform(design: Design, template: Design) -> Design:
 
     Blocks are matched by position rather than by name, because a term's
     parameters are part of its block name and these are exactly the blocks
-    whose parameters are moving.
+    whose parameters are moving. The template's record of what it dropped and
+    why is carried over with each seed block name replaced by this design's —
+    a reason can name a block, as a duplicate names the column it duplicates —
+    so the record describes this design rather than the seed's.
     """
-    blocks, dropped, reasons = [], [], []
+    blocks = []
     for block, kept in zip(design.blocks, template.blocks):
         wanted = set(kept.columns)
-        mask = np.array([c in wanted for c in block.columns], dtype=bool)
-        for column in np.asarray(block.columns, dtype=object)[~mask]:
-            dropped.append(f"{block.name}:{column}")
-            reasons.append("not estimable at the seed parameters (identification "
-                           "is decided once and held)")
-        blocks.append(block.keep(mask))
-    return Design(tuple(blocks), Aliased(tuple(dropped), tuple(reasons)))
+        blocks.append(block.keep(np.array([c in wanted for c in block.columns], dtype=bool)))
+
+    aliased = template.aliased
+    renamed = {kept.name: block.name for block, kept in zip(design.blocks, template.blocks)
+               if kept.name != block.name}
+    if renamed:
+        # All at once: renaming one block after another would carry a block
+        # onto a later block's new name whenever two of them trade values.
+        seed_names = re.compile("|".join(map(re.escape, sorted(renamed, key=len, reverse=True))))
+
+        def here(text: str) -> str:
+            return seed_names.sub(lambda m: renamed[m[0]], text)
+
+        aliased = Aliased(tuple(map(here, aliased.columns)), tuple(map(here, aliased.reasons)))
+    return Design(tuple(blocks), aliased)
 
 
 @dataclass(frozen=True)
@@ -1303,7 +1357,8 @@ def fit_lkt_pars(data: StepData, terms: Iterable[Term], *,
         state["w"] = None
         clipped = np.clip(start, [lo for lo, _ in box], [hi for _, hi in box])
         result = minimize(negated, clipped, method="L-BFGS-B", bounds=box,
-                          options={"maxiter": max_iterations, "eps": PARAMETER_STEP})
+                          jac=lambda x: _central_differences(negated, x, box),
+                          options={"maxiter": max_iterations})
         value, fit, design = evaluate(result.x)
         outcomes.append({"start": tuple(float(v) for v in start),
                          "estimate": tuple(float(v) for v in result.x),

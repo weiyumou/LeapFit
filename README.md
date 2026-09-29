@@ -26,7 +26,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit@v0.5.0"
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync                # or: uv pip install -e ".[dev]"
-uv run pytest          # 180 pass, 29 skip in ~21s; extras need R / reference-run artifacts
+uv run pytest          # 327 pass, 45 skip in ~28s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
@@ -82,10 +82,10 @@ print(lkt.notation())                        # the spec it fitted, in LKT notati
 print(lkt.component_values(data, "kc"))      # one row per level, one column per feature
 ```
 
-Features that read the clock or a decayed history are here too, at parameters
-you fix — `recency`, `base`, `base2`, `base4`, `ppe`, `dashafm`, `logitdec`,
-`propdec`, `expdec*`. Nothing here *searches* for a decay rate, so a parametric
-feature requires its `pars`:
+Features that read the clock or a decayed history are here too — `recency`,
+`base`, `base2`, `base4`, `ppe`, `dashafm`, `logitdec`, `propdec`, `expdec*`.
+A parametric feature always takes its `pars`, and `build_lkt_design` holds
+them where you put them:
 
 ```python
 terms = lkt_terms(components=("student", "kc", "kc", "kc"),
@@ -100,8 +100,8 @@ with the reason — three of them because the reference cannot compute them
 either.
 
 To **fit** the decay rates instead of choosing them, `fit_lkt_pars` profiles
-them: each candidate rebuilds the features, refits the coefficients, and the
-outer optimizer walks the resulting surface.
+them, starting from those same `pars`: each candidate rebuilds the features,
+refits the coefficients, and the outer optimizer walks the resulting surface.
 
 ```python
 from leapfit import fit_lkt_pars
@@ -250,13 +250,17 @@ producing compatible files from your own data.
   numerically: a KC no student practises twice; two KCs that tag identical
   steps (one keeps the estimate, the other reports `NaN` rather than a number
   that is really its twin's); and sum redundancies between blocks that
-  partition the rows — *all of them, per connected component*. Any block whose
-  rows sum to one positive constant spans the all-ones direction, so `m` of
-  them (student and KC intercepts, or those plus an item or cohort factor)
-  carry `m - 1` dependencies, and an export whose cohorts never met the same
-  material carries a set per cohort. Their intercept levels are then comparable
-  only within a cohort. Anything left over raises instead of being counted, so
-  a collinear block added later cannot slip through.
+  partition the rows — *all of them, pair by pair and component by
+  component*. Any block whose rows sum to one positive constant spans the
+  all-ones direction, so two of them (student and KC intercepts, or either
+  beside an item or cohort factor) are dependent on each connected component
+  of their own graph: once per cohort, where cohorts never met the same
+  material, and once per KC, where items nest within KCs. With three or more
+  blocks the dependencies overlap, and exact elimination drops just as many
+  columns as they span. Intercept levels are then comparable only within a
+  cohort. Anything left over raises instead of being counted, so a collinear
+  block added later cannot slip through — and one factor entered twice under
+  two names is refused by name.
 - **Separation detection.** A KC answered correctly by everyone has no finite
   intercept estimate; leapfit reports it (`fit.separated`, a `Separated` flag
   in `kc_values`) instead of printing the arbitrary number the optimizer
@@ -292,7 +296,7 @@ producing compatible files from your own data.
 | **AFM** | shipped | validated for equivalence against LearnSphere workflow output |
 | **PFA** | shipped | canonical fixed-effects PFA (Pavlik, Cen & Koedinger 2009) with strictly-prior counts; per-KC or pooled slopes, optional student intercepts. The audited reference builds its counts *including* each attempt's own outcome — that construction is reproducible here via an explicit option that warns, never silently |
 | **LFA** | shipped | a search over KC models rather than a model: greedy best-first on AFM's BIC or AIC, reproducing the reference's fit statistics to 1e-9. Every candidate move is screened for estimability and evidence — the reference's own selection contained a KC whose slope has no finite estimate, and that one move then appeared in all 99 states it reported — and the top states are validated out of sample on identical folds |
-| **LKT** | shipped | components x features, of which AFM and PFA are single specifications — both identities are pinned by tests. Thirty-one features over any component the export carries: prior counts, decayed outcome histories, recency, power-law forgetting, and the two four-parameter spacing models (`base4`, `ppe`). Nothing here searches for a decay rate, so every parametric feature is held at a value you pass. Validated against the reference's own published output — the CRAN package's precompiled vignette prints the log-likelihood of each model it fits — on **four** of its chunks, spanning the whole implemented surface: **-27347.207** (AFM), **-25474.531** (logitdec + recency), **-24695.586** (PPE) and **-25969.925** (base4), each reproduced within 0.5 nats and each on the better side, from a certified optimum, because the reference's `LiblineaR` stops at `epsilon = 1e-4`. `fit_lkt_pars` fits the decay rates themselves by profile likelihood, counting them in `nPars` and certifying stationarity by measurement; it walks the reference's own published RPFA search to the same optimum. Written clean-room: the reference is GPL-3, so this module is validated against it rather than adapted from it |
+| **LKT** | shipped | components x features, of which AFM and PFA are single specifications — both identities are pinned by tests. Thirty-one features over any component the export carries: prior counts, decayed outcome histories, recency, power-law forgetting, and the two four-parameter spacing models (`base4`, `ppe`), each parametric one held at the values you pass or fitted. Validated against the reference's own published output — the CRAN package's precompiled vignette prints the log-likelihood of each model it fits — on **four** of its chunks, spanning the whole implemented surface: **-27347.207** (AFM), **-25474.531** (logitdec + recency), **-24695.586** (PPE) and **-25969.925** (base4), each reproduced within 0.5 nats and each on the better side, from a certified optimum, because the reference's `LiblineaR` stops at `epsilon = 1e-4`. `fit_lkt_pars` fits the decay rates themselves by profile likelihood, counting them in `n_params` and certifying stationarity by measurement; it walks the reference's own published RPFA search to the same optimum. Written clean-room: the reference is GPL-3, so this module is validated against it rather than adapted from it |
 | LKT, a search over terms | planned | the reference's `buildLKTModel` is greedy forward/backward selection over features x components on BIC. That is a *consumer* of the family, the shape `leapfit.lfa` already has, not more of `leapfit.lkt` |
 | BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
 
@@ -304,7 +308,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 319 pass, 45 skip, ~27s
+uv run pytest                                       # 327 pass, 45 skip, ~28s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 16 LKT equivalence tests

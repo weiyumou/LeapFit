@@ -43,6 +43,7 @@ from leapfit import (
     load_student_step,
     success_failure_counts,
 )
+from leapfit.lkt import PARAMETER_STEP, _central_differences
 
 EXAMPLE = "examples/student-step.txt"
 
@@ -392,11 +393,11 @@ def test_a_random_effect_is_refused_rather_than_silently_fixed():
 
 
 def test_a_shape_parameter_is_required_where_it_exists_and_refused_where_it_does_not():
-    with pytest.raises(ValueError, match="takes 1 fixed parameter, got 0"):
+    with pytest.raises(ValueError, match="takes 1 parameter, got 0"):
         Term("kc", "powafm")
     with pytest.raises(ValueError, match="takes no parameter"):
         Term("kc", "lineafm", pars=0.5)
-    with pytest.raises(ValueError, match="takes 4 fixed parameters, got 2"):
+    with pytest.raises(ValueError, match="takes 4 parameters, got 2"):
         Term("kc", "ppe", pars=(0.3, 0.2))
 
 
@@ -462,17 +463,115 @@ def test_the_earliest_component_in_the_spec_keeps_every_level(example):
     assert all(c.startswith("kc_intercept:") for c in second.aliased.columns)
 
 
-def test_a_dependence_beyond_the_all_ones_one_still_raises(example):
-    """The pass models the sum redundancy exactly and nothing else. Add a
-    student intercept to the nested pair above and the KC/item graph becomes
-    one component again, so the nesting shows up as three dependencies the
-    pass cannot name — and it says so rather than undercounting parameters."""
+def test_a_nested_component_is_identified_under_a_student_intercept_too(example):
+    """Adding a student intercept to the nested pair above connects the whole
+    design, but not the KC/item graph: the nesting still lives there, one
+    redundancy per KC, beside the student's own. Cut from the whole design's
+    graph instead, this looked like one component and was refused."""
     spec = [Term("student", "intercept"), Term("kc", "intercept"),
             Term("item", "intercept")]
     unidentified = build_lkt_design(example, spec, identify=False)
-    assert unidentified.rank() < unidentified.n_params - 2, "the premise"
+    n_kcs = len(example.kc_names)
+    assert unidentified.rank() == unidentified.n_params - (n_kcs + 1), "the premise"
+
+    design = build_lkt_design(example, spec)
+    assert design.n_params == design.rank()
+    dropped = design.aliased.by_block()
+    assert len(dropped["student"]) == 1 and len(dropped["intercept[item]"]) == n_kcs
+    assert "kc_intercept" not in dropped, "declared before the items, so kept whole"
+    assert design.aliased.reasons[0] == "reference level (student/KC sum redundancy)"
+
+
+def test_a_dependence_beyond_the_all_ones_one_still_raises(example):
+    """The pass models sum redundancies between factors exactly and nothing
+    else. ``lineafm`` is ``linesuc`` plus ``linefail``, level by level — a
+    dependence among blocks that are not factors at all — and it says so
+    rather than undercounting parameters."""
+    spec = lkt_terms(("kc", "kc", "kc"), ("lineafm$", "linesuc$", "linefail$"))
+    unidentified = build_lkt_design(example, spec, identify=False)
+    assert unidentified.rank() < unidentified.n_params, "the premise"
     with pytest.raises(ValueError, match="still rank-deficient"):
         build_lkt_design(example, spec)
+
+
+def test_the_same_factor_under_two_names_is_refused_rather_than_halved(example):
+    """The export's own KC column read as a component partitions the rows
+    exactly as the parsed KC does. That is nested in the extreme — every level
+    pairs with one level of the other — and it is a mistake in the
+    specification, not a property of the data, so it is refused by name
+    rather than resolved by silently dropping one copy whole."""
+    spec = [Term("kc", "intercept"), Term("KC (Topics)", "intercept")]
+    with pytest.raises(ValueError, match=r"kc_intercept and intercept\[KC \(Topics\)\] "
+                                         "partition the rows identically"):
+        build_lkt_design(example, spec)
+
+
+def _cohorts(tags, conditions=None, n_students=3, n_steps=30, seed=0):
+    """Cohorts that share no students: cohort ``c`` draws each step's KC tag
+    from ``tags[c]`` (``~~`` for a step carrying two) and, where given, its
+    ``Condition`` from ``conditions[c]``."""
+    rng = np.random.default_rng(seed)
+    rows, seen = [], {}
+    for c, kcs in enumerate(tags):
+        for s in range(n_students):
+            for j in range(n_steps):
+                kc = str(rng.choice(kcs))
+                n = seen[(c, s, kc)] = seen.get((c, s, kc), 0) + 1
+                extra = {} if conditions is None else {"Condition": str(rng.choice(conditions[c]))}
+                rows.append(_row(f"c{c}s{s}", f"st{j}", int(rng.random() < 0.6), kc,
+                                 "~~".join([str(n)] * len(kc.split("~~"))), **extra))
+    return _data(rows)
+
+
+def test_a_feature_that_touches_every_row_does_not_merge_cohorts():
+    """``propdec`` starts every level at a half, so its column is nonzero on
+    every row and joins the graph over the blocks that cover every row. Two
+    cohorts sharing no students and no KCs merge there — but not on the
+    student/KC pair's own graph, which is where their redundancies live, one
+    per cohort, exactly as without the feature."""
+    data = _cohorts([["A", "B"], ["C", "D"]])
+    afm = build_lkt_design(data, lkt_terms(*AFM_SPEC))
+    terms = lkt_terms(("student", "kc", "kc"), ("intercept", "intercept", "propdec"),
+                      (None, None, 0.9))
+    assert len(set(build_lkt_design(data, terms, identify=False).row_components())) == 1
+
+    design = build_lkt_design(data, terms)
+    assert design.n_params == design.rank()
+    assert design.aliased == afm.aliased
+    assert design.aliased.reasons[1] == ("reference level (student/KC sum redundancy, "
+                                         "component 2 of 2)")
+
+
+def test_cohorts_joined_only_through_a_third_block_keep_a_reference_level_each():
+    """Students and conditions never cross between the two cohorts, so their
+    pair carries one redundancy per cohort, however well the KCs both cohorts
+    share connect everything else — and the student/KC and condition/KC pairs
+    carry one more between them. Cut from the whole design's graph, the
+    cohorts looked like one and a reference level went missing."""
+    spec = [Term("student", "intercept"), Term("Condition", "intercept"),
+            Term("kc", "intercept")]
+    conditions = [["c1", "c2"], ["c3", "c4"]]
+
+    single = _cohorts([["K1", "K2", "K3"]] * 2, conditions)
+    unidentified = build_lkt_design(single, spec, identify=False)
+    assert unidentified.rank() == unidentified.n_params - 3, "the premise"
+    design = build_lkt_design(single, spec)
+    assert design.n_params == design.rank()
+    dropped = design.aliased.by_block()
+    assert sorted(s[:2] for s in dropped["student"]) == ["c0", "c1"], "one per cohort"
+    assert len(dropped["kc_intercept"]) == 1
+    assert "intercept[Condition]" not in dropped, "declared first, so kept whole"
+
+    # Steps carrying one KC or two: the KC block covers every row without
+    # partitioning it, so it has no redundancy of its own to add — but it
+    # joined the cohorts all the same.
+    multi = _cohorts([["K1", "K2", "K1~~K2"], ["K1", "K3", "K1~~K3"]], conditions)
+    unidentified = build_lkt_design(multi, spec, identify=False)
+    assert unidentified.rank() == unidentified.n_params - 2, "the premise"
+    design = build_lkt_design(multi, spec)
+    assert design.n_params == design.rank()
+    assert sorted(design.aliased.by_block()) == ["student"]
+    assert len(design.aliased) == 2
 
 
 def test_a_single_intercept_on_any_component_is_fine(example):
@@ -852,16 +951,21 @@ def test_powafm_and_logit_read_the_plain_counts(clocked):
 
 def test_a_multi_parameter_term_round_trips_through_its_block_name(example):
     """All four parameters are part of the block name, so two ``ppe`` terms at
-    different settings are two blocks rather than a collision."""
+    different settings are two blocks rather than a collision — and they are
+    written exactly, because the block name is where a design keeps its
+    specification. Six significant digits would hand back different numbers
+    from the ones fitted, and the vignette's own seeds already carry seven."""
     pars = (0.3491901, 0.2045801, 1e-05, 0.9734477)
     term = Term("kc", "ppe", per_level=True, pars=pars)
-    assert term.block_name.startswith("ppe$(") and term.block_name.endswith(")[kc]")
-    assert term.block_name.count(",") == 3
+    assert term.block_name == "ppe$(0.3491901,0.2045801,1e-05,0.9734477)[kc]"
 
     design = build_lkt_design(example, [term], identify=False)
     recovered = design_terms(design)[0]
-    assert recovered.feature == "ppe" and recovered.component == "kc"
-    assert recovered.pars == pytest.approx(pars, rel=1e-5)
+    assert recovered == term
+    assert recovered.pars == pars
+
+    # Exact is not the same as long: a value written plainly prints plainly.
+    assert Term("kc", "powafm", pars=1.0).block_name == "powafm(1)[kc]"
 
 
 def test_a_scalar_parameter_is_accepted_for_the_single_parameter_features():
@@ -939,6 +1043,72 @@ def test_identification_is_decided_at_the_seed_and_held(example):
     result = fit_lkt_pars(example, _profile_terms())
     assert result.fit.design.n_params == seed.n_params
     assert len(result.fit.design.aliased) == len(seed.aliased)
+
+
+def _twins(n_students=8, n_steps=16, seed=3):
+    """KCs ``A`` and ``B`` tag exactly the same steps, so every per-level block
+    carries them as two identical columns; ``C`` tags the rest. At these sizes a
+    ``propdec$`` search lands inside its bounds rather than on one, where six
+    significant digits would happen to be exact."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for s in range(n_students):
+        seen = {"A~~B": 0, "C": 0}
+        for i in range(n_steps):
+            kc = "A~~B" if i % 2 == 0 else "C"
+            seen[kc] += 1
+            opp = "~~".join([str(seen[kc])] * len(kc.split("~~")))
+            rows.append(_row(f"s{s}", f"st{i}", int(rng.random() < 0.6), kc, opp))
+    return _data(rows)
+
+
+def test_a_profiles_design_reports_the_seeds_aliasing_in_its_own_names():
+    """Identification is held from the seed, and so is its record of *why*. A
+    duplicate's reason names the block it duplicates, and a parametric block's
+    name moves with its parameter — so the profile's design has to report what
+    a design built fresh at the estimate reports, not the seed's names and not
+    a generic reason in place of the real one."""
+    data = _twins()
+    terms = lkt_terms(("student", "kc", "kc"), ("intercept", "intercept", "propdec$"),
+                      (None, None, 0.9))
+    assert "duplicate of propdec$(0.9)[kc]:A" in build_lkt_design(data, terms).aliased.reasons
+
+    profile = fit_lkt_pars(data, terms)
+    assert profile.pars[0] != 0.9, "the parameter has to move for its block name to"
+    assert profile.fit.design.aliased == build_lkt_design(data, profile.terms).aliased
+    # And the fit knows exactly what it fitted: the terms read back from its
+    # block names are the estimate itself, not the estimate to six digits.
+    assert profile.fit.terms == profile.terms
+
+
+def test_the_outer_gradient_is_a_central_difference_as_optim_takes_it(example):
+    """R's ``optim`` differences both ways at ``ndeps = 1e-3``; scipy's
+    L-BFGS-B, left to itself, would step forward only. The trajectory shows
+    which one ran: after the seed, each parameter is probed once above it and
+    once below."""
+    result = fit_lkt_pars(example, _profile_terms(), max_iterations=1)
+    visited = result.trajectory[list(result.labels)].to_numpy()
+    seed = np.array([0.9, 0.5])
+    np.testing.assert_allclose(visited[0], seed)
+    np.testing.assert_allclose(visited[1:5] - seed,
+                               [[PARAMETER_STEP, 0.0], [-PARAMETER_STEP, 0.0],
+                                [0.0, PARAMETER_STEP], [0.0, -PARAMETER_STEP]], atol=1e-12)
+
+
+def test_a_difference_at_a_bound_is_taken_over_the_span_that_fits():
+    """Each side stops at its bound and the quotient divides by the span it
+    covered, as ``optim`` does. On a quadratic that quotient is exactly the
+    derivative at the span's midpoint, which makes the rule checkable."""
+    def f(x):
+        return float(x[0] ** 2 + 3.0 * x[0])
+
+    h = PARAMETER_STEP
+    for x, midpoint in [(0.5, 0.5),                    # interior: central
+                        (1.0, 1.0 - h / 2),            # on the bound: one-sided
+                        (1.0 - h / 2, 1.0 - 3 * h / 4)]:  # partway: shortened
+        gradient = _central_differences(f, np.array([x]), [(0.0, 1.0)])
+        assert gradient[0] == pytest.approx(2.0 * midpoint + 3.0, abs=1e-9)
+    assert _central_differences(f, np.array([0.5]), [(0.5, 0.5)])[0] == 0.0
 
 
 def test_max_gain_bounds_what_any_single_parameter_step_actually_buys(example, profile):

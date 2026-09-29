@@ -708,13 +708,30 @@ def test_never_repeated_kc_reports_slope_as_undefined_not_zero():
 
 
 def test_identify_raises_on_a_collinear_extra_block():
-    """The guard that protects accumulator and hierarchical blocks added later."""
+    """The guard that protects blocks added later. A copy of the KC intercepts
+    under new names is one factor entered twice — every level pairs with
+    exactly one of the other's — and is refused by name, rather than resolved
+    like a nested factor by silently dropping one copy whole."""
     data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
     design = build_afm_design(data, identify=False)
     kc_block = next(b for b in design.blocks if b.name == "kc_intercept")
     duplicate = Block.build("copy", kc_block.matrix.copy(),
                             [f"dup_{c}" for c in kc_block.columns])
-    with pytest.raises(ValueError, match="rank-deficient"):
+    with pytest.raises(ValueError, match="kc_intercept and copy partition the rows "
+                                         "identically"):
+        design.with_blocks(duplicate).identify()
+
+
+def test_identify_raises_on_a_collinear_accumulator():
+    """And the same guard for a block that is not a factor at all: a copy of
+    the slopes is zero wherever a KC is met for the first time, so no sum
+    redundancy can explain it."""
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
+    design = build_afm_design(data, identify=False)
+    slopes = next(b for b in design.blocks if b.name == "kc_slope")
+    duplicate = Block.build("counts", slopes.matrix.copy(),
+                            [f"dup_{c}" for c in slopes.columns])
+    with pytest.raises(ValueError, match="a block added to this design is collinear"):
         design.with_blocks(duplicate).identify()
 
 
@@ -871,7 +888,7 @@ def test_a_block_that_leaves_a_row_at_zero_does_not_partition():
     partial[20:29, 1] = 1.0          # row 29 is left at zero
     design = Design((_one_hot(labels, "left"),
                      Block.build("sparse", partial, ["p", "q"])))
-    assert design._partition_blocks() == ["left"]
+    assert design._covering_blocks() == ["left"]
     assert not design._has_sum_redundancy()
     assert design.identify().n_params == design.n_params
 

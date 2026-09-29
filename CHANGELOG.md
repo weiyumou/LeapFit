@@ -10,35 +10,51 @@ while the major version is 0, a minor bump may change the public API.
 - **The sum-redundancy pass is no longer written in terms of students and
   KCs.** `Design.identify` detected its one redundancy by looking for blocks
   literally named `student` and `kc_intercept`; it now detects *every* such
-  redundancy from the row sums. A block whose rows all sum to the same positive
-  constant spans the all-ones direction, so `m` of them carry `m - 1`
-  dependencies rather than one, and a reference level is dropped from each of
-  `m - 1` blocks — `prefer_drop` first, then latest-declared, so the block a
-  design names first keeps every level. The connected components are cut from
-  the graph over those blocks' levels rather than the student x KC one.
+  redundancy from the row sums, pair by pair. A block whose rows all sum to the
+  same positive constant spans the all-ones direction, so any two of them are
+  dependent — on each connected component of *their own* graph on which both
+  blocks' row sums are constant. Where three or more blocks take part those
+  pairwise dependencies overlap (three crossed blocks carry two, not three), so
+  the columns to drop are chosen by exact elimination over them, in rationals:
+  `prefer_drop` first, then latest-declared, each block from its last level
+  back, so the block a design names first keeps every level, and exactly as
+  many go as the dependencies span.
 
-  **AFM, PFA and LFA are unaffected, bit for bit.** In the two-block case the
-  new rule selects the same blocks, drops the same columns, and writes the same
-  `Aliased.reasons` strings, including the per-component wording; the design
-  matrices, column labels, parameter counts and ranks of every shipped model
-  builder are byte-identical, and both equivalence suites still pass. The one
-  behaviour that does change is `Design.row_components()` called on an
-  *already identified* design: the old mapping sent the dropped reference
-  student's rows to a phantom component of their own, because it labelled each
-  row through its student's now-empty column. They are now labelled by the
-  component they are actually in. Nothing reads that value internally — the
-  pass runs before any level is dropped.
+  **AFM, PFA and LFA are unaffected, bit for bit.** With two blocks the rule is
+  one reference level per component: the same columns, and the same
+  `Aliased.reasons` strings, including the per-component wording. Checked
+  against the previous pass on 201 designs from every shipped builder — AFM
+  with and without recomputed opportunities, PFA per-KC, pooled and with
+  student intercepts — over 103 KC models, all identical, and all three
+  equivalence suites still pass. `Design.row_components()` now takes the blocks
+  to build its graph over, defaulting to every block that covers the rows as
+  before. It also no longer sends a dropped reference student's rows to a
+  phantom component of their own on an *already identified* design, which the
+  old mapping did by labelling each row through its student's now-empty column.
 
-  What this unlocks: a specification with per-level intercepts on more than two
-  components. `leapfit.lkt` previously refused those rather than fit a
-  parameter count it could not state honestly; the refusal is gone.
+  What this unlocks is per-level intercepts on more than two components in the
+  shapes real exports have. Crossed factors: students, KCs and a cohort or
+  condition column. Nested ones: items within KCs identify with one reference
+  item per KC, under a student intercept too, which used to be refused. Cohorts
+  that one pair of blocks separates while another connects them — students and
+  conditions never shared between classes that share KCs — each keep a
+  reference level of their own. And a feature that touches every row no longer
+  merges cohorts: `propdec` is positive from the first attempt, so the graph
+  over the whole design counted its one column as a level every row shares, and
+  `student + kc + kc:propdec` on an export with two cohorts was refused.
 
-  What it does not: a dependence of any other shape. Nesting is the case worth
-  knowing. Where every item belongs to exactly one KC, an item intercept
-  alongside a KC intercept splits the graph into one component per KC and each
-  is identified exactly — but add a student intercept, the graph becomes one
-  component again, the nesting relations outnumber the all-ones ones, and
-  `identify` raises as it always did.
+  What it still refuses is one factor under two names. Two blocks that
+  partition the rows identically — the export's own `KC (...)` column beside
+  the parsed KC, or the vignette's KC, which *is* its problem name, beside
+  `Problem Name` — are a mistake in the specification rather than nesting, and
+  `identify` names the pair instead of silently dropping one copy whole. A
+  dependence that is not a sum redundancy between factors still raises as it
+  always did: an accumulator collinear with what is there, or `lineafm$` beside
+  `linesuc$` and `linefail$`.
+
+- `Term.par` -> `Term.pars` (a tuple; a scalar is accepted for the
+  single-parameter features), and `STATIC_FEATURES` -> `FEATURE_NAMES`. Both
+  from the same release, both unreleased.
 
 ### Added
 
@@ -70,7 +86,11 @@ while the major version is 0, a minor bump may change the public API.
   (`_conform`), for the reason `Design.take` already holds it across CV folds:
   a parameter value that made one more column identically zero would change
   the parameter count mid-search and make one evaluation's AIC incomparable
-  with the next's.
+  with the next's. The seed's record of what it dropped and why is held with
+  it, renamed to the blocks' current names, so a searched fit reports the real
+  reason each column is missing rather than a generic one. And parameters are
+  written into block names exactly, so `fit.terms` and `fit.notation()` give
+  back the estimate itself rather than six significant digits of it.
 
 - **`objective=`, because the reference profiles a surface it is not
   maximizing.** `"penalized"` (the default) profiles the objective the inner
@@ -86,7 +106,7 @@ while the major version is 0, a minor bump may change the public API.
   of the points it visited (agreement around 0.05 nats — tighter than any
   other chunk, because the spec has no time features), and
   `test_the_parameter_search_reaches_the_references_optimum` runs the loop:
-  the reference stops at `propdec2 = 0.3736667`, leapfit reaches `0.37338`
+  the reference stops at `propdec2 = 0.3736667`, leapfit reaches `0.37352`
   with a better likelihood from a stationary point. Worth knowing why it can:
   R's `optim` at `factr = 1e12` stops once the objective improves by less than
   about 6 nats, and the reference's own next probe already reported a better
@@ -94,22 +114,22 @@ while the major version is 0, a minor bump may change the public API.
 
   Two defaults follow the reference deliberately. `PARAMETER_BOUNDS` is its
   `(1e-5, 0.99999)`, recycled across every parameter whatever it means; and
-  the outer differencing step is R's `ndeps = 1e-3` rather than scipy's `1e-8`,
-  because the profile is only as smooth as the inner solve is tight and a step
-  that small differentiates the inner optimizer's own noise.
+  the outer gradient is taken the way R's `optim` takes it — central
+  differences at `ndeps = 1e-3`, each side stopped at its bound — rather than
+  by scipy's own forward differences at `1e-8`, because the profile is only as
+  smooth as the inner solve is tight and a step that small differentiates the
+  inner optimizer's own noise.
 
-- **LKT features that read the clock and the outcome history**, at parameters
-  the caller fixes. Thirty-one features now, up from eleven: decayed histories
+- **LKT features that read the clock and the outcome history.** Thirty-one
+  features now, up from eleven: decayed histories
   (`expdecafm`, `expdecsuc`, `expdecfail`, `propdec`, `propdec2`, `logitdec`),
   recency (`recency`, `recencysuc`, `recencyfail`), power-law forgetting
   (`base`, `basesuc`, `basefail`, `base2`, `base2suc`, `base2fail`, `dashafm`,
   `dashsuc`) and the two four-parameter spacing models (`base4`, `ppe`).
 
-  Nothing here searches for a decay rate — the reference fits its rates with an
-  outer optimizer that rebuilds every feature and refits the whole regression
-  at each evaluation, which is a different fitter — so a parametric feature
-  *requires* its `pars`, and `Term.par` becomes `Term.pars`, a tuple, scalar
-  accepted.
+  A parametric feature *requires* its `pars` — `build_lkt_design` holds them
+  there, and `fit_lkt_pars` starts its search from them — and `Term.par`
+  becomes `Term.pars`, a tuple, scalar accepted.
 
   Two reference behaviours are reproduced deliberately and are worth knowing
   about. `logitdec` truncates at a **60-trial window** (`slidelogitdec`'s
@@ -161,14 +181,14 @@ while the major version is 0, a minor bump may change the public API.
   LKT counts practice from the ordering rather than reading DataShop's
   `Opportunity` column.
 
-  Implemented are the features that are pure functions of prior success and
-  failure counts: `intercept`, `lineafm`, `logafm`, `powafm` (at a fixed
-  exponent), `linesuc`, `logsuc`, `linefail`, `logfail`, `linecomp`, `prop`
-  and `numer`. `history_counts` is `success_failure_counts` with the KC
-  hardcoding lifted to an arbitrary component. Everything else the reference
-  computes is **refused by name with the reason** — a clock it does not have,
-  or a decay parameter nothing here fits — because a spec silently missing a
-  term is worse than one that will not build.
+  The features here are the pure functions of prior success and failure
+  counts: `intercept`, `lineafm`, `logafm`, `powafm`, `linesuc`, `logsuc`,
+  `linefail`, `logfail`, `linecomp`, `prop` and `numer`. `history_counts` is
+  `success_failure_counts` with the KC hardcoding lifted to an arbitrary
+  component. The clock and the decayed histories are the entries above, and
+  whatever the reference computes that none of them implements is **refused
+  by name with the reason**, because a spec silently missing a term is worse
+  than one that will not build.
 
 - **`cost=`, the reference's penalty, expressed exactly.** LKT solves through
   `LiblineaR(type = 0, cost = 512)`, which is this package's objective with
@@ -195,12 +215,6 @@ while the major version is 0, a minor bump may change the public API.
   assembled column is non-finite, naming the feature. Two attempts on one level
   sharing a timestamp make an age of zero, and the reference raises it to a
   negative power and hands `Inf` to its solver.
-
-### Changed
-
-- `Term.par` -> `Term.pars` (a tuple; a scalar is accepted for the
-  single-parameter features), and `STATIC_FEATURES` -> `FEATURE_NAMES`. Both
-  from the same release, both unreleased.
 
 ### Known limitations
 
