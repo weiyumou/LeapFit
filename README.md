@@ -10,9 +10,11 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
-- **Grounded.** The implementation is adapted from LearnSphere's reference
+- **Grounded.** AFM, PFA and LFA are adapted from LearnSphere's reference
   components and validated for equivalence against their output, so results
-  stay comparable with numbers DataShop already reports.
+  stay comparable with numbers DataShop already reports. LKT is validated
+  against the published output of the CRAN `LKT` package but written
+  clean-room, because that package is GPL-3.
 - **Honest statistics.** Parameter counts equal the rank of the design,
   coefficients with no finite estimate are flagged instead of printed as if
   real, and every fit carries a convergence certificate — checked, not assumed.
@@ -25,7 +27,7 @@ uv pip install "git+https://github.com/weiyumou/LeapFit@v0.5.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
-uv sync                # or: uv pip install -e ".[dev]"
+uv sync --extra dev    # or: uv pip install -e ".[dev]"
 uv run pytest          # 330 pass, 45 skip in ~28s; extras need R / reference-run artifacts
 ```
 
@@ -89,7 +91,7 @@ them where you put them:
 
 ```python
 terms = lkt_terms(components=("student", "kc", "kc", "kc"),
-                  features=("intercept", "intercept", "logitdec", "recency"),
+                  features=("intercept", "intercept", "expdecafm", "recency"),
                   pars=(None, None, 0.9, 0.5))
 ```
 

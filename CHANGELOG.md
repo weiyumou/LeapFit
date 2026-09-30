@@ -225,6 +225,9 @@ while the major version is 0, a minor bump may change the public API.
   assembled column is non-finite, naming the feature. Two attempts on one level
   sharing a timestamp make an age of zero, and the reference raises it to a
   negative power and hands `Inf` to its solver.
+- The development install in `README.md` was `uv sync`, which leaves out the
+  `dev` extra, so `uv run pytest` had no pytest of its own to run. It is now
+  `uv sync --extra dev`, as CI runs it.
 
 ### Known limitations
 
@@ -241,6 +244,11 @@ while the major version is 0, a minor bump may change the public API.
   `buildLKTModel`, and that is a consumer of the family — the shape
   `leapfit.lfa` already has over `leapfit.afm` — rather than more of
   `leapfit.lkt`.
+- Steps tagged with several KCs are not checked against the reference, whose
+  sample data has one KC per step. leapfit enters them additively, as AFM
+  does: a per-level term gives each of the step's KCs its own column, and a
+  shared coefficient takes their sum
+  (`test_a_shared_coefficient_sums_a_rows_levels`).
 
 ## 0.5.0 — 2026-09-03
 

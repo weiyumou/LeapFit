@@ -13,7 +13,7 @@ dataset is not vendored: it is GPL-3, this repository is MIT, and it is 1.5 MB.
 Run as a script from the repository root, this module builds it::
 
     curl -O https://cran.r-project.org/src/contrib/LKT_1.7.0.tar.gz
-    uv run --with pyreadr python tests/test_lkt_equivalence.py --tarball LKT_1.7.0.tar.gz
+    uv run --extra dev --with pyreadr python tests/test_lkt_equivalence.py --tarball LKT_1.7.0.tar.gz
 
 It writes where the suite reads, and ``LKT_VIGNETTE_DIR`` moves both.
 
