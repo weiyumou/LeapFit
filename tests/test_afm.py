@@ -25,6 +25,7 @@ from scipy.optimize import minimize
 
 from leapfit import (
     Block,
+    Design,
     StepData,
     accumulator_block,
     build_afm_design,
@@ -707,14 +708,52 @@ def test_never_repeated_kc_reports_slope_as_undefined_not_zero():
 
 
 def test_identify_raises_on_a_collinear_extra_block():
-    """The guard that protects accumulator and hierarchical blocks added later."""
+    """The guard that protects blocks added later. A copy of the KC intercepts
+    under new names is one factor entered twice — every level pairs with
+    exactly one of the other's — and is refused by name, rather than resolved
+    like a nested factor by silently dropping one copy whole."""
     data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
     design = build_afm_design(data, identify=False)
     kc_block = next(b for b in design.blocks if b.name == "kc_intercept")
     duplicate = Block.build("copy", kc_block.matrix.copy(),
                             [f"dup_{c}" for c in kc_block.columns])
-    with pytest.raises(ValueError, match="rank-deficient"):
+    with pytest.raises(ValueError, match="kc_intercept and copy partition the rows "
+                                         "identically"):
         design.with_blocks(duplicate).identify()
+
+
+def test_identify_raises_on_a_collinear_accumulator():
+    """And the same guard for a block that is not a factor at all: a copy of
+    the slopes is zero wherever a KC is met for the first time, so no sum
+    redundancy can explain it."""
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
+    design = build_afm_design(data, identify=False)
+    slopes = next(b for b in design.blocks if b.name == "kc_slope")
+    duplicate = Block.build("counts", slopes.matrix.copy(),
+                            [f"dup_{c}" for c in slopes.columns])
+    with pytest.raises(ValueError, match="a block added to this design is collinear"):
+        design.with_blocks(duplicate).identify()
+
+
+def test_identify_raises_on_a_hierarchical_parent_block():
+    """The hook's other use. A parent appended over the KCs it groups is the
+    sum of their intercept columns, so the KC block already spans it, and the
+    elimination would take every column of it — as silent as dropping one copy
+    of a repeated factor, and refused the same way. Declared before the KCs,
+    the same parent keeps every level and its KCs give up one each instead."""
+    data = _synthetic(n_students=6, n_kcs=4, n_items=12, seed=36, n_reps=5)
+    design = build_afm_design(data, identify=False)
+    parent = _one_hot([f"g{int(kcs[0][2:]) // 2}" for kcs in data.kcs], "parent")
+    with pytest.raises(ValueError, match="parent adds nothing to this design: every column "
+                                         "of it lies in the span of kc_intercept"):
+        design.with_blocks(parent).identify()
+
+    student, kc_intercept, kc_slope = design.blocks
+    identified = Design((student, parent, kc_intercept, kc_slope)).identify()
+    assert identified.n_params == identified.rank()
+    dropped = identified.aliased.by_block()
+    assert len(dropped["student"]) == 1 and len(dropped["kc_intercept"]) == 2
+    assert "parent" not in dropped
 
 
 def _co_occurring_kc_data(pair_steps=3, solo_steps=3, n_students=6):
@@ -803,6 +842,78 @@ def _two_cohort_data(n_per_cohort=4, n_steps=4):
     return from_frame(_rollup_frame(rows), "M")
 
 
+def _one_hot(labels: list[str], name: str) -> Block:
+    """A crossed factor as a design block: one column per level, one per row."""
+    levels = sorted(set(labels))
+    index = {v: j for j, v in enumerate(levels)}
+    matrix = np.zeros((len(labels), len(levels)))
+    matrix[np.arange(len(labels)), [index[v] for v in labels]] = 1.0
+    return Block.build(name, matrix, levels)
+
+
+def test_a_third_partitioning_block_carries_a_second_redundancy():
+    """``m`` blocks that each cover every row span the all-ones direction ``m``
+    times over, so they carry ``m - 1`` dependencies rather than one.
+
+    The third block here is crossed with both students and KCs — every
+    combination occurs — so the all-ones relation is the *only* thing relating
+    it to them, which is exactly what the pass models.
+    """
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=11, n_reps=6)
+    third = _one_hot([f"g{i % 4}" for i in range(len(data))], "cohort")
+
+    two = build_afm_design(data, identify=False)
+    three = two.with_blocks(third)
+    assert three.rank() == three.n_params - 2, "two redundancies to break, not one"
+
+    identified = three.identify()
+    assert identified.n_params == identified.rank()
+    assert len(identified.aliased) == 2
+    blocks = {c.split(":")[0] for c in identified.aliased.columns}
+    assert blocks == {"student", "cohort"}, "prefer_drop first, then latest-declared"
+
+
+def test_the_kc_block_keeps_every_level_however_many_blocks_partition():
+    """The reason for dropping a student rather than a KC does not weaken when
+    a third factor joins: the KC intercepts are still the reported output."""
+    data = _synthetic(n_students=6, n_kcs=3, n_items=12, seed=12, n_reps=6)
+    design = build_afm_design(data, identify=False).with_blocks(
+        _one_hot([f"g{i % 4}" for i in range(len(data))], "cohort")).identify()
+    kc = next(b for b in design.blocks if b.name == "kc_intercept")
+    assert sorted(kc.columns) == sorted(data.kc_names)
+
+
+def test_partitioning_is_detected_from_the_row_sums_not_from_a_block_name():
+    """The old pass looked for blocks literally named ``student`` and
+    ``kc_intercept``. Two blocks named neither, both covering every row, are
+    just as dependent and are now identified as such."""
+    labels_a = [f"a{i % 3}" for i in range(60)]
+    labels_b = [f"b{i % 4}" for i in range(60)]
+    design = Design((_one_hot(labels_a, "left"), _one_hot(labels_b, "right")))
+    assert design.rank() == design.n_params - 1
+
+    identified = design.identify()
+    assert identified.n_params == identified.rank()
+    assert len(identified.aliased) == 1
+    assert identified.aliased.columns[0].startswith("right:"), "latest-declared gives way"
+    assert "sum redundancy across left, right" in identified.aliased.reasons[0]
+
+
+def test_a_block_that_leaves_a_row_at_zero_does_not_partition():
+    """Covering every row is what makes a block span the all-ones direction.
+    One that misses a row cannot, so it neither carries a redundancy nor joins
+    the graph the components are cut from."""
+    labels = [f"a{i % 3}" for i in range(30)]
+    partial = np.zeros((30, 2))
+    partial[: 20, 0] = 1.0
+    partial[20:29, 1] = 1.0          # row 29 is left at zero
+    design = Design((_one_hot(labels, "left"),
+                     Block.build("sparse", partial, ["p", "q"])))
+    assert design._covering_blocks() == ["left"]
+    assert not design._has_sum_redundancy()
+    assert design.identify().n_params == design.n_params
+
+
 def test_row_components_separates_cohorts_that_share_no_material():
     design = build_afm_design(_two_cohort_data(), identify=False)
     labels = design.row_components()
@@ -821,6 +932,17 @@ def test_identify_drops_one_reference_student_per_component():
     assert all("component" in reason for reason in ident.aliased.reasons
                if "reference level" in reason)
     assert ident.n_params == ident.rank()
+
+
+def test_a_cohort_of_one_student_gives_up_its_only_student():
+    """``prefer_drop`` is the one block allowed to go whole. One student per
+    cohort is still one reference level per component, as it always was;
+    refusing it would refuse every single-student export."""
+    data = _two_cohort_data(n_per_cohort=1, n_steps=6)
+    ident = build_afm_design(data, identify=False).identify()
+    assert ident.n_params == ident.rank()
+    assert len(ident.aliased.by_block()["student"]) == 2
+    assert next(b for b in ident.blocks if b.name == "student").matrix.shape[1] == 0
 
 
 def test_a_single_component_keeps_the_plain_reference_level_reason():

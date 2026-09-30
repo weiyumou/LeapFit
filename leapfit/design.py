@@ -33,8 +33,9 @@ This is deliberately the extension point for everything downstream:
 
 from __future__ import annotations
 
-from collections.abc import Sized
+from collections.abc import Sequence, Sized
 from dataclasses import dataclass
+from fractions import Fraction
 
 import numpy as np
 import pandas as pd
@@ -364,36 +365,62 @@ class Design:
 
            Deliberately *within* a block only. A whole block that duplicates
            another — an accumulator or hierarchical-parent term collinear with
-           what is already there — is a modelling error, not a property of the
-           data, and still raises under ``check``.
-        3. **The student/KC sum redundancy, once per connected component.**
-           When every row carries exactly one student and the same number of
-           KCs, the student columns and the KC intercept columns span a common
-           direction: adding a constant to every student and subtracting it
-           from every KC intercept leaves every prediction unchanged. One
-           column from ``prefer_drop`` is removed to break it.
+           what is already there, or one factor entered twice under two names —
+           is a modelling error, not a property of the data, and still raises
+           under ``check``. A factor *nested* in another, items within KCs, is
+           a property of the data, and is identified under point 3 — provided
+           the coarser factor is declared first. Declared after the levels it
+           groups, it is the hierarchical parent just described: the finer
+           block already spans it, point 3 would drop it whole, and it is
+           refused instead.
+        3. **Sum redundancies, pair by pair.** A block whose rows all sum to
+           the same positive constant spans the all-ones direction: its
+           columns add up to ``c * 1``. The student block always does (one
+           student per row), and so does a KC-intercept block whenever every
+           row carries the same number of KCs. Two such blocks are therefore
+           linearly dependent — add a constant to every student, subtract it
+           from every KC intercept, and no prediction moves.
 
-           That redundancy is *not* unique when the student x KC bipartite
-           graph is disconnected. Each component shifts independently, so a
-           design with ``c`` components carries ``c`` of them, and dropping a
-           single reference level leaves ``c - 1`` behind. Cohorts that share
-           no material do this: on the spacing-exp2 export the ten components
-           are its courses, and one reference student is dropped per course.
-           A component whose rows do not all carry the same number of KCs has
-           no redundancy to break and keeps every column.
+           The dependency lives on the two blocks' *own* graph, and on each of
+           its connected components separately. Each component shifts
+           independently, so cohorts that share no material carry one apiece:
+           on the spacing-exp2 export the ten components are its courses, and
+           one reference student is dropped per course. A component where one
+           of the two blocks' row sums varies — rows that do not all carry the
+           same number of KCs, say — has no redundancy to break and keeps
+           every column. And no third block enters a pair's graph: a
+           decayed-history feature touches every row without relating two
+           cohorts to each other, and a nested factor — items within KCs —
+           splits its pair's graph into one component per KC however well
+           connected the students make everything else.
+
+           With three or more blocks the pairwise dependencies overlap —
+           three crossed blocks carry two, not three — so the columns to drop
+           are chosen by exact elimination over them rather than one per
+           dependency: ``prefer_drop`` first, then the latest-declared blocks,
+           each from its last level back, so that the earliest block in the
+           design keeps every level. Exactly as many columns go as the
+           dependencies span, and with two blocks this is one per component.
+           A block other than ``prefer_drop`` that this would take whole is
+           the collinear block of point 2, and is refused rather than
+           dropped. ``prefer_drop`` alone may go whole: a cohort of one
+           student gives up its only student, as it always has.
 
         A student is dropped rather than a KC because the KC intercepts are
         the reported output — learning curves, difficulty tables, low-slope
         screens — and a KC missing from that table would be worse than an
-        arbitrary reference student. Use :meth:`~leapfit.afm.AFMFit.centred_students` to move the
+        arbitrary reference student. The same reasoning orders the general
+        case: whichever block a spec declares first is the one that keeps every
+        level. Use :meth:`~leapfit.afm.AFMFit.centred_students` to move the
         fit to the reference-free sum-to-zero point afterwards. Note that with
         several components that recentring is one *global* shift, so intercept
         levels stay comparable only within a component — nothing in the data
         relates two cohorts that never met the same material.
 
         :param check: verify numerically that the result is full rank, and
-            raise if it is not. Leave this on: it is the guard that catches
-            aliasing introduced by blocks added later.
+            raise if it is not, or if it would drop a whole block. Leave this
+            on: it is the guard that catches aliasing introduced by blocks
+            added later.
         """
         keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
         dropped, reasons = [], []
@@ -416,59 +443,122 @@ class Design:
             Aliased(tuple(self.aliased.columns) + tuple(dropped),
                     tuple(self.aliased.reasons) + tuple(reasons)),
         )
-        reduced = reduced._drop_reference_levels(prefer_drop)
+        identified = reduced._drop_reference_levels(prefer_drop, check=check)
 
         if check:
-            r = reduced.rank()
-            if r != reduced.n_params:
+            r = identified.rank()
+            if r != identified.n_params:
+                if repeated := reduced._coinciding_pairs():
+                    named = "; ".join(f"{a} and {b}" for a, b in repeated)
+                    raise ValueError(
+                        f"Design still rank-deficient after identification: "
+                        f"{identified.n_params} columns, rank {r}. {named} partition "
+                        f"the rows identically — one factor under two names — and a "
+                        f"repeated factor is refused rather than one copy of it "
+                        f"silently dropped. Keep one of them."
+                    )
                 raise ValueError(
                     f"Design still rank-deficient after identification: "
-                    f"{reduced.n_params} columns, rank {r}. Either a block added to "
+                    f"{identified.n_params} columns, rank {r}. Either a block added to "
                     f"this design is collinear with the others, or the KC model "
                     f"carries a dependency this pass does not model exactly — a KC "
                     f"that tags every row of its component, say. Drop or "
                     f"reparameterize the offending columns before fitting, or "
                     f"AIC/BIC will count parameters that do not exist."
                 )
-        return reduced
+        return identified
 
-    def _drop_reference_levels(self, prefer_drop: str) -> Design:
-        """Break one sum redundancy per component, on the columns that survive.
+    def _drop_reference_levels(self, prefer_drop: str, *, check: bool = True) -> Design:
+        """Break every sum redundancy, on the columns that survive.
 
         Deliberately decided *after* dead and duplicate columns are gone: a row
         that carried two KCs carries one once a duplicate of the pair is
-        dropped, and that is when the student/KC sum redundancy comes into
-        being. Asking the question of the original matrix would miss it.
+        dropped, and that is when the sum redundancy comes into being. Asking
+        the question of the original matrix would miss it.
+
+        Each column is read as its vector of coefficients across the
+        redundancies, and the columns are visited in drop order. A column is
+        dropped when its vector is not already spanned by those of the columns
+        visited before it — decided exactly, in rationals. The dropped vectors
+        then span every column's, so no combination of the redundancies
+        survives on the columns kept, and exactly as many columns go as there
+        are independent redundancies. Each drop is reported against the
+        smallest redundancy it takes part in, the one it most specifically
+        stands for.
+
+        Under ``check``, a block other than ``prefer_drop`` that would lose
+        every column raises instead, naming the blocks those drops are
+        reported against: they span it, so it is not a factor with a reference
+        level but a block that adds nothing — a parent declared after the
+        levels it groups.
         """
-        block = next((b for b in self.blocks if b.name == prefer_drop), None)
-        if block is None or block.matrix.shape[1] == 0:
+        redundancies = self._sum_redundancies()
+        if not redundancies:
             return self
 
-        rows = self.row_components()
-        n_components = int(rows.max()) + 1 if rows.size else 0
-        column_of = self._column_components(prefer_drop, rows)
+        # Column (block, j) -> {redundancy index: its coefficient there}.
+        vectors: dict[tuple[str, int], dict[int, Fraction]] = {}
+        for k, redundancy in enumerate(redundancies):
+            for name, columns, weight in zip(redundancy.blocks, redundancy.columns,
+                                             redundancy.weights):
+                for j in columns:
+                    vectors.setdefault((name, int(j)), {})[k] = Fraction(weight)
+        support = [sum(map(len, r.columns)) for r in redundancies]
 
-        keep = np.ones(block.matrix.shape[1], dtype=bool)
+        by_name = {b.name: b for b in self.blocks}
+        involved = [b.name for b in self.blocks
+                    if any(b.name in r.blocks for r in redundancies)]
+        basis: dict[int, dict[int, Fraction]] = {}
+        seen: set[frozenset] = set()
+        drops = []
+        for name in self._drop_order(involved, prefer_drop):
+            for j in range(by_name[name].matrix.shape[1] - 1, -1, -1):
+                vector = vectors.get((name, j))
+                if not vector or (key := frozenset(vector.items())) in seen:
+                    continue  # in no redundancy, or identical to a column visited
+                seen.add(key)
+                if residual := _reduce(vector, basis):
+                    pivot = min(residual)
+                    basis[pivot] = {k: v / residual[pivot] for k, v in residual.items()}
+                    drops.append((min(vector, key=lambda k: (support[k], k)), name, j))
+
+        if check:
+            spanned_by: dict[str, set[str]] = {}
+            for k, name, _ in drops:
+                spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
+            for name, blocks in spanned_by.items():
+                taken = sum(drop[1] == name for drop in drops)
+                if name != prefer_drop and taken == by_name[name].matrix.shape[1]:
+                    raise ValueError(_whole_block_refusal(
+                        name, [b for b in by_name if b in blocks and b != name]))
+
+        keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
         dropped, reasons = [], []
-        for label in self._sum_redundant_components(rows):
-            live = np.flatnonzero(keep & (column_of == label))
-            if not live.size:
-                continue
-            j = int(live[-1])
-            keep[j] = False
-            dropped.append(f"{prefer_drop}:{block.columns[j]}")
-            reasons.append(
-                "reference level (student/KC sum redundancy)" if n_components == 1
-                else ("reference level (student/KC sum redundancy, component "
-                      f"{label + 1} of {n_components})"))
-
-        if not dropped:
-            return self
+        for k, name, j in sorted(drops, key=lambda drop: drop[0]):
+            keep[name][j] = False
+            dropped.append(f"{name}:{by_name[name].columns[j]}")
+            redundancy = redundancies[k]
+            reasons.append(_reference_reason(list(redundancy.blocks), redundancy.label,
+                                             redundancy.n_components))
         return Design(
-            tuple(b.keep(keep) if b.name == prefer_drop else b for b in self.blocks),
+            tuple(b.keep(keep[b.name]) if not keep[b.name].all() else b
+                  for b in self.blocks),
             Aliased(tuple(self.aliased.columns) + tuple(dropped),
                     tuple(self.aliased.reasons) + tuple(reasons)),
         )
+
+    @staticmethod
+    def _drop_order(names: list[str], prefer_drop: str) -> list[str]:
+        """Which blocks give up a level first.
+
+        ``prefer_drop`` leads where it applies, and the rest follow
+        latest-declared first, so the block a specification names earliest is
+        the one left whole. For an AFM design that is exactly the old rule —
+        drop a student, keep every KC — and it generalizes the reason for it
+        rather than the two block names it was written in.
+        """
+        ordered = [n for n in names if n == prefer_drop]
+        return ordered + [n for n in reversed(names) if n != prefer_drop]
 
     def _row_sums(self, name: str) -> np.ndarray | None:
         b = next((x for x in self.blocks if x.name == name), None)
@@ -481,53 +571,60 @@ class Design:
             return None
         return float(sums[0]) if sums[0] > 0 else None
 
-    def _has_sum_redundancy(self, rows: np.ndarray | None = None) -> bool:
-        """True when the student columns and the KC columns span the same vector.
+    def _covering_blocks(self) -> list[str]:
+        """Blocks that touch every row, in design order.
+
+        The candidates for a sum redundancy, and the blocks
+        :meth:`row_components` builds its graph over by default. A block that
+        leaves some row at zero cannot span the all-ones direction, so it can
+        be neither.
+        """
+        out = []
+        for b in self.blocks:
+            sums = self._row_sums(b.name)
+            if sums is not None and sums.size and bool(np.all(sums > 0)):
+                out.append(b.name)
+        return out
+
+    def _has_sum_redundancy(self) -> bool:
+        """Whether any two blocks span the same direction over some rows.
 
         Every row carries exactly one student, so the student columns sum to
         the all-ones vector. If every row also carries the *same* number ``m``
         of KCs, the KC-intercept columns sum to ``m * 1``, and the two blocks
         are linearly dependent whatever ``m`` is — not only for the usual
-        one-KC-per-row partition.
-
-        ``rows`` restricts the question to a subset — one connected component,
-        where the redundancy actually lives (see :meth:`row_components`). The
-        whole design is one component's worth of rows in the common case, and
-        then this is the global test it has always been.
+        one-KC-per-row partition. Nothing here is specific to those two blocks;
+        see :meth:`_sum_redundancies`.
         """
-        students = self._row_sums("student")
-        kcs = self._row_sums("kc_intercept")
-        if students is None or kcs is None:
-            return False
-        if rows is not None:
-            students, kcs = students[rows], kcs[rows]
-        return bool(students.size and np.allclose(students, 1.0)
-                    and np.allclose(kcs, kcs[0]) and kcs[0] > 0)
+        return bool(self._sum_redundancies())
 
-    def row_components(self) -> np.ndarray:
-        """Component label per row, from the student x KC bipartite graph.
+    def row_components(self, names: Sequence[str] | None = None) -> np.ndarray:
+        """Component label per row, from the graph over some blocks' levels.
 
-        Two rows land in the same component when a chain of shared students and
-        shared KCs connects them. One component is the ordinary case; several
-        mean the export holds cohorts that never met the same material, and
-        each of them carries its own sum redundancy and its own intercept
-        level (see :meth:`identify`). All-zero if either block is missing.
+        Two rows land in the same component when a chain of shared levels
+        connects them. ``names`` picks the blocks, by default every one that
+        covers every row — shared students, shared KCs, shared anything — so
+        that several components mean the export holds cohorts that never met
+        the same material. :meth:`identify` asks this of one *pair* of blocks
+        at a time instead, because a sum redundancy between two blocks lives
+        on their own graph: a third block that touches every row can join
+        components that no redundancy joins. All-zero when fewer than two
+        blocks are given, since then there is nothing for components to
+        localize.
         """
-        student = next((b for b in self.blocks if b.name == "student"), None)
-        kc = next((b for b in self.blocks if b.name == "kc_intercept"), None)
-        if student is None or kc is None:
+        names = self._covering_blocks() if names is None else list(names)
+        if len(names) < 2:
             return np.zeros(self.n_obs, dtype=np.int64)
 
-        incidence = (student.matrix.T @ kc.matrix).tocsr()
-        incidence.data[:] = 1.0
+        by_name = {b.name: b for b in self.blocks}
+        incidence = sparse.hstack([by_name[n].matrix for n in names], format="csr")
+        incidence = (incidence != 0).astype(np.int8)
+        n_rows = incidence.shape[0]
         graph = sparse.bmat([[None, incidence], [incidence.T, None]], format="csr")
         _, labels = csgraph.connected_components(graph, directed=False)
-        # Each row carries exactly one student, so its student's label is its own.
-        by_student = labels[: student.matrix.shape[1]]
-        by_row = (student.matrix @ (by_student + 1.0)).astype(np.int64) - 1
-        # Renumber consecutively: a KC nobody practises is its own graph
+        # Renumber consecutively: a level nobody touches is its own graph
         # component, and would otherwise leave a gap in the labels.
-        return np.unique(by_row, return_inverse=True)[1].astype(np.int64)
+        return np.unique(labels[:n_rows], return_inverse=True)[1].astype(np.int64)
 
     def _column_components(self, name: str, rows: np.ndarray) -> np.ndarray:
         """Component label per column of a block: the label of any row it touches.
@@ -543,19 +640,57 @@ class Design:
         out[occupied] = rows[M.indices[starts[occupied]]]
         return out
 
-    def _sum_redundant_components(self, rows: np.ndarray) -> list[int]:
-        """The components that carry a student/KC sum redundancy to break.
+    def _pair_graphs(self):
+        """Each pair of covering blocks with its own graph, in design order.
 
-        Rows are grouped by one sort rather than one scan per component, so
-        this stays linear-ish however many components there are — a design
-        where no two students share an item has as many components as students.
+        Yields the two names, the component of every row, how many components
+        there are, and each block's columns grouped by component.
         """
-        if rows.size == 0:
-            return []
-        order = np.argsort(rows, kind="stable")
-        groups = np.split(order, np.flatnonzero(np.diff(rows[order])) + 1)
-        return [int(rows[group[0]]) for group in groups
-                if self._has_sum_redundancy(group)]
+        names = self._covering_blocks()
+        for i, first in enumerate(names):
+            for second in names[i + 1:]:
+                rows = self.row_components((first, second))
+                if rows.size:
+                    yield (first, second, rows, int(rows.max()) + 1,
+                           (_members(self._column_components(first, rows)),
+                            _members(self._column_components(second, rows))))
+
+    def _sum_redundancies(self) -> list[_SumRedundancy]:
+        """Every sum redundancy between two covering blocks: pairs in design
+        order, and within a pair its graph's components in label order.
+
+        A component carries one wherever both blocks' row sums are constant on
+        it, and none where either varies — a block can be constant within one
+        cohort and not across the export, so the question is asked per
+        component rather than of the block. Rows and columns are grouped by one
+        sort rather than one scan per component, so this stays linear-ish
+        however many components there are — a design where no two students
+        share an item has as many components as students.
+
+        Two blocks that partition the rows identically are left out: that is
+        one factor under two names, a mistake in the specification rather than
+        a property of the data, and :meth:`identify` refuses it rather than
+        silently dropping one of them whole.
+        """
+        sums = {name: self._row_sums(name) for name in self._covering_blocks()}
+        out = []
+        for first, second, rows, n_components, columns in self._pair_graphs():
+            if _coincide(n_components, columns):
+                continue
+            for label, group in _members(rows).items():
+                a, b = sums[first][group], sums[second][group]
+                if np.allclose(a, a[0]) and np.allclose(b, b[0]):
+                    empty = np.array([], dtype=np.int64)
+                    out.append(_SumRedundancy(
+                        (first, second), label, n_components,
+                        (columns[0].get(label, empty), columns[1].get(label, empty)),
+                        (float(b[0]), -float(a[0]))))
+        return out
+
+    def _coinciding_pairs(self) -> list[tuple[str, str]]:
+        """Pairs of covering blocks that partition the rows identically."""
+        return [(first, second) for first, second, _, n_components, columns
+                in self._pair_graphs() if _coincide(n_components, columns)]
 
     def recentring_is_valid(self) -> bool:
         """Whether shifting students into KC intercepts leaves predictions fixed.
@@ -568,6 +703,92 @@ class Design:
         one KC per row.
         """
         return self.kc_per_row() == 1.0
+
+
+def _reference_reason(names: list[str], label: int, n_components: int) -> str:
+    """Why a reference level was dropped, naming the blocks it stood between.
+
+    The student/KC wording is preserved exactly: it is the case every other
+    docstring, changelog entry and design note in this package refers to, and
+    a reader following one of those to ``Aliased.reasons`` should find the
+    words they were sent to look for.
+    """
+    kind = ("student/KC sum redundancy" if set(names) == {"student", "kc_intercept"}
+            else "sum redundancy across " + ", ".join(names))
+    where = "" if n_components == 1 else f", component {label + 1} of {n_components}"
+    return f"reference level ({kind}{where})"
+
+
+def _whole_block_refusal(name: str, spanning: list[str]) -> str:
+    """Why a block that identification would drop whole is refused instead."""
+    return (
+        f"{name} adds nothing to this design: every column of it lies in the span "
+        f"of {' and '.join(spanning)}, the way a parent block's columns are sums of "
+        f"the levels it groups, so identification would drop it whole. A block "
+        f"collinear with what is already there is refused rather than silently "
+        f"dropped. Remove it; or, to keep it, declare it before the finer blocks, "
+        f"which then give up one reference level per level of {name} instead; and "
+        f"where a ridge is what identifies the hierarchy, leave identification out."
+    )
+
+
+@dataclass(frozen=True)
+class _SumRedundancy:
+    """Two blocks that span the same direction over one component of their graph.
+
+    Where the two blocks' rows sum to constants ``c1`` and ``c2`` there, adding
+    ``c2`` to each of the first block's levels in the component and taking
+    ``c1`` from each of the second's leaves every prediction where it was: that
+    null vector is ``weights`` on ``columns``.
+    """
+
+    blocks: tuple[str, str]
+    label: int                              # the component, in the pair's own graph
+    n_components: int                       # how many components that graph has
+    columns: tuple[np.ndarray, np.ndarray]  # each block's columns in the component
+    weights: tuple[float, float]
+
+
+def _members(labels: np.ndarray) -> dict[int, np.ndarray]:
+    """Indices grouped by their label, by one sort; negative labels left out."""
+    order = np.argsort(labels, kind="stable")
+    groups = np.split(order, np.flatnonzero(np.diff(labels[order])) + 1)
+    return {int(labels[g[0]]): g for g in groups if g.size and labels[g[0]] >= 0}
+
+
+def _coincide(n_components: int, columns: tuple[dict, dict]) -> bool:
+    """Whether a pair's graph pairs every level of one block with exactly one of
+    the other's — the same partition of the rows, under two sets of names.
+
+    One component does not count: a single student and a single KC are two
+    constant columns, and that is the ordinary reference level, not a
+    repeated factor.
+    """
+    return n_components > 1 and all(
+        len(columns[0].get(label, ())) == len(columns[1].get(label, ())) == 1
+        for label in range(n_components))
+
+
+def _reduce(vector: dict[int, Fraction],
+            basis: dict[int, dict[int, Fraction]]) -> dict[int, Fraction]:
+    """What is left of ``vector`` once the span of ``basis`` is taken out.
+
+    ``basis`` is in echelon form: each vector is keyed by its smallest index,
+    where it is 1. Eliminating the smallest index the two share therefore
+    never reintroduces one already eliminated, and each step moves strictly
+    rightwards.
+    """
+    residual = dict(vector)
+    while hits := [k for k in residual if k in basis]:
+        k = min(hits)
+        coefficient = residual[k]
+        for m, value in basis[k].items():
+            updated = residual.get(m, 0) - coefficient * value
+            if updated:
+                residual[m] = updated
+            else:
+                residual.pop(m, None)
+    return residual
 
 
 def accumulator_block(data: Sized, values: np.ndarray, *,

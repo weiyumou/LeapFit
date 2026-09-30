@@ -31,11 +31,13 @@ over the KC model a family conditions on:
     leapfit.crossval  fold schemes and both RMSE conventions
     leapfit.afm       Additive Factors Model
     leapfit.pfa       Performance Factors Analysis
+    leapfit.lkt       Logistic Knowledge Tracing: components x features, of
+                      which AFM and PFA are two specifications
     leapfit.lfa       Learning Factors Analysis: a search over KC models,
                       scored by AFM
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from leapfit.afm import (
     STUDENT_L2,
@@ -85,6 +87,24 @@ from leapfit.lfa import (
     root_labels,
     validate_top,
 )
+from leapfit.lkt import (
+    FEATURE_NAMES,
+    LOGITDEC_WINDOW,
+    OBJECTIVES,
+    PARAMETER_BOUNDS,
+    PARAMETER_TOLERANCE,
+    REFERENCE_COST,
+    LKTFit,
+    LKTProfile,
+    Term,
+    build_lkt_design,
+    component_labels,
+    design_terms,
+    fit_lkt,
+    fit_lkt_pars,
+    history_counts,
+    lkt_terms,
+)
 from leapfit.pfa import (
     PFAFit,
     build_pfa_design,
@@ -95,10 +115,16 @@ from leapfit.pfa import (
 __all__ = [
     "CONVENTIONS",
     "DEFAULT_METHOD",
+    "FEATURE_NAMES",
     "FIRST_ATTEMPT_VALUES",
     "HEURISTICS",
+    "LOGITDEC_WINDOW",
     "MERGES",
     "MIN_OPPORTUNITIES",
+    "OBJECTIVES",
+    "PARAMETER_BOUNDS",
+    "PARAMETER_TOLERANCE",
+    "REFERENCE_COST",
     "SCHEMES",
     "STUDENT_L2",
     "AFMFit",
@@ -110,25 +136,35 @@ __all__ = [
     "LFAResult",
     "LFAState",
     "LFAValidation",
+    "LKTFit",
+    "LKTProfile",
     "LogisticFit",
     "Move",
     "PFAFit",
     "Rejected",
     "Separated",
     "StepData",
+    "Term",
     "__version__",
     "accumulator_block",
     "build_afm_design",
     "build_factor_matrix",
+    "build_lkt_design",
     "build_pfa_design",
     "coefficient_frame",
+    "component_labels",
     "cross_validate",
+    "design_terms",
     "fit_afm",
+    "fit_lkt",
+    "fit_lkt_pars",
     "fit_logistic",
     "fit_pfa",
     "from_frame",
+    "history_counts",
     "lfa_search",
     "list_kc_models",
+    "lkt_terms",
     "load_student_step",
     "make_folds",
     "paired_contrasts",

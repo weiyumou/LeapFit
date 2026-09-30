@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 #: per model family — the split that makes adding PFA/BKT/IRT a new module
 #: rather than a rewrite.
 SHARED = ["leapfit.data", "leapfit.design", "leapfit.fit", "leapfit.crossval"]
-FAMILIES = ["leapfit.afm", "leapfit.pfa"]
+FAMILIES = ["leapfit.afm", "leapfit.pfa", "leapfit.lkt"]
 
 #: Modules that sit *above* a family rather than beside it. A search over KC
 #: models is scored by AFM's own AIC/BIC, so ``leapfit.lfa`` imports
@@ -86,7 +86,8 @@ def test_shared_modules_carry_no_family_specific_api():
 
     for module in (leapfit.design, leapfit.fit):
         for symbol in ("build_afm_design", "AFMFit", "build_pfa_design",
-                       "PFAFit", "kc_values", "success_failure_counts"):
+                       "PFAFit", "kc_values", "success_failure_counts",
+                       "build_lkt_design", "LKTFit", "lkt_terms"):
             assert not hasattr(module, symbol), (
                 f"{module.__name__} exposes {symbol}, which is family-specific")
 

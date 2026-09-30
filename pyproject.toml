@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "leapfit"
-version = "0.5.0"
-description = "LearnSphere-grounded student models over DataShop student-step data"
+version = "0.6.0"
+description = "Student models over DataShop student-step data, validated against LearnSphere and CRAN LKT"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Canwen Wang", email = "canwenw@andrew.cmu.edu" }]
-keywords = ["educational-data-mining", "datashop", "learnsphere", "afm", "pfa", "student-modeling"]
+keywords = ["educational-data-mining", "datashop", "learnsphere", "afm", "pfa", "lfa", "lkt", "student-modeling"]
 # Python versions listed are the ones CI runs the suite on, not the ones that
 # would probably work.
 classifiers = [
@@ -34,7 +34,7 @@ classifiers = [
 # happens to work. numpy 2 and pandas 3 both changed behaviour we depend on
 # (copy-on-write semantics, sparse interop), and the test suite is run against
 # them -- claiming support for older releases we never exercise would be a
-# guess. Install with `uv sync` or `uv pip install -e ".[dev]"`.
+# guess. Install with `uv sync --extra dev` or `uv pip install -e ".[dev]"`.
 dependencies = [
     "numpy>=2.1",
     "pandas>=2.2",

@@ -3,6 +3,253 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## 0.6.0 — 2026-09-30
+
+### Changed
+
+- **The sum-redundancy pass is no longer written in terms of students and
+  KCs.** `Design.identify` detected its one redundancy by looking for blocks
+  literally named `student` and `kc_intercept`; it now detects *every* such
+  redundancy from the row sums, pair by pair. A block whose rows all sum to the
+  same positive constant spans the all-ones direction, so any two of them are
+  dependent — on each connected component of *their own* graph on which both
+  blocks' row sums are constant. Where three or more blocks take part those
+  pairwise dependencies overlap (three crossed blocks carry two, not three), so
+  the columns to drop are chosen by exact elimination over them, in rationals:
+  `prefer_drop` first, then latest-declared, each block from its last level
+  back, so the block a design names first keeps every level, and exactly as
+  many go as the dependencies span.
+
+  **AFM, PFA and LFA are unaffected, bit for bit.** With two blocks the rule is
+  one reference level per component: the same columns, and the same
+  `Aliased.reasons` strings, including the per-component wording. Checked
+  against the previous pass on 201 designs from every shipped builder — AFM
+  with and without recomputed opportunities, PFA per-KC, pooled and with
+  student intercepts — over 103 KC models, all identical, and all three
+  equivalence suites still pass. `Design.row_components()` now takes the blocks
+  to build its graph over, defaulting to every block that covers the rows as
+  before. It also no longer sends a dropped reference student's rows to a
+  phantom component of their own on an *already identified* design, which the
+  old mapping did by labelling each row through its student's now-empty column.
+
+  What this unlocks is per-level intercepts on more than two components in the
+  shapes real exports have. Crossed factors: students, KCs and a cohort or
+  condition column. Nested ones: items declared after the KCs they sit in
+  identify with one reference item per KC, under a student intercept too,
+  which used to be refused. Cohorts that one pair of blocks separates while
+  another connects them — students and conditions never shared between
+  classes that share KCs — each keep a reference level of their own. And a
+  feature that touches every row no longer
+  merges cohorts: `propdec` is positive from the first attempt, so the graph
+  over the whole design counted its one column as a level every row shares, and
+  `student + kc + kc:propdec` on an export with two cohorts was refused.
+
+  What it still refuses is what 0.5.0 refused as a mistake in the
+  specification rather than a property of the data: a block the others
+  already span. The first case is one factor under two names — two blocks
+  that partition the rows identically, such as the export's own `KC (...)`
+  column beside the parsed KC, or the vignette's KC, which *is* its problem
+  name, beside `Problem Name` — and `identify` names the pair instead of
+  silently dropping one copy whole. The second is a hierarchical parent
+  declared after the levels it groups: topics appended with `with_blocks`
+  over the KCs they group, or `kc` after `item` in an LKT spec. Elimination
+  would take every column of it, so it is refused, naming the block that
+  spans it; declared first, the parent keeps every level and the finer block
+  gives up one per parent instead. `prefer_drop` alone may still go whole, so
+  a cohort of one student gives up its only student as before. A dependence
+  that is not a sum redundancy between factors still raises as it always did:
+  an accumulator collinear with what is there, or `lineafm$` beside `linesuc$`
+  and `linefail$`.
+
+- `Term.par` -> `Term.pars` (a tuple; a scalar is accepted for the
+  single-parameter features), and `STATIC_FEATURES` -> `FEATURE_NAMES`. Both
+  from the same release, both unreleased.
+
+### Added
+
+- **`fit_lkt_pars`: fitting LKT's feature parameters, not just choosing them.**
+  A profile likelihood over the design builder — each candidate parameter
+  vector recomputes the features, rebuilds the design and fits the
+  coefficients to convergence, and an outer L-BFGS-B walks the resulting
+  surface. That is the reference's own procedure; three things around it are
+  not.
+
+  *The parameters are counted.* `LKTFit.n_params` becomes `rank(X) + k`, so a
+  searched model's AIC and BIC are charged for the search. The reference
+  reports no parameter count at all.
+
+  *Stationarity is measured, not inferred.* The profile is **not** convex, so
+  the inner KKT certificate — which does prove a global optimum over the
+  coefficients — says nothing about the parameters. After the optimizer stops,
+  every parameter is stepped by `PARAMETER_STEP` in both directions and
+  refitted; `LKTProfile.max_gain` is the best improvement any of those found,
+  in nats, and `is_stationary` compares it against `PARAMETER_TOLERANCE`. It is
+  reported next to, not instead of, the optimizer's own `converged` flag,
+  because they answer different questions.
+
+  *Restarts turn an assumption into a measurement.* Pass several `starts` and
+  the summary reports how many distinct optima they reached and how far apart.
+  One start says nothing about other basins, and the summary says so.
+
+  Identification is decided once at the seed and held for every evaluation
+  (`_conform`), for the reason `Design.take` already holds it across CV folds:
+  a parameter value that made one more column identically zero would change
+  the parameter count mid-search and make one evaluation's AIC incomparable
+  with the next's. The seed's record of what it dropped and why is held with
+  it, renamed to the blocks' current names, so a searched fit reports the real
+  reason each column is missing rather than a generic one. And parameters are
+  written into block names exactly, so `fit.terms` and `fit.notation()` give
+  back the estimate itself rather than six significant digits of it.
+
+- **`objective=`, because the reference profiles a surface it is not
+  maximizing.** `"penalized"` (the default) profiles the objective the inner
+  solver actually maximizes, so the pair (parameters, coefficients) maximizes
+  one function. `"likelihood"` profiles the plain Bernoulli log-likelihood of a
+  *ridged* fit, which is the reference's choice and is not a single objective;
+  the two coincide whenever `l2 = 0`, and part company as soon as `cost` is
+  finite.
+
+- **The reference's RPFA search reproduced, path and endpoint.** Its vignette
+  prints every evaluation, so the whole `optim` trajectory is visible.
+  `test_the_references_search_path_is_reproduced_point_by_point` checks four
+  of the points it visited (agreement around 0.05 nats — tighter than any
+  other chunk, because the spec has no time features), and
+  `test_the_parameter_search_reaches_the_references_optimum` runs the loop:
+  the reference stops at `propdec2 = 0.3736667`, leapfit reaches `0.37352`
+  with a better likelihood from a stationary point. Worth knowing why it can:
+  R's `optim` at `factr = 1e12` stops once the objective improves by less than
+  about 6 nats, and the reference's own next probe already reported a better
+  value than the one it returned.
+
+  Two defaults follow the reference deliberately. `PARAMETER_BOUNDS` is its
+  `(1e-5, 0.99999)`, recycled across every parameter whatever it means; and
+  the outer gradient is taken the way R's `optim` takes it — central
+  differences at `ndeps = 1e-3`, each side stopped at its bound — rather than
+  by scipy's own forward differences at `1e-8`, because the profile is only as
+  smooth as the inner solve is tight and a step that small differentiates the
+  inner optimizer's own noise.
+
+- **LKT features that read the clock and the outcome history.** Thirty-one
+  features now, up from eleven: decayed histories
+  (`expdecafm`, `expdecsuc`, `expdecfail`, `propdec`, `propdec2`, `logitdec`),
+  recency (`recency`, `recencysuc`, `recencyfail`), power-law forgetting
+  (`base`, `basesuc`, `basefail`, `base2`, `base2suc`, `base2fail`, `dashafm`,
+  `dashsuc`) and the two four-parameter spacing models (`base4`, `ppe`).
+
+  A parametric feature *requires* its `pars` — `build_lkt_design` holds them
+  there, and `fit_lkt_pars` starts its search from them — and `Term.par`
+  becomes `Term.pars`, a tuple, scalar accepted.
+
+  Two reference behaviours are reproduced deliberately and are worth knowing
+  about. `logitdec` truncates at a **60-trial window** (`slidelogitdec`'s
+  `max(1, i - 60)`), undocumented in the paper and worth 0.06 logits at
+  `d = .97` over 200 trials; `LOGITDEC_WINDOW` names it. And the mean-spacing
+  sentinel of `-1` at a level's second practice is what selects `base4`'s
+  unspaced branch, rather than the position doing it.
+
+- **A clock on `StepData`.** `epoch_times()` parses `First Transaction Time` to
+  seconds, and `time_on_task()` accumulates `Step Duration (sec)` — lagged, per
+  student, over `practice_order()` — into the clock that ignores gaps between
+  sessions. Both **refuse** when the export lacks the column instead of
+  substituting a row number or a constant, because every substitute is a
+  different model. Neither column is required by anything that ran before.
+
+- **Three more of the reference's published chunks reproduced**, spanning the
+  whole implemented surface: `logitdec + recency` at **-25474.531**, `PPE` at
+  **-24695.586** and `base4` at **-25969.925**, each within 0.2 nats and each
+  on the better side of the published value from a KKT-certified optimum. With
+  the AFM chunk that is four, and `test_every_chunk_lands_on_the_better_side_of_its_published_value`
+  checks the *shape* of all four together: a sign that flipped between them
+  would say the agreement is noise around a wrong design.
+
+  The equivalence fixture now also carries `Step Duration (sec)`, derived the
+  way the vignette derives it — `(end latency + review latency + 500)/1000`,
+  overwriting the export's own duration column — because that is what the
+  published `base4` number was produced from.
+
+- **Features are refused by name with the reason, and three of those reasons
+  are reference defects.** `errordec` reads `data$pred_ed`, which nothing in
+  the package ever assigns; `recencystudy` and `recencytest` read
+  `<component>previousstudy`, whose assignment is commented out in
+  `computeSpacingPredictors`; `dashfail` is counted in `parlength` but has no
+  branch in `computefeatures`. The reference cannot compute any of them either.
+
+- **Logistic Knowledge Tracing, static features** (`leapfit/lkt.py`). A model
+  is a list of `Term`s, each pairing a *component* (any factor the export
+  carries — student, item, KC, or a column of the source table) with a
+  *feature* of that component's practice history for that student; the
+  reference's `$` suffix fits one coefficient per level instead of one shared.
+  `lkt_terms` takes the reference's own parallel `components`/`features`
+  vectors so a specification can be copied out of a paper unchanged, and
+  `LKTFit.component_values` generalizes `AFMFit.kc_values` to any component.
+
+  AFM and PFA turn out to be single LKT specifications, and
+  `build_lkt_design` reproduces both designs column for column — including the
+  aliasing, the parameter count and the likelihood. Both identities are pinned
+  by tests, with the AFM one against `recompute_opportunities=True`, because
+  LKT counts practice from the ordering rather than reading DataShop's
+  `Opportunity` column.
+
+  The features here are the pure functions of prior success and failure
+  counts: `intercept`, `lineafm`, `logafm`, `powafm`, `linesuc`, `logsuc`,
+  `linefail`, `logfail`, `linecomp`, `prop` and `numer`. `history_counts` is
+  `success_failure_counts` with the KC hardcoding lifted to an arbitrary
+  component. The clock and the decayed histories are the entries above, and
+  whatever the reference computes that none of them implements is **refused
+  by name with the reason**, because a spec silently missing a term is worse
+  than one that will not build.
+
+- **`cost=`, the reference's penalty, expressed exactly.** LKT solves through
+  `LiblineaR(type = 0, cost = 512)`, which is this package's objective with
+  `l2 = 1/cost` on every column. The default stays `l2 = 0` with an identified
+  design: that ridge is an identification device, and `Design.identify`
+  removes the redundancy exactly instead. `test_the_reference_ridge_hides_a_separation_the_default_reports`
+  pins what the difference costs.
+
+- **Equivalence against the reference's published output**
+  (`tests/test_lkt_equivalence.py`), without an R interpreter. The CRAN
+  tarball ships both halves of a fixture — `largerawsample.rda` and a
+  precompiled vignette printing each model's log-likelihood to eight decimals
+  — which is the same kind of artifact as LearnSphere's `model_values.xml`,
+  and the module builds its own fixture from the tarball when run as a script.
+  On the vignette's AFM chunk leapfit reaches **-27346.740** against its
+  published **-27347.207**: 0.47 nats better, from a KKT-certified optimum, so
+  by the two-sided criterion this suite already uses the gap is the
+  reference's optimizer stopping early. The test decomposes it rather than
+  asserting it — the ridge accounts for 0.036 nats and the choice of reference
+  level for 0.015, leaving `LiblineaR`'s default `epsilon = 1e-4`.
+
+### Fixed
+
+- A term whose feature divides by an elapsed time now **raises** when the
+  assembled column is non-finite, naming the feature. Two attempts on one level
+  sharing a timestamp make an age of zero, and the reference raises it to a
+  negative power and hands `Inf` to its solver.
+- The development install in `README.md` was `uv sync`, which leaves out the
+  `dev` extra, so `uv run pytest` had no pytest of its own to run. It is now
+  `uv sync --extra dev`, as CI runs it.
+
+### Known limitations
+
+- No global intercept (`interc=TRUE`), no `*` or `:` connectors, no
+  `interacts`, no `autoKC`, no `@` random effects, and no `leapfit-lkt`
+  console script yet. `interc` is now only a small step — the generalized
+  identification pass above is what it was waiting on, since an all-ones column
+  is just one more block that covers every row — but it is not implemented.
+  Where a spec already carries a per-level intercept it changes nothing but the
+  parameterization anyway, which is why the three `interc=TRUE` chunks
+  reproduced here match without it.
+- No search over *terms*. `fit_lkt_pars` fits a specification's parameters;
+  choosing which features on which components to include is the reference's
+  `buildLKTModel`, and that is a consumer of the family — the shape
+  `leapfit.lfa` already has over `leapfit.afm` — rather than more of
+  `leapfit.lkt`.
+- Steps tagged with several KCs are not checked against the reference, whose
+  sample data has one KC per step. leapfit enters them additively, as AFM
+  does: a per-level term gives each of the step's KCs its own column, and a
+  shared coefficient takes their sum
+  (`test_a_shared_coefficient_sums_a_rows_levels`).
+
 ## 0.5.0 — 2026-09-03
 
 ### Added
