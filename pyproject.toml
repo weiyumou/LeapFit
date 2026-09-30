@@ -59,9 +59,10 @@ packages = ["leapfit"]
 
 # hatchling honours VCS ignores, and this repo inherits a research-workspace
 # `.gitignore` that drops all `*.md`. README survives only because it is the
-# declared readme; the changelog has to be named or the sdist ships without it.
+# declared readme; every other Markdown file has to be named here or the sdist
+# ships without it.
 [tool.hatch.build.targets.sdist]
-artifacts = ["CHANGELOG.md"]
+artifacts = ["CHANGELOG.md", "examples/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

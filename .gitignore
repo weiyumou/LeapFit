@@ -175,6 +175,10 @@ activemq-data/
 .env
 .envrc
 .venv
+# Further environments beside it, such as .venv-pybkt. uv hides each from git
+# with a `.gitignore` of its own, but hatchling reads only this file, so
+# without this rule `uv build` packs them into the sdist.
+.venv*/
 env/
 venv/
 ENV/

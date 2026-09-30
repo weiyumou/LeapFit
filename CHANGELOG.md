@@ -3,6 +3,20 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## Unreleased
+
+### Fixed
+
+- The source distribution ships `examples/README.md`. The repository's
+  `.gitignore` drops every `*.md` and hatchling honours it, so every release
+  so far packed the examples without their README. It is now named in
+  `artifacts`, as `CHANGELOG.md` already was.
+- `uv build` in a working copy no longer packs a second virtual environment,
+  such as `.venv-pybkt`, into the sdist. uv hides each environment from git
+  with a `.gitignore` inside it, which hatchling does not read, so building
+  0.6.0 that way failed on the environment's link to its interpreter.
+  `.venv*/` is now ignored at the root.
+
 ## 0.6.0 — 2026-09-30
 
 ### Changed
