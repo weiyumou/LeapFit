@@ -37,7 +37,7 @@ over the KC model a family conditions on:
                       scored by AFM
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from leapfit.afm import (
     STUDENT_L2,
