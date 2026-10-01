@@ -78,12 +78,13 @@ import os
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 import pandas as pd
 
-from leapfit.afm import build_afm_design, fit_afm
-from leapfit.crossval import paired_contrasts, paired_cross_validate, paired_scores
+from leapfit.afm import AFMFit, build_afm_design, fit_afm
+from leapfit.crossval import _worker_count, paired_contrasts, paired_cross_validate, paired_scores
 from leapfit.data import StepData
 from leapfit.design import Design
 from leapfit.fit import DEFAULT_METHOD
@@ -350,10 +351,27 @@ class LFAState:
     iteration: int = -1
     weights: np.ndarray | None = field(default=None, repr=False)
     columns: tuple[str, ...] = field(default=(), repr=False)
+    #: The columns counted in :attr:`n_separated`, by qualified name.
+    separated: tuple[str, ...] = field(default=(), repr=False)
+
+    @classmethod
+    def _from_fit(cls, fit: AFMFit, n_kcs: int, **search) -> LFAState:
+        """The state ``fit`` scores, with ``search`` saying where it sits in
+        the search: its labels, history, iteration, and so on."""
+        return cls(ll=fit.ll, aic=fit.aic, bic=fit.bic, n_kcs=n_kcs,
+                   n_params=fit.n_params, is_optimal=fit.is_optimal,
+                   n_separated=len(fit.separated),
+                   n_separated_kc=len(fit.separated.in_blocks("kc_intercept", "kc_slope")),
+                   separated=fit.separated.columns, **search)
 
     @property
     def depth(self) -> int:
         return len(self.history)
+
+    @property
+    def path(self) -> str:
+        """The moves from the root, as the frontier and validation tables print them."""
+        return " | ".join(str(m) for m in self.history)
 
     def score(self, heuristic: str) -> float:
         """The value the search ranks by. Lower is better."""
@@ -364,7 +382,7 @@ class LFAState:
         return dict(zip(steps, self.labels))
 
     def summary(self) -> str:
-        moves = " | ".join(str(m) for m in self.history) or "root"
+        moves = self.path or "root"
         flag = "" if self.is_optimal else "  NOT AT OPTIMUM"
         sep = (f"  separated={self.n_separated} "
                f"({self.n_separated_kc} in a KC block)") if self.n_separated else ""
@@ -407,7 +425,7 @@ class LFAResult:
             "is_optimal": [s.is_optimal for s in self.states],
             "n_separated": [s.n_separated for s in self.states],
             "found_at_iteration": [s.iteration for s in self.states],
-            "history": [" | ".join(str(m) for m in s.history) for s in self.states],
+            "history": [s.path for s in self.states],
         })
 
     def summary(self) -> str:
@@ -608,12 +626,9 @@ def screen(data: StepData, design: Design | None, touched: tuple[str, ...], *,
 
     if design is None:
         return "not identifiable"
-    if separation:
-        by_block = design.separated(data.y).by_block()
-        wanted = set(touched)
-        if any(name in wanted for block in ("kc_intercept", "kc_slope")
-               for name in by_block.get(block, ())):
-            return "separated"
+    if separation and not set(touched).isdisjoint(
+            design.separated(data.y).in_blocks("kc_intercept", "kc_slope")):
+        return "separated"
     return None
 
 
@@ -638,7 +653,7 @@ def _seed(design: Design, parent: tuple | None) -> np.ndarray | None:
         return None
     columns, weights = parent
     at = dict(zip(columns, weights))
-    out = np.zeros(design.matrix.shape[1])
+    out = np.zeros(design.n_params)
     for j, column in enumerate(design.columns):
         if column in at:
             out[j] = at[column]
@@ -648,6 +663,21 @@ def _seed(design: Design, parent: tuple | None) -> np.ndarray | None:
         if origin in at:
             out[j] = at[origin]
     return out
+
+
+def _state_design(data: StepData, steps: tuple[str, ...], labels: tuple[str, ...],
+                  learnsphere_compat: bool) -> tuple[StepData, Design | None]:
+    """``data`` under ``labels``, and the AFM design a search scores it with:
+    ``None`` when identification refuses the labelling."""
+    scored = relabel(data, steps, labels)
+    try:
+        return scored, build_afm_design(scored, learnsphere_compat=learnsphere_compat,
+                                        recompute_opportunities=False)
+    except ValueError:
+        # identify() refuses a rank deficiency it cannot attribute. On a
+        # machine-generated KC model that is a property of the move, not a
+        # modelling mistake, so it refuses the move rather than the search.
+        return scored, None
 
 
 def _evaluate(data: StepData, steps: tuple[str, ...], labels: tuple[str, ...],
@@ -662,16 +692,7 @@ def _evaluate(data: StepData, steps: tuple[str, ...], labels: tuple[str, ...],
     reads nothing the caller has not handed it, and returns a state that
     pickles.
     """
-    scored = relabel(data, steps, labels)
-    try:
-        design = build_afm_design(scored, learnsphere_compat=learnsphere_compat,
-                                  recompute_opportunities=False)
-    except ValueError:
-        # identify() refuses a rank deficiency it cannot attribute. On a
-        # machine-generated KC model that is a property of the move, not a
-        # modelling mistake, so it refuses the move rather than the search.
-        design = None
-
+    scored, design = _state_design(data, steps, labels, learnsphere_compat)
     if (reason := screen(scored, design, touched,
                          min_opportunities=min_opportunities,
                          separation=separation)) is not None:
@@ -680,17 +701,9 @@ def _evaluate(data: StepData, steps: tuple[str, ...], labels: tuple[str, ...],
     fit = fit_afm(design, scored.y, method=method, max_fun=max_fun,
                   w0=_seed(design, parent),
                   warn_not_converged=False, warn_separated=False)
-    by_block = fit.separated.by_block()
-    state = LFAState(
-        labels=labels, history=history, ll=fit.ll, aic=fit.aic, bic=fit.bic,
-        n_kcs=len(scored.kc_names), n_params=fit.n_params,
-        is_optimal=fit.is_optimal, n_separated=len(fit.separated),
-        n_separated_kc=(len(by_block.get("kc_intercept", ()))
-                        + len(by_block.get("kc_slope", ()))),
-        iteration=iteration, weights=fit.weights,
-        columns=tuple(design.columns),
-    )
-    return state, None
+    return LFAState._from_fit(fit, len(scored.kc_names), labels=labels, history=history,
+                              iteration=iteration, weights=fit.weights,
+                              columns=tuple(design.columns)), None
 
 
 # --------------------------------------------------------------------------
@@ -725,15 +738,6 @@ def _score_candidate(job: tuple) -> tuple:
         method=_WORKER["method"], max_fun=_WORKER["max_fun"])
 
 
-def _worker_count(n_jobs: int | None, n_tasks: int) -> int:
-    """joblib's convention: ``-1`` is every core, ``-2`` all but one."""
-    if n_jobs is None or n_jobs == 0:
-        return 1
-    if n_jobs < 0:
-        n_jobs = (os.cpu_count() or 1) + 1 + n_jobs
-    return max(1, min(n_jobs, n_tasks))
-
-
 def _open_pool(initargs: tuple, n_jobs: int | None):
     """A pool held open for the whole search, or ``None`` to score serially.
 
@@ -756,6 +760,48 @@ def _run_candidates(jobs: list[tuple], pool) -> list[tuple]:
     if pool is None:
         return [_score_candidate(job) for job in jobs]
     return list(pool.map(_score_candidate, jobs))
+
+
+def _children(parent: LFAState, factors: FactorMatrix, start: tuple[str, ...],
+              merges: str) -> list[tuple[tuple[str, ...], tuple[Move, ...], tuple[str, ...], str]]:
+    """Every state one move from ``parent``: its labels, its history, the KC
+    labels the move touched, and the move as a refusal records it, in the
+    order an expansion scores them.
+
+    Splits come first, every skill by every factor, then the merges ``merges``
+    offers. A move already on the parent's lineage is not offered again, and a
+    degenerate split, or a lineage undo whose replay is degenerate, not at all.
+    """
+    out = []
+    done = {(m.kind, m.skill, m.factor) for m in parent.history}
+    skills = sorted(set(parent.labels))
+    for skill in skills:
+        for factor, members in zip(factors.factors, factors.members):
+            if ("split", skill, factor) in done:
+                continue
+            child = split(parent.labels, factors.steps, skill, factor, members)
+            if child is not None:
+                move = Move("split", skill, factor)
+                out.append((child, (*parent.history, move),
+                            (f"{skill}{SPLIT_SEP}{factor}", skill), str(move)))
+    if merges in ("lineage", "both"):
+        for i, move in enumerate(parent.history):
+            if move.kind != "split":
+                continue
+            history = parent.history[:i] + parent.history[i + 1:]
+            try:
+                child = replay(history, factors, start)
+            except ValueError:
+                continue
+            out.append((child, history, tuple(sorted(set(child))), f"undo {move}"))
+    if merges in ("pairwise", "both"):
+        for i, left in enumerate(skills):
+            for right in skills[i + 1:]:
+                if ("merge", left, right) not in done:
+                    move = Move("merge", left, right)
+                    out.append((merge(parent.labels, left, right), (*parent.history, move),
+                                (MERGE_SEP.join(sorted((left, right))),), str(move)))
+    return out
 
 
 def lfa_search(data: StepData, factors: FactorMatrix, *,
@@ -853,7 +899,6 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
             "being fitted, or the searched labelling is undefined on some rows."
         )
 
-    at = dict(zip(factors.factors, factors.members))
     start = root_labels(factors, root)
     root, reason = _evaluate(
         data, factors.steps, start, (), None, 0,
@@ -873,16 +918,12 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
     # so no move can repair it and every state inherits a flat direction. Read
     # it once, at the root, and report it rather than letting it surface as an
     # unexplained ``separated=1`` on each state in turn.
-    root_design = build_afm_design(relabel(data, factors.steps, start),
-                                   learnsphere_compat=learnsphere_compat,
-                                   recompute_opportunities=False)
-    at_root = root_design.separated(data.y).columns
     kc_block = ("kc_intercept:", "kc_slope:")
-    persistent = tuple(c for c in at_root if not c.startswith(kc_block))
+    persistent = tuple(c for c in root.separated if not c.startswith(kc_block))
     # A KC separated at the root is a different matter: a later split can
     # divide its rows and remove the divergence, so it is not persistent — but
     # the screens never saw it, because a root is not a move.
-    at_root_kcs = tuple(c for c in at_root if c.startswith(kc_block))
+    at_root_kcs = tuple(c for c in root.separated if c.startswith(kc_block))
 
     # The source table is what makes a StepData large, and nothing a worker
     # does touches it: relabelling reads ``items``, opportunity counts read the
@@ -923,50 +964,13 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
             expanded.add(parent_key)
             iteration += 1
 
-            tried: list[tuple[tuple[str, ...], tuple[Move, ...], tuple[str, ...]]] = []
-            done = {(m.kind, m.skill, m.factor) for m in parent.history}
-            for skill in sorted(set(parent.labels)):
-                for factor in factors.factors:
-                    if ("split", skill, factor) in done:
-                        continue
-                    child = split(parent.labels, factors.steps, skill, factor,
-                                  at[factor])
-                    if child is None:
-                        continue
-                    move = Move("split", skill, factor)
-                    tried.append((child, (*parent.history, move),
-                                  (f"{skill}{SPLIT_SEP}{factor}", skill)))
-            if merges in ("lineage", "both"):
-                for i, move in enumerate(parent.history):
-                    if move.kind != "split":
-                        continue
-                    history = parent.history[:i] + parent.history[i + 1:]
-                    try:
-                        child = replay(history, factors, start)
-                    except ValueError:
-                        continue
-                    tried.append((child, history, tuple(sorted(set(child)))))
-            if merges in ("pairwise", "both"):
-                skills = sorted(set(parent.labels))
-                for i, left in enumerate(skills):
-                    for right in skills[i + 1:]:
-                        if ("merge", left, right) in done:
-                            continue
-                        child = merge(parent.labels, left, right)
-                        if child is None:  # pragma: no cover - both present
-                            continue
-                        move = Move("merge", left, right)
-                        joined = MERGE_SEP.join(sorted((left, right)))
-                        tried.append(
-                            (child, (*parent.history, move), (joined,)))
-
             # The parent is fixed for the whole expansion, so its coefficients are
             # the seed every child starts from — pulled out here rather than
             # shipping an LFAState to each worker.
             seed = ((parent.columns, parent.weights)
                     if warm_start and parent.weights is not None else None)
-            jobs, keys, queued = [], [], set()
-            for child, history, touched in tried:
+            jobs, keys, offered, queued = [], [], [], set()
+            for child, history, touched, move in _children(parent, factors, start, merges):
                 key = _partition(child)
                 if key in cache:
                     # Already scored. Re-offering it is what makes merge useful:
@@ -978,12 +982,13 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
                     continue        # two moves reaching one partition this round
                 queued.add(key)
                 keys.append(key)
+                offered.append(move)
                 jobs.append((child, history, touched, seed, iteration))
 
             scored = _run_candidates(jobs, pool)
-            for (_, history, *_), key, (state, reason) in zip(jobs, keys, scored):
+            for move, key, (state, reason) in zip(offered, keys, scored):
                 if state is None:
-                    moves.append(str(history[-1]) if history else "root")
+                    moves.append(move)
                     reasons.append(reason)
                     continue
                 cache[key] = state
@@ -1056,6 +1061,12 @@ class LFAValidation:
 
     def frame(self) -> pd.DataFrame:
         """One row per candidate: its in-sample criterion and its held-out RMSE."""
+        return self._table.copy()
+
+    @cached_property
+    def _table(self) -> pd.DataFrame:
+        """:meth:`frame`, built once for the properties and the summary that
+        read it."""
         per_seed = paired_scores(self.folds, self.convention)
         scores = per_seed.groupby("model", as_index=False).agg(
             cv_rmse=("rmse", "mean"),
@@ -1070,13 +1081,13 @@ class LFAValidation:
     @property
     def winner(self) -> str:
         """The model with the lowest held-out RMSE."""
-        frame = self.frame()
+        frame = self._table
         return str(frame.loc[frame["cv_rmse"].idxmin(), "model"])
 
     @property
     def agrees(self) -> bool:
         """Whether the criterion's pick also wins out of sample."""
-        frame = self.frame()
+        frame = self._table
         return bool(frame.loc[frame[self.heuristic].idxmin(), "model"] == self.winner)
 
     def rank_correlation(self) -> float:
@@ -1086,13 +1097,13 @@ class LFAValidation:
         candidates, not an inferential claim — with a handful of models and a
         handful of folds there is not enough to test.
         """
-        frame = self.frame()
+        frame = self._table
         if len(frame) < 3:
             return float("nan")
         return float(frame["search_rank"].corr(frame["cv_rank"], method="spearman"))
 
     def summary(self) -> str:
-        frame = self.frame()
+        frame = self._table
         best = frame.iloc[0]
         rho = self.rank_correlation()
         lines = [
@@ -1162,30 +1173,22 @@ def validate_top(result: LFAResult, data: StepData, *, n: int = 5,
         if state is None:
             fit = fit_afm(design, scored.y, method=method, max_fun=max_fun,
                           warn_not_converged=False, warn_separated=False)
-            state = LFAState(
-                labels=(), history=(), ll=fit.ll, aic=fit.aic, bic=fit.bic,
-                n_kcs=len(scored.kc_names), n_params=fit.n_params,
-                is_optimal=fit.is_optimal, n_separated=len(fit.separated))
+            state = LFAState._from_fit(fit, len(scored.kc_names), labels=(), history=())
         rows.append({
             "model": name, "depth": state.depth, "n_kcs": state.n_kcs,
             "n_params": state.n_params, "log_likelihood": state.ll,
             "aic": state.aic, "bic": state.bic,
             "is_optimal": state.is_optimal,
-            "history": " | ".join(str(m) for m in state.history),
+            "history": state.path,
         })
 
-    def design_for(state: LFAState) -> tuple[Design, StepData]:
-        scored = relabel(data, steps, state.labels)
-        return build_afm_design(scored, learnsphere_compat=compat,
-                                recompute_opportunities=False), scored
-
     if include_root:
-        design, scored = design_for(result.root)
+        scored, design = _state_design(data, steps, result.root.labels, compat)
         record("root", result.root, design, scored)
     for rank, state in enumerate(result.states[:n], start=1):
         if include_root and state.labels == result.root.labels:
             continue
-        design, scored = design_for(state)
+        scored, design = _state_design(data, steps, state.labels, compat)
         record(f"rank{rank}", state, design, scored)
     for name, authored in (extra or {}).items():
         if list(authored.items) != list(data.items):

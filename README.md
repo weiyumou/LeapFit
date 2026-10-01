@@ -23,16 +23,16 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 ```bash
 # Not on PyPI — install from a release tag:
-uv pip install "git+https://github.com/weiyumou/LeapFit@v0.6.0"
+uv pip install "git+https://github.com/weiyumou/LeapFit@v0.7.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync --extra dev    # or: uv pip install -e ".[dev]"
-uv run pytest          # 330 pass, 45 skip in ~28s; extras need R / reference-run artifacts
+uv run pytest          # 315 pass, 44 skip in ~16s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
-`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.6.0"` in its
+`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.7.0"` in its
 `dependencies` or in an extra. Two consequences worth knowing before you do:
 PyPI refuses distributions whose metadata carries a direct URL, so a package
 that is itself published to PyPI cannot declare leapfit this way even in an
@@ -292,6 +292,59 @@ producing compatible files from your own data.
   you need to match a published table; the default is the statistically clean
   variant. 
 
+## Recipes
+
+A few statistics take a line or two of code rather than a method of their own.
+Each needs only what every fit carries — `predict_proba`, `weights`, `design`,
+`ll_unpenalized`, `n_params` and `n_obs` — and the snippets continue the
+quickstart's `data`, `design` and `fit`:
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.special import expit
+
+p = fit.predict_proba(design)        # P(correct) per row, from any Design with the fit's columns
+brier = np.mean((data.y - p) ** 2)   # Brier score: mean squared error on the probability scale
+rmse = np.sqrt(brier)
+
+# AIC and BIC without the ridge. They differ from fit.aic and fit.bic only
+# when a block is penalized, as under learnsphere_compat=True.
+aic_unpenalized = -2 * fit.ll_unpenalized + 2 * fit.n_params
+bic_unpenalized = -2 * fit.ll_unpenalized + fit.n_params * np.log(fit.n_obs)
+
+# Every coefficient by block and column, and one block's rows of it.
+coefficients = pd.DataFrame({
+    "block": [b.name for b in fit.design.blocks for _ in b.columns],
+    "column": [c for b in fit.design.blocks for c in b.columns],
+    "estimate": fit.weights,
+})
+slopes = coefficients[coefficients["block"] == "kc_slope"]
+
+# Predictions from a bare sparse matrix with the fit's columns, in order.
+X = design.matrix
+p = expit(X @ fit.weights)
+```
+
+Held-out versions come from cross-validation. A fold's Brier score is its RMSE
+squared, and under the pooled convention so is the overall one:
+
+```python
+cv = cross_validate(design, data, scheme="item_blocked", convention="pooled")
+held_out_brier = cv.rmse ** 2
+per_fold_brier = cv.frame["rmse"] ** 2
+```
+
+A ridge on PFA's student intercepts is a block you build yourself:
+
+```python
+from leapfit import Block, Design, build_pfa_design, fit_pfa
+
+students = Block.from_levels("student", [(s,) for s in data.students], l2=1.0)
+ridged = Design((students, *build_pfa_design(data, identify=False).blocks)).identify()
+pfa = fit_pfa(ridged, data.y)
+```
+
 ## Roadmap
 
 | model | state | notes |
@@ -311,10 +364,10 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 330 pass, 45 skip, ~28s
+uv run pytest                                       # 315 pass, 44 skip, ~16s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
-LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 16 LKT equivalence tests
+LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 15 LKT equivalence tests
 ```
 
 The LKT fixture is built from the CRAN tarball rather than shipped, because the

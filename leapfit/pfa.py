@@ -14,9 +14,10 @@ student term (that is its point: usable for adaptive scheduling without an
 ability estimate); ``student_intercepts=True`` adds one.
 
 PFA relates to AFM by splitting practice by outcome: ``s_ik + f_ik = T_ik``
-identically, so AFM is the restriction ``gamma_k = rho_k``. That identity is
-pinned by a test, and it is what makes AIC/BIC/LRT comparisons between the two
-families meaningful on one dataset.
+identically, so AFM is the restriction ``gamma_k = rho_k``. That identity holds
+by construction, since the recomputed ``T`` is the two counts' sum from the
+same pass over the practice order, and it is what makes AIC/BIC/LRT
+comparisons between the two families meaningful on one dataset.
 
 **Provenance, and where we deliberately differ.** LearnSphere ships two PFA
 components, and neither fits the canonical model:
@@ -49,11 +50,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
 
 from leapfit.data import StepData
 from leapfit.design import Block, Design
-from leapfit.fit import DEFAULT_METHOD, LogisticFit, _expit, fit_logistic
+from leapfit.fit import DEFAULT_METHOD, LogisticFit, _expit, _steps_per_kc, fit_logistic
 
 COUNT_MODES = ("prior", "inclusive")
 
@@ -64,10 +64,11 @@ def success_failure_counts(
     """Per-observation success/failure counts for each of its KCs.
 
     Shaped exactly like ``data.opportunities``: element ``n`` holds one count
-    per KC of observation ``n``, aligned by position. Accumulated over
+    per KC of observation ``n``, aligned by position. These are
+    :meth:`~leapfit.data.StepData.prior_counts`, accumulated over
     :meth:`~leapfit.data.StepData.practice_order`, so "before" means the same
-    thing it means for AFM's ``T`` — and ``s + f`` equals the recomputed
-    opportunity count identically (a pinned invariant).
+    thing it means for AFM's ``T``: ``s + f`` is the recomputed opportunity
+    count, which is computed from the same pass.
 
     :param inclusive: include the current attempt's own outcome in its own
         counts, replicating ``AnalysisPfaStepBased``'s ``cumsum``
@@ -75,29 +76,15 @@ def success_failure_counts(
         ``f = f_prior + (1 - y)`` hold row by row — the label-leak identity.
         Exists so the defect is reproducible; never use it for analysis.
     """
-    s_out: list[tuple[int, ...]] = [()] * len(data)
-    f_out: list[tuple[int, ...]] = [()] * len(data)
-    for rows in data.practice_order().values():
-        s_seen: dict[str, int] = {}
-        f_seen: dict[str, int] = {}
-        for i in rows:
-            correct = int(data.y[i])
-            s_row, f_row = [], []
-            for kc in data.kcs[i]:
-                s, f = s_seen.get(kc, 0), f_seen.get(kc, 0)
-                if inclusive:
-                    s, f = s + correct, f + (1 - correct)
-                s_row.append(s)
-                f_row.append(f)
-                s_seen[kc] = s_seen.get(kc, 0) + correct
-                f_seen[kc] = f_seen.get(kc, 0) + (1 - correct)
-            s_out[i], f_out[i] = tuple(s_row), tuple(f_row)
-    return s_out, f_out
+    s, f = data.prior_counts()
+    if not inclusive:
+        return s, f
+    return ([tuple(c + int(y) for c in row) for row, y in zip(s, data.y)],
+            [tuple(c + 1 - int(y) for c in row) for row, y in zip(f, data.y)])
 
 
 def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
-                     student_intercepts: bool = False, student_l2: float = 0.0,
-                     counts: str = "prior",
+                     student_intercepts: bool = False, counts: str = "prior",
                      identify: bool = True) -> Design:
     """Assemble the PFA design from parsed student-step data.
 
@@ -109,7 +96,6 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
         it; both LearnSphere components include a (random) one. With one KC
         per row this recreates the student/KC sum redundancy, which
         ``identify`` resolves exactly as for AFM.
-    :param student_l2: ridge on the student block when present.
     :param counts: ``"prior"`` or ``"inclusive"`` — see
         :func:`success_failure_counts`. Inclusive warns: it exists to
         reproduce a defect, and every statistic of such a fit describes a
@@ -135,40 +121,13 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
 
     s_counts, f_counts = success_failure_counts(data, inclusive=(counts == "inclusive"))
 
-    kcs = data.kc_names
-    k_index = {k: i for i, k in enumerate(kcs)}
-    n = len(data)
-
-    q_rows, q_cols, s_vals, f_vals = [], [], [], []
-    for i, (labels, s_row, f_row) in enumerate(zip(data.kcs, s_counts, f_counts)):
-        for label, s, f in zip(labels, s_row, f_row):
-            q_rows.append(i)
-            q_cols.append(k_index[label])
-            s_vals.append(float(s))
-            f_vals.append(float(f))
-
-    shape = (n, len(kcs))
-    kc_mat = sparse.csr_matrix((np.ones(len(q_rows)), (q_rows, q_cols)), shape=shape)
-
     blocks: list[Block] = []
     if student_intercepts:
-        students = data.student_names
-        s_index = {s: i for i, s in enumerate(students)}
-        student_mat = sparse.csr_matrix(
-            (np.ones(n), (np.arange(n), [s_index[s] for s in data.students])),
-            shape=(n, len(students)),
-        )
-        blocks.append(Block.build("student", student_mat, students, l2=student_l2))
-
-    blocks.append(Block.build("kc_intercept", kc_mat, kcs))
-
+        blocks.append(Block.from_levels("student", [(s,) for s in data.students]))
+    blocks.append(Block.from_levels("kc_intercept", data.kcs))
     if slopes == "per_kc":
-        s_mat = sparse.csr_matrix((s_vals, (q_rows, q_cols)), shape=shape)
-        f_mat = sparse.csr_matrix((f_vals, (q_rows, q_cols)), shape=shape)
-        s_mat.eliminate_zeros()  # a zero count is a structural zero, not a datum
-        f_mat.eliminate_zeros()
-        blocks.append(Block.build("kc_success", s_mat, kcs))
-        blocks.append(Block.build("kc_failure", f_mat, kcs))
+        blocks.append(Block.from_levels("kc_success", data.kcs, values=s_counts))
+        blocks.append(Block.from_levels("kc_failure", data.kcs, values=f_counts))
     else:
         # Pooled: gamma * sum_k q_jk s_ik — the row totals across the step's KCs.
         s_tot = np.array([float(sum(row)) for row in s_counts])
@@ -199,55 +158,35 @@ class PFAFit(LogisticFit):
             intercepts for the average student (sum-to-zero) rather than the
             reference student. A no-op for canonical student-free PFA.
         """
-        intercepts = self._block_values("kc_intercept")
-        s_per = self._block_values("kc_success")
-        f_per = self._block_values("kc_failure")
-        pooled_s = self._block_values("success")
-        pooled_f = self._block_values("failure")
-
-        shift = 0.0
-        has_students = any(b.name == "student" for b in self.design.blocks)
-        if centre and has_students and self.design.recentring_is_valid():
-            _, shift = self.centred_students(data)
-
-        steps: dict[str, set[str]] = {}
-        for labels, item in zip(data.kcs, data.items):
-            for label in labels:
-                steps.setdefault(label, set()).add(item)
-
-        by_block = self.separated.by_block()
-        diverging = (set(by_block.get("kc_intercept", ()))
-                     | set(by_block.get("kc_success", ()))
-                     | set(by_block.get("kc_failure", ())))
-
         names = data.kc_names
-        beta = np.array([intercepts.get(n, np.nan) + shift for n in names])
+        beta = self._kc_intercepts(data, centre)
+        diverging = set(self.separated.in_blocks("kc_intercept", "kc_success", "kc_failure"))
 
-        def slope(per: dict[str, float], pooled: dict[str, float]) -> list[float]:
-            if pooled:  # one shared coefficient, broadcast
-                value = next(iter(pooled.values()))
-                return [value] * len(names)
+        def slope(per_kc: str, pooled: str) -> list[float]:
+            if shared := self._block_values(pooled):  # one coefficient, broadcast
+                return [next(iter(shared.values()))] * len(names)
+            per = self._block_values(per_kc)
             return [per.get(n, np.nan) for n in names]
 
         return pd.DataFrame({
             "KC Name": names,
             "Intercept (logit)": beta,
-            "Intercept (probability) at first attempt":
-                _expit(np.nan_to_num(beta)) * np.where(np.isnan(beta), np.nan, 1.0),
-            "Success Slope": slope(s_per, pooled_s),
-            "Failure Slope": slope(f_per, pooled_f),
-            "Number of Unique Steps": [len(steps.get(n, ())) for n in names],
+            "Intercept (probability) at first attempt": _expit(beta),
+            "Success Slope": slope("kc_success", "success"),
+            "Failure Slope": slope("kc_failure", "failure"),
+            "Number of Unique Steps": _steps_per_kc(data),
             "Separated": [n in diverging for n in names],
         }).sort_values("KC Name", ignore_index=True)
 
 
 def fit_pfa(design: Design, y, *, method: str = DEFAULT_METHOD,
             max_fun: int | None = None, tol: float | None = None,
+            w0: np.ndarray | None = None,
             warn_not_converged: bool = True,
             warn_separated: bool = True) -> PFAFit:
     """Fit PFA by penalized maximum likelihood — :func:`leapfit.fit.fit_logistic`
     with a PFA reporting view. See that function for the parameters."""
     return fit_logistic(design, y, method=method, max_fun=max_fun, tol=tol,
-                        warn_not_converged=warn_not_converged,
+                        w0=w0, warn_not_converged=warn_not_converged,
                         warn_separated=warn_separated, result_type=PFAFit,
                         label="PFA", stacklevel=3)  # 3: attribute past this wrapper

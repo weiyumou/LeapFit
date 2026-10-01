@@ -36,11 +36,16 @@ from __future__ import annotations
 from collections.abc import Sequence, Sized
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import chain
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.sparse import csgraph
+
+#: The block identification takes a reference level from first. A student, not
+#: a KC, because the KC intercepts are the reported output; see Design.identify.
+_PREFER_DROP = "student"
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,31 @@ class Block:
             lower=np.full(n, float(lower)),
             upper=np.full(n, float(upper)),
         )
+
+    @classmethod
+    def from_levels(cls, name: str, labels: Sequence[Sequence[str]], *,
+                    values: Sequence[Sequence[float]] | None = None, l2: float = 0.0,
+                    lower: float = -np.inf, upper: float = np.inf) -> Block:
+        """One column per level, sorted, and row ``n``'s entries in the columns
+        of ``labels[n]``.
+
+        A factor gives each row one label, such as its student; a multi-KC
+        step gives it several. ``values[n]`` are the entries, aligned with
+        ``labels[n]`` by position, and default to 1: an indicator for each
+        label, or with values a count per label. A zero value is a structural
+        zero rather than a datum, so it is not stored.
+        """
+        flat = list(chain.from_iterable(labels))
+        levels = sorted(set(flat))
+        lengths = np.fromiter(map(len, labels), dtype=np.intp, count=len(labels))
+        entries = (np.ones(len(flat)) if values is None else
+                   np.fromiter(chain.from_iterable(values), dtype=float, count=len(flat)))
+        matrix = sparse.csr_matrix(
+            (entries, (np.repeat(np.arange(len(labels)), lengths),
+                       pd.Index(levels).get_indexer(flat))),
+            shape=(len(labels), len(levels)))
+        matrix.eliminate_zeros()
+        return cls.build(name, matrix, levels, l2=l2, lower=lower, upper=upper)
 
     def keep(self, mask: np.ndarray) -> Block:
         """Column subset, preserving labels, penalty, and bounds."""
@@ -113,20 +143,10 @@ class Block:
 
 
 @dataclass(frozen=True)
-class Aliased:
-    """Columns removed from a design because they are not estimable.
-
-    ``columns`` are fully-qualified (``"kc_slope:KC-17"``) and ``reasons``
-    parallel them. A dropped column carries no information: it is either
-    identically zero or an exact linear combination of the columns kept, so
-    removing it leaves every fitted value unchanged while making the
-    parameter count honest. This is what R's ``glm`` does when it reports
-    coefficients as ``NA`` "because of singularities" and uses the rank for
-    its degrees of freedom.
-    """
+class _Columns:
+    """Fully-qualified column names (``"kc_slope:KC-17"``), read block by block."""
 
     columns: tuple[str, ...] = ()
-    reasons: tuple[str, ...] = ()
 
     def __len__(self) -> int:
         return len(self.columns)
@@ -138,16 +158,39 @@ class Aliased:
             out.setdefault(block, []).append(col)
         return out
 
-    def summary(self) -> str:
-        if not self.columns:
-            return "no aliased columns"
-        counts = {b: len(v) for b, v in self.by_block().items()}
-        detail = ", ".join(f"{n} from {b}" for b, n in sorted(counts.items()))
-        return f"{len(self)} aliased column(s) dropped ({detail})"
+    def in_blocks(self, *blocks: str) -> list[str]:
+        """The columns in any of ``blocks``, named as within their block."""
+        by_block = self.by_block()
+        return [col for block in blocks for col in by_block.get(block, ())]
+
+    def _per_block(self) -> str:
+        """How many columns each block has here, blocks in name order."""
+        return ", ".join(f"{len(v)} from {b}" for b, v in sorted(self.by_block().items()))
 
 
 @dataclass(frozen=True)
-class Separated:
+class Aliased(_Columns):
+    """Columns removed from a design because they are not estimable.
+
+    ``columns`` are fully-qualified (``"kc_slope:KC-17"``) and ``reasons``
+    parallel them. A dropped column carries no information: it is either
+    identically zero or an exact linear combination of the columns kept, so
+    removing it leaves every fitted value unchanged while making the
+    parameter count honest. This is what R's ``glm`` does when it reports
+    coefficients as ``NA`` "because of singularities" and uses the rank for
+    its degrees of freedom.
+    """
+
+    reasons: tuple[str, ...] = ()
+
+    def summary(self) -> str:
+        if not self.columns:
+            return "no aliased columns"
+        return f"{len(self)} aliased column(s) dropped ({self._per_block()})"
+
+
+@dataclass(frozen=True)
+class Separated(_Columns):
     """Columns whose maximum-likelihood estimate runs off to infinity.
 
     Distinct from :class:`Aliased`, and the difference matters. An aliased
@@ -162,27 +205,13 @@ class Separated:
     ``+inf``, ``-1`` to ``-inf``.
     """
 
-    columns: tuple[str, ...] = ()
     directions: tuple[int, ...] = ()
-
-    def __len__(self) -> int:
-        return len(self.columns)
-
-    def by_block(self) -> dict[str, list[str]]:
-        out: dict[str, list[str]] = {}
-        for full in self.columns:
-            block, _, col = full.partition(":")
-            out.setdefault(block, []).append(col)
-        return out
 
     def summary(self) -> str:
         if not self.columns:
             return "no separated columns"
-        counts = {b: len(v) for b, v in self.by_block().items()}
-        detail = ", ".join(f"{n} from {b}" for n, b in
-                           ((n, b) for b, n in sorted(counts.items())))
         up = sum(d > 0 for d in self.directions)
-        return (f"{len(self)} column(s) with no finite MLE ({detail}); "
+        return (f"{len(self)} column(s) with no finite MLE ({self._per_block()}); "
                 f"{up} diverge to +inf, {len(self) - up} to -inf")
 
 
@@ -217,6 +246,10 @@ class Design:
         """
         return sum(b.matrix.shape[1] for b in self.blocks)
 
+    def get(self, name: str) -> Block | None:
+        """The block called ``name``, or ``None`` if the design has none."""
+        return next((b for b in self.blocks if b.name == name), None)
+
     @property
     def matrix(self) -> sparse.csr_matrix:
         return sparse.hstack([b.matrix for b in self.blocks], format="csr")
@@ -226,11 +259,21 @@ class Design:
         return np.concatenate([b.l2 for b in self.blocks])
 
     @property
+    def lower(self) -> np.ndarray:
+        """Each coefficient's lower bound, ``-inf`` where it has none."""
+        return np.concatenate([b.lower for b in self.blocks])
+
+    @property
+    def upper(self) -> np.ndarray:
+        """Each coefficient's upper bound, ``inf`` where it has none."""
+        return np.concatenate([b.upper for b in self.blocks])
+
+    @property
     def bounds(self) -> list[tuple[float | None, float | None]]:
-        lo = np.concatenate([b.lower for b in self.blocks])
-        hi = np.concatenate([b.upper for b in self.blocks])
+        """:attr:`lower` and :attr:`upper` as ``(min, max)`` pairs, ``None``
+        where unbounded."""
         return [(None if np.isneginf(a) else a, None if np.isposinf(b) else b)
-                for a, b in zip(lo, hi)]
+                for a, b in zip(self.lower, self.upper)]
 
     @property
     def columns(self) -> list[str]:
@@ -268,7 +311,7 @@ class Design:
         """
         return Design(self.blocks + tuple(extra), self.aliased)
 
-    def rank(self, tol: float | None = None) -> int:
+    def rank(self) -> int:
         """Numerical rank of the design, via the column-scaled Gram matrix.
 
         Scaling to unit column norm first is not optional. An opportunity
@@ -287,8 +330,7 @@ class Design:
         D = sparse.diags(1.0 / norms)
         gram = ((X @ D).T @ (X @ D)).toarray()
         ev = np.linalg.eigvalsh(gram)
-        if tol is None:
-            tol = max(self.n_obs, gram.shape[0]) * np.finfo(float).eps * max(ev.max(), 0.0)
+        tol = max(self.n_obs, gram.shape[0]) * np.finfo(float).eps * max(ev.max(), 0.0)
         return int((ev > tol).sum())
 
     def separated(self, y) -> Separated:
@@ -342,7 +384,7 @@ class Design:
             tuple(1 if rises[j] else -1 for j in idx),
         )
 
-    def identify(self, *, prefer_drop: str = "student", check: bool = True) -> Design:
+    def identify(self) -> Design:
         """Drop columns that are not estimable, so ``n_params == rank(X)``.
 
         Three sources of aliasing are removed, all exactly rather than
@@ -366,8 +408,8 @@ class Design:
            Deliberately *within* a block only. A whole block that duplicates
            another — an accumulator or hierarchical-parent term collinear with
            what is already there, or one factor entered twice under two names —
-           is a modelling error, not a property of the data, and still raises
-           under ``check``. A factor *nested* in another, items within KCs, is
+           is a modelling error, not a property of the data, and still
+           raises. A factor *nested* in another, items within KCs, is
            a property of the data, and is identified under point 3 — provided
            the coarser factor is declared first. Declared after the levels it
            groups, it is the hierarchical parent just described: the finer
@@ -397,13 +439,13 @@ class Design:
            With three or more blocks the pairwise dependencies overlap —
            three crossed blocks carry two, not three — so the columns to drop
            are chosen by exact elimination over them rather than one per
-           dependency: ``prefer_drop`` first, then the latest-declared blocks,
-           each from its last level back, so that the earliest block in the
-           design keeps every level. Exactly as many columns go as the
+           dependency: the student block first, then the latest-declared
+           blocks, each from its last level back, so that the earliest block
+           in the design keeps every level. Exactly as many columns go as the
            dependencies span, and with two blocks this is one per component.
-           A block other than ``prefer_drop`` that this would take whole is
+           A block other than the student block that this would take whole is
            the collinear block of point 2, and is refused rather than
-           dropped. ``prefer_drop`` alone may go whole: a cohort of one
+           dropped. The student block alone may go whole: a cohort of one
            student gives up its only student, as it always has.
 
         A student is dropped rather than a KC because the KC intercepts are
@@ -417,58 +459,32 @@ class Design:
         levels stay comparable only within a component — nothing in the data
         relates two cohorts that never met the same material.
 
-        :param check: verify numerically that the result is full rank, and
-            raise if it is not, or if it would drop a whole block. Leave this
-            on: it is the guard that catches aliasing introduced by blocks
-            added later.
+        Finally the result is checked numerically: a design that is still not
+        full rank raises. That is the guard that catches aliasing introduced
+        by blocks added later.
         """
-        keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
-        dropped, reasons = [], []
+        dead = [(b.name, j, "column is identically zero (not estimable)")
+                for b in self.blocks
+                for j in np.flatnonzero(np.asarray((b.matrix != 0).sum(axis=0)).ravel() == 0)]
+        repeated = [(b.name, j, f"duplicate of {b.name}:{b.columns[first]}")
+                    for b in self.blocks for j, first in b.duplicate_columns()]
+        reduced = self._without(dead + repeated)
+        identified = reduced._drop_reference_levels()
 
-        for b in self.blocks:
-            nnz = np.asarray((b.matrix != 0).sum(axis=0)).ravel()
-            for j in np.flatnonzero(nnz == 0):
-                keep[b.name][j] = False
-                dropped.append(f"{b.name}:{b.columns[j]}")
-                reasons.append("column is identically zero (not estimable)")
-
-        for b in self.blocks:
-            for j, first in b.duplicate_columns():
-                keep[b.name][j] = False
-                dropped.append(f"{b.name}:{b.columns[j]}")
-                reasons.append(f"duplicate of {b.name}:{b.columns[first]}")
-
-        reduced = Design(
-            tuple(b.keep(keep[b.name]) for b in self.blocks),
-            Aliased(tuple(self.aliased.columns) + tuple(dropped),
-                    tuple(self.aliased.reasons) + tuple(reasons)),
-        )
-        identified = reduced._drop_reference_levels(prefer_drop, check=check)
-
-        if check:
-            r = identified.rank()
-            if r != identified.n_params:
-                if repeated := reduced._coinciding_pairs():
-                    named = "; ".join(f"{a} and {b}" for a, b in repeated)
-                    raise ValueError(
-                        f"Design still rank-deficient after identification: "
-                        f"{identified.n_params} columns, rank {r}. {named} partition "
-                        f"the rows identically — one factor under two names — and a "
-                        f"repeated factor is refused rather than one copy of it "
-                        f"silently dropped. Keep one of them."
-                    )
-                raise ValueError(
-                    f"Design still rank-deficient after identification: "
-                    f"{identified.n_params} columns, rank {r}. Either a block added to "
-                    f"this design is collinear with the others, or the KC model "
-                    f"carries a dependency this pass does not model exactly — a KC "
-                    f"that tags every row of its component, say. Drop or "
-                    f"reparameterize the offending columns before fitting, or "
-                    f"AIC/BIC will count parameters that do not exist."
-                )
+        r = identified.rank()
+        if r != identified.n_params:
+            raise ValueError(
+                f"Design still rank-deficient after identification: "
+                f"{identified.n_params} columns, rank {r}. Either a block added to "
+                f"this design is collinear with the others, or the KC model "
+                f"carries a dependency this pass does not model exactly — a KC "
+                f"that tags every row of its component, say. Drop or "
+                f"reparameterize the offending columns before fitting, or "
+                f"AIC/BIC will count parameters that do not exist."
+            )
         return identified
 
-    def _drop_reference_levels(self, prefer_drop: str, *, check: bool = True) -> Design:
+    def _drop_reference_levels(self) -> Design:
         """Break every sum redundancy, on the columns that survive.
 
         Deliberately decided *after* dead and duplicate columns are gone: a row
@@ -486,11 +502,12 @@ class Design:
         smallest redundancy it takes part in, the one it most specifically
         stands for.
 
-        Under ``check``, a block other than ``prefer_drop`` that would lose
-        every column raises instead, naming the blocks those drops are
+        A block other than the student block that would lose every column
+        raises instead, naming the blocks those drops are
         reported against: they span it, so it is not a factor with a reference
-        level but a block that adds nothing — a parent declared after the
-        levels it groups.
+        level but a block that adds nothing: a parent declared after the
+        levels it groups, or one factor entered a second time under another
+        name.
         """
         redundancies = self._sum_redundancies()
         if not redundancies:
@@ -505,14 +522,13 @@ class Design:
                     vectors.setdefault((name, int(j)), {})[k] = Fraction(weight)
         support = [sum(map(len, r.columns)) for r in redundancies]
 
-        by_name = {b.name: b for b in self.blocks}
         involved = [b.name for b in self.blocks
                     if any(b.name in r.blocks for r in redundancies)]
         basis: dict[int, dict[int, Fraction]] = {}
         seen: set[frozenset] = set()
         drops = []
-        for name in self._drop_order(involved, prefer_drop):
-            for j in range(by_name[name].matrix.shape[1] - 1, -1, -1):
+        for name in self._drop_order(involved):
+            for j in range(self.get(name).matrix.shape[1] - 1, -1, -1):
                 vector = vectors.get((name, j))
                 if not vector or (key := frozenset(vector.items())) in seen:
                     continue  # in no redundancy, or identical to a column visited
@@ -522,46 +538,49 @@ class Design:
                     basis[pivot] = {k: v / residual[pivot] for k, v in residual.items()}
                     drops.append((min(vector, key=lambda k: (support[k], k)), name, j))
 
-        if check:
-            spanned_by: dict[str, set[str]] = {}
-            for k, name, _ in drops:
-                spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
-            for name, blocks in spanned_by.items():
-                taken = sum(drop[1] == name for drop in drops)
-                if name != prefer_drop and taken == by_name[name].matrix.shape[1]:
-                    raise ValueError(_whole_block_refusal(
-                        name, [b for b in by_name if b in blocks and b != name]))
+        spanned_by: dict[str, set[str]] = {}
+        for k, name, _ in drops:
+            spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
+        for name, blocks in spanned_by.items():
+            taken = sum(drop[1] == name for drop in drops)
+            if name != _PREFER_DROP and taken == self.get(name).matrix.shape[1]:
+                raise ValueError(_whole_block_refusal(
+                    name, [b.name for b in self.blocks
+                           if b.name in blocks and b.name != name]))
 
+        return self._without([
+            (name, j, _reference_reason(list(redundancies[k].blocks), redundancies[k].label,
+                                        redundancies[k].n_components))
+            for k, name, j in sorted(drops, key=lambda drop: drop[0])])
+
+    def _without(self, drops: list[tuple[str, int, str]]) -> Design:
+        """This design less the ``(block, column index, reason)`` drops, each
+        recorded in :attr:`aliased` in the order given."""
         keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
-        dropped, reasons = [], []
-        for k, name, j in sorted(drops, key=lambda drop: drop[0]):
+        for name, j, _ in drops:
             keep[name][j] = False
-            dropped.append(f"{name}:{by_name[name].columns[j]}")
-            redundancy = redundancies[k]
-            reasons.append(_reference_reason(list(redundancy.blocks), redundancy.label,
-                                             redundancy.n_components))
         return Design(
-            tuple(b.keep(keep[b.name]) if not keep[b.name].all() else b
-                  for b in self.blocks),
-            Aliased(tuple(self.aliased.columns) + tuple(dropped),
-                    tuple(self.aliased.reasons) + tuple(reasons)),
+            tuple(b if keep[b.name].all() else b.keep(keep[b.name]) for b in self.blocks),
+            Aliased(self.aliased.columns
+                    + tuple(f"{name}:{self.get(name).columns[j]}" for name, j, _ in drops),
+                    self.aliased.reasons + tuple(reason for _, _, reason in drops)),
         )
 
     @staticmethod
-    def _drop_order(names: list[str], prefer_drop: str) -> list[str]:
+    def _drop_order(names: list[str]) -> list[str]:
         """Which blocks give up a level first.
 
-        ``prefer_drop`` leads where it applies, and the rest follow
+        The student block leads where it applies, and the rest follow
         latest-declared first, so the block a specification names earliest is
         the one left whole. For an AFM design that is exactly the old rule —
         drop a student, keep every KC — and it generalizes the reason for it
         rather than the two block names it was written in.
         """
-        ordered = [n for n in names if n == prefer_drop]
-        return ordered + [n for n in reversed(names) if n != prefer_drop]
+        ordered = [n for n in names if n == _PREFER_DROP]
+        return ordered + [n for n in reversed(names) if n != _PREFER_DROP]
 
     def _row_sums(self, name: str) -> np.ndarray | None:
-        b = next((x for x in self.blocks if x.name == name), None)
+        b = self.get(name)
         return None if b is None else np.asarray(b.matrix.sum(axis=1)).ravel()
 
     def kc_per_row(self) -> float | None:
@@ -586,18 +605,6 @@ class Design:
                 out.append(b.name)
         return out
 
-    def _has_sum_redundancy(self) -> bool:
-        """Whether any two blocks span the same direction over some rows.
-
-        Every row carries exactly one student, so the student columns sum to
-        the all-ones vector. If every row also carries the *same* number ``m``
-        of KCs, the KC-intercept columns sum to ``m * 1``, and the two blocks
-        are linearly dependent whatever ``m`` is — not only for the usual
-        one-KC-per-row partition. Nothing here is specific to those two blocks;
-        see :meth:`_sum_redundancies`.
-        """
-        return bool(self._sum_redundancies())
-
     def row_components(self, names: Sequence[str] | None = None) -> np.ndarray:
         """Component label per row, from the graph over some blocks' levels.
 
@@ -616,8 +623,7 @@ class Design:
         if len(names) < 2:
             return np.zeros(self.n_obs, dtype=np.int64)
 
-        by_name = {b.name: b for b in self.blocks}
-        incidence = sparse.hstack([by_name[n].matrix for n in names], format="csr")
+        incidence = sparse.hstack([self.get(n).matrix for n in names], format="csr")
         incidence = (incidence != 0).astype(np.int8)
         n_rows = incidence.shape[0]
         graph = sparse.bmat([[None, incidence], [incidence.T, None]], format="csr")
@@ -633,7 +639,7 @@ class Design:
         the first stored row decides it. Empty columns get ``-1`` and match no
         component.
         """
-        M = next(b for b in self.blocks if b.name == name).matrix.tocsc()
+        M = self.get(name).matrix.tocsc()
         starts, ends = M.indptr[:-1], M.indptr[1:]
         out = np.full(M.shape[1], -1, dtype=np.int64)
         occupied = starts < ends
@@ -666,17 +672,10 @@ class Design:
         sort rather than one scan per component, so this stays linear-ish
         however many components there are — a design where no two students
         share an item has as many components as students.
-
-        Two blocks that partition the rows identically are left out: that is
-        one factor under two names, a mistake in the specification rather than
-        a property of the data, and :meth:`identify` refuses it rather than
-        silently dropping one of them whole.
         """
         sums = {name: self._row_sums(name) for name in self._covering_blocks()}
         out = []
         for first, second, rows, n_components, columns in self._pair_graphs():
-            if _coincide(n_components, columns):
-                continue
             for label, group in _members(rows).items():
                 a, b = sums[first][group], sums[second][group]
                 if np.allclose(a, a[0]) and np.allclose(b, b[0]):
@@ -686,11 +685,6 @@ class Design:
                         (columns[0].get(label, empty), columns[1].get(label, empty)),
                         (float(b[0]), -float(a[0]))))
         return out
-
-    def _coinciding_pairs(self) -> list[tuple[str, str]]:
-        """Pairs of covering blocks that partition the rows identically."""
-        return [(first, second) for first, second, _, n_components, columns
-                in self._pair_graphs() if _coincide(n_components, columns)]
 
     def recentring_is_valid(self) -> bool:
         """Whether shifting students into KC intercepts leaves predictions fixed.
@@ -723,12 +717,14 @@ def _whole_block_refusal(name: str, spanning: list[str]) -> str:
     """Why a block that identification would drop whole is refused instead."""
     return (
         f"{name} adds nothing to this design: every column of it lies in the span "
-        f"of {' and '.join(spanning)}, the way a parent block's columns are sums of "
-        f"the levels it groups, so identification would drop it whole. A block "
+        f"of {' and '.join(spanning)}, so identification would drop it whole. It "
+        f"is either a factor already in the design under another name, or a parent "
+        f"block whose columns are sums of the levels it groups, and a block "
         f"collinear with what is already there is refused rather than silently "
-        f"dropped. Remove it; or, to keep it, declare it before the finer blocks, "
-        f"which then give up one reference level per level of {name} instead; and "
-        f"where a ridge is what identifies the hierarchy, leave identification out."
+        f"dropped. Remove it; or, to keep a parent, declare it before the finer "
+        f"blocks, which then give up one reference level per level of {name} "
+        f"instead; and where a ridge is what identifies the hierarchy, leave "
+        f"identification out."
     )
 
 
@@ -754,19 +750,6 @@ def _members(labels: np.ndarray) -> dict[int, np.ndarray]:
     order = np.argsort(labels, kind="stable")
     groups = np.split(order, np.flatnonzero(np.diff(labels[order])) + 1)
     return {int(labels[g[0]]): g for g in groups if g.size and labels[g[0]] >= 0}
-
-
-def _coincide(n_components: int, columns: tuple[dict, dict]) -> bool:
-    """Whether a pair's graph pairs every level of one block with exactly one of
-    the other's — the same partition of the rows, under two sets of names.
-
-    One component does not count: a single student and a single KC are two
-    constant columns, and that is the ordinary reference level, not a
-    repeated factor.
-    """
-    return n_components > 1 and all(
-        len(columns[0].get(label, ())) == len(columns[1].get(label, ())) == 1
-        for label in range(n_components))
 
 
 def _reduce(vector: dict[int, Fraction],
@@ -820,11 +803,3 @@ def accumulator_block(data: Sized, values: np.ndarray, *,
                          else [f"{name}_{i}" for i in range(acc.shape[1])])
     return Block.build(name, acc, labels, l2=l2)
 
-
-def coefficient_frame(design: Design, weights: np.ndarray) -> pd.DataFrame:
-    """Fitted weights as a tidy table of (block, column, estimate)."""
-    return pd.DataFrame({
-        "block": [b.name for b in design.blocks for _ in b.columns],
-        "column": [c for b in design.blocks for c in b.columns],
-        "estimate": weights,
-    })

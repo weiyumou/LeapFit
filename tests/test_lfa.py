@@ -20,10 +20,7 @@ instead would have passed all three.
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
-import pandas as pd
 import pytest
 
 from leapfit import build_afm_design, fit_afm, from_frame, load_student_step
@@ -31,7 +28,9 @@ from leapfit.lfa import (
     HEURISTICS,
     MERGES,
     FactorMatrix,
+    LFAState,
     Move,
+    _children,
     build_factor_matrix,
     lfa_search,
     merge,
@@ -43,30 +42,11 @@ from leapfit.lfa import (
 )
 from leapfit.lfa import _partition as partition
 
-EXAMPLE = "examples/student-step.txt"
-
+from helpers import EXAMPLE, attempts, mixed, rollup, step_data
 
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
-
-
-def _frame(rows, kc_model="F"):
-    return pd.DataFrame(rows).rename(
-        columns={"kc": f"KC ({kc_model})", "opp": f"Opportunity ({kc_model})"})
-
-
-def _attempts(student, step, kc, outcomes):
-    """One student's repeated attempts at one step, in practice order."""
-    return [{"Anon Student Id": student, "Problem Name": "p", "Step Name": step,
-             "First Attempt": outcome, "kc": kc, "opp": str(i + 1)}
-            for i, outcome in enumerate(outcomes)]
-
-
-def _mixed(student, step, kc, n):
-    """``n`` attempts alternating correct/incorrect — never separated."""
-    return _attempts(student, step, kc,
-                     ["correct" if i % 2 else "incorrect" for i in range(n)])
 
 
 def _screen_data():
@@ -80,12 +60,12 @@ def _screen_data():
     """
     rows = []
     for student in ("s1", "s2", "s3"):
-        rows += _attempts(student, "dead", "dead", ["correct"])
-        rows += _mixed(student, "thin", "thin", 2)
-        rows += _attempts(student, "uniform", "uniform", ["incorrect"] * 4)
+        rows += attempts(student, "dead", "dead", ["correct"])
+        rows += mixed(student, "thin", "thin", 2)
+        rows += attempts(student, "uniform", "uniform", ["incorrect"] * 4)
         for k in range(4):
-            rows += _mixed(student, f"m{k}", f"m{k}", 6)
-    return from_frame(_frame(rows), "F")
+            rows += mixed(student, f"m{k}", f"m{k}", 6)
+    return step_data(rows, "F")
 
 
 def _constant_student_data():
@@ -93,14 +73,30 @@ def _constant_student_data():
     rows = []
     for student in ("s1", "s2"):
         for k in range(3):
-            rows += _mixed(student, f"m{k}", f"m{k}", 6)
-    rows += _attempts("always", "m0", "m0", ["correct", "correct"])
-    return from_frame(_frame(rows), "F")
+            rows += mixed(student, f"m{k}", f"m{k}", 6)
+    rows += attempts("always", "m0", "m0", ["correct", "correct"])
+    return step_data(rows, "F")
 
 
 def _example_factors():
     models = {m: load_student_step(EXAMPLE, kc_model=m) for m in ("Topics", "Skills")}
     return models, build_factor_matrix(models)
+
+
+@pytest.fixture(scope="module")
+def search():
+    """The default BIC search over the example, for the tests that only read
+    it. It stops on patience after six expansions, so any ``max_iterations``
+    from 6 up returns this same result."""
+    models, P = _example_factors()
+    return lfa_search(models["Topics"], P, max_iterations=8)
+
+
+@pytest.fixture(scope="module")
+def search_aic():
+    """The same search under AIC, which stops on patience after nine."""
+    models, P = _example_factors()
+    return lfa_search(models["Topics"], P, heuristic="aic", max_iterations=12)
 
 
 # --------------------------------------------------------------------------
@@ -109,9 +105,9 @@ def _example_factors():
 
 
 def test_factor_matrix_drops_a_column_identical_to_one_already_taken():
-    rows = _mixed("s1", "a", "X", 2) + _mixed("s1", "b", "Y", 2)
-    coarse = from_frame(_frame(rows, "coarse"), "coarse")
-    same = from_frame(_frame(rows, "coarse").rename(
+    rows = mixed("s1", "a", "X", 2) + mixed("s1", "b", "Y", 2)
+    coarse = step_data(rows, "coarse")
+    same = from_frame(rollup(rows, "coarse").rename(
         columns={"KC (coarse)": "KC (twin)",
                  "Opportunity (coarse)": "Opportunity (twin)"}), "twin")
     P = build_factor_matrix({"coarse": coarse, "twin": same})
@@ -122,29 +118,27 @@ def test_factor_matrix_drops_a_column_identical_to_one_already_taken():
 
 
 def test_a_skill_name_present_in_two_models_is_prefixed_with_its_model():
-    a = from_frame(_frame(_mixed("s1", "a", "S", 2) + _mixed("s1", "b", "T", 2),
-                          "one"), "one")
-    b = from_frame(_frame(_mixed("s1", "a", "S", 2) + _mixed("s1", "b", "S", 2),
-                          "two"), "two")
+    a = step_data(mixed("s1", "a", "S", 2) + mixed("s1", "b", "T", 2), "one")
+    b = step_data(mixed("s1", "a", "S", 2) + mixed("s1", "b", "S", 2), "two")
     P = build_factor_matrix({"one": a, "two": b})
     assert "S" in P.factors, "the first model keeps the bare name"
     assert "two-S" in P.factors, "the collision is prefixed, not silently merged"
 
 
 def test_a_multi_kc_model_cannot_serve_as_a_difficulty_factor():
-    df = _frame([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
-                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}])
+    df = rollup([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
+                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}], "F")
     with pytest.raises(ValueError, match="more than one"):
         build_factor_matrix({"wide": from_frame(df, "F")})
 
 
 def test_models_covering_different_row_sets_cannot_be_combined():
-    full = _mixed("s1", "a", "X", 2) + _mixed("s1", "b", "Y", 2)
-    short = _frame(full, "short")
+    full = mixed("s1", "a", "X", 2) + mixed("s1", "b", "Y", 2)
+    short = rollup(full, "short")
     short.loc[0, "KC (short)"] = ""          # drops that observation entirely
     short.loc[0, "Opportunity (short)"] = ""
     with pytest.raises(ValueError, match="different numbers of observations"):
-        build_factor_matrix({"full": from_frame(_frame(full, "full"), "full"),
+        build_factor_matrix({"full": step_data(full, "full"),
                              "short": from_frame(short, "short")})
 
 
@@ -166,45 +160,35 @@ def test_a_factor_matrix_checks_its_parallel_tuples():
 STEPS = ("a", "b", "c")
 
 
-def test_split_carves_the_factors_steps_out_of_the_skill():
-    got = split(("all",) * 3, STEPS, "all", "f", frozenset({"a"}))
-    assert got == ("all*f", "all", "all")
+@pytest.mark.parametrize("labels,skill,factor,steps,expected", [
+    pytest.param(("all",) * 3, "all", "f", {"a"}, ("all*f", "all", "all"), id="carves"),
+    pytest.param(("all",) * 3, "all", "f", set(), None, id="covers-nothing"),
+    pytest.param(("all",) * 3, "all", "f", set(STEPS), None, id="covers-all"),
+    pytest.param(("all*f", "all", "all"), "all", "g", {"a", "b"}, ("all*f", "all*g", "all"),
+                 id="only-the-named-skill"),
+    pytest.param(("all*f", "all*f", "all"), "all*f", "g", {"a"}, ("all*f*g", "all*f", "all"),
+                 id="a-derived-skill"),
+])
+def test_split_carves_the_factors_steps_out_of_the_skill(labels, skill, factor, steps,
+                                                         expected):
+    """Only the named skill's steps move, so step ``a`` stays in ``all*f`` when
+    ``all`` is split; a derived skill splits like any other; and a split that
+    would empty either side is degenerate."""
+    assert split(labels, STEPS, skill, factor, frozenset(steps)) == expected
 
 
-def test_a_split_that_would_empty_either_side_is_degenerate():
-    labels = ("all",) * 3
-    assert split(labels, STEPS, "all", "f", frozenset()) is None, "covers nothing"
-    assert split(labels, STEPS, "all", "f", frozenset(STEPS)) is None, "covers all"
-
-
-def test_a_split_only_touches_the_skill_it_names():
-    labels = ("all*f", "all", "all")
-    got = split(labels, STEPS, "all", "g", frozenset({"a", "b"}))
-    assert got == ("all*f", "all*g", "all"), "step a already belongs to all*f"
-
-
-def test_a_derived_skill_can_be_split_again():
-    labels = split(("all",) * 3, STEPS, "all", "f", frozenset({"a", "b"}))
-    got = split(labels, STEPS, "all*f", "g", frozenset({"a"}))
-    assert got == ("all*f*g", "all*f", "all")
-
-
-def test_merge_joins_two_skills():
-    labels = ("all*f", "all*g", "all")
-    assert merge(labels, "all*f", "all*g") == ("all*f+all*g", "all*f+all*g", "all")
-
-
-def test_a_merge_label_does_not_depend_on_the_order_it_was_asked_in():
-    """Which is what lets the two orders collapse to one state."""
-    labels = ("x", "y", "z")
-    assert merge(labels, "x", "y") == merge(labels, "y", "x")
-
-
-def test_merging_an_absent_or_identical_skill_is_impossible():
-    labels = ("x", "y", "z")
-    assert merge(labels, "x", "nope") is None
-    assert merge(labels, "nope", "x") is None
-    assert merge(labels, "x", "x") is None, "a skill cannot merge with itself"
+@pytest.mark.parametrize("a,b,expected", [
+    pytest.param("all*f", "all*g", ("all*f+all*g", "all*f+all*g", "all"), id="joins"),
+    pytest.param("all*g", "all*f", ("all*f+all*g", "all*f+all*g", "all"), id="either-order"),
+    pytest.param("all*f", "nope", None, id="absent"),
+    pytest.param("nope", "all*f", None, id="absent-first"),
+    pytest.param("all*f", "all*f", None, id="itself"),
+])
+def test_merge_joins_two_skills(a, b, expected):
+    """The label does not depend on the order the merge was asked in, which is
+    what lets the two orders collapse to one state; a skill cannot merge with
+    one that is absent, or with itself."""
+    assert merge(("all*f", "all*g", "all"), a, b) == expected
 
 
 def test_a_merge_reads_as_a_merge_in_the_history():
@@ -212,33 +196,26 @@ def test_a_merge_reads_as_a_merge_in_the_history():
     assert str(Move("split", "a", "f")) == "split a by f"
 
 
-def test_replay_applies_merges_as_well_as_splits():
-    P = FactorMatrix(STEPS, ("f", "g"),
-                     (frozenset({"a"}), frozenset({"b"})))
-    history = (Move("split", "all", "f"), Move("split", "all", "g"),
-               Move("merge", "all*f", "all*g"))
-    assert replay(history, P) == ("all*f+all*g", "all*f+all*g", "all")
+#: Two factors over ``STEPS``, one step each.
+F_AND_G = FactorMatrix(STEPS, ("f", "g"), (frozenset({"a"}), frozenset({"b"})))
+SPLIT_F, SPLIT_G = Move("split", "all", "f"), Move("split", "all", "g")
 
 
-def test_replay_reconstructs_a_labelling_from_its_history():
-    P = FactorMatrix(STEPS, ("f", "g"),
-                     (frozenset({"a"}), frozenset({"b"})))
-    history = (Move("split", "all", "f"), Move("split", "all", "g"))
-    assert replay(history, P) == ("all*f", "all*g", "all")
-
-
-def test_replaying_a_history_without_a_move_is_how_merge_undoes_a_split():
-    P = FactorMatrix(STEPS, ("f", "g"),
-                     (frozenset({"a"}), frozenset({"b"})))
-    history = (Move("split", "all", "f"), Move("split", "all", "g"))
-    assert replay(history[1:], P) == ("all", "all*g", "all")
+@pytest.mark.parametrize("history,expected", [
+    pytest.param((SPLIT_F, SPLIT_G), ("all*f", "all*g", "all"), id="splits"),
+    pytest.param((SPLIT_F, SPLIT_G, Move("merge", "all*f", "all*g")),
+                 ("all*f+all*g", "all*f+all*g", "all"), id="and-merges"),
+    pytest.param((SPLIT_G,), ("all", "all*g", "all"), id="without-a-move"),
+])
+def test_replay_reconstructs_a_labelling_from_its_history(history, expected):
+    """Merges replay as well as splits, and replaying a history without one of
+    its moves is how a lineage merge undoes a split."""
+    assert replay(history, F_AND_G) == expected
 
 
 def test_transposed_split_orders_are_one_state():
-    P = FactorMatrix(STEPS, ("f", "g"),
-                     (frozenset({"a"}), frozenset({"b"})))
-    forward = replay((Move("split", "all", "f"), Move("split", "all", "g")), P)
-    reverse = replay((Move("split", "all", "g"), Move("split", "all", "f")), P)
+    forward = replay((SPLIT_F, SPLIT_G), F_AND_G)
+    reverse = replay((SPLIT_G, SPLIT_F), F_AND_G)
     assert partition(forward) == partition(reverse), (
         "the search must not fit the same partition twice under two labellings")
 
@@ -261,8 +238,8 @@ def test_a_searched_kc_model_recomputes_its_own_opportunity_counts():
     file was written, so reading the column would carry the *old* model's
     practice counts into the new one.
     """
-    rows = _mixed("s1", "a", "X", 2) + _mixed("s1", "b", "X", 2)
-    data = from_frame(_frame(rows), "F")
+    rows = mixed("s1", "a", "X", 2) + mixed("s1", "b", "X", 2)
+    data = step_data(rows, "F")
     assert [o[0] for o in data.opportunities] == [0, 1, 0, 1], "as exported, one KC"
     got = relabel(data, ("p##a", "p##b"), ("split_a", "split_b"))
     assert [o[0] for o in got.opportunities] == [0, 1, 0, 1]
@@ -270,9 +247,9 @@ def test_a_searched_kc_model_recomputes_its_own_opportunity_counts():
 
 
 def test_relabelling_two_steps_apart_restarts_each_kcs_practice_count():
-    rows = _attempts("s1", "a", "X", ["correct", "correct"]) + \
-        _attempts("s1", "b", "X", ["correct", "correct"])
-    data = from_frame(_frame(rows), "F")
+    rows = attempts("s1", "a", "X", ["correct", "correct"]) + \
+        attempts("s1", "b", "X", ["correct", "correct"])
+    data = step_data(rows, "F")
     merged = relabel(data, ("p##a", "p##b"), ("one", "one"))
     assert [o[0] for o in merged.opportunities] == [0, 1, 2, 3], (
         "one KC over both steps accumulates across them")
@@ -286,35 +263,27 @@ def test_relabelling_two_steps_apart_restarts_each_kcs_practice_count():
 # --------------------------------------------------------------------------
 
 
-def test_the_evidence_screen_counts_prior_practice_not_observations():
-    """The screen counts rows at ``T >= 1``, not rows.
+@pytest.mark.parametrize("threshold,thin_refused", [(4, True), (3, False)],
+                         ids=["thin-below-threshold", "thin-at-threshold"])
+def test_the_evidence_screen_counts_prior_practice_not_observations(threshold, thin_refused):
+    """The screen counts rows at ``T >= 1``, not rows, and inclusively.
 
     In this fixture ``thin`` has **6 observations but only 3 at T >= 1** — two
     attempts each by three students. A screen counting observations would let
     it through a threshold of 4; the slope it would estimate rests on three
-    rows. ``dead`` has 3 observations and none at ``T >= 1`` at all.
+    rows. Exactly 3 rows clears a threshold of 3. ``dead`` has 3 observations
+    and none at ``T >= 1`` at all.
     """
     data = _screen_data()
     P = build_factor_matrix({"F": data})
-    res = lfa_search(data, P, max_iterations=1, min_opportunities=4,
+    res = lfa_search(data, P, max_iterations=1, min_opportunities=threshold,
                      screen_separation=False)
     refused = res.rejected.by_reason().get("too little practice", [])
     assert any("by dead" in m for m in refused), "0 rows at T >= 1"
-    assert any("by thin" in m for m in refused), (
+    assert any("by thin" in m for m in refused) == thin_refused, (
         "6 observations, but only 3 of them carry prior practice")
     assert not any("by m0" in m for m in refused), (
         "an ordinary step has 15 rows at T >= 1 and must survive")
-
-
-def test_the_evidence_screen_compares_against_the_threshold_inclusively():
-    data = _screen_data()
-    P = build_factor_matrix({"F": data})
-    res = lfa_search(data, P, max_iterations=1, min_opportunities=3,
-                     screen_separation=False)
-    refused = res.rejected.by_reason().get("too little practice", [])
-    assert any("by dead" in m for m in refused)
-    assert not any("by thin" in m for m in refused), (
-        "exactly 3 rows at T >= 1 clears a threshold of 3")
 
 
 def test_a_separated_kc_is_refused_and_the_reason_is_recorded():
@@ -326,6 +295,11 @@ def test_a_separated_kc_is_refused_and_the_reason_is_recorded():
         "all of this KC's repeat attempts fail, so its slope has no finite MLE")
     assert not any("uniform" in "".join(str(m) for m in s.history)
                    for s in res.states), "no accepted state may contain it"
+    # Reported rather than silently dropped: a screen that shrinks the space
+    # must say so.
+    assert len(res.rejected.moves) == len(res.rejected.reasons)
+    assert "refused" in res.rejected.summary()
+    assert "refused" in res.summary()
 
 
 def test_without_the_screens_the_reference_pathology_reproduces():
@@ -345,16 +319,6 @@ def test_without_the_screens_the_reference_pathology_reproduces():
         "and the state it produces carries a coefficient with no finite estimate")
 
 
-def test_refusals_are_reported_rather_than_silently_dropped():
-    data = _screen_data()
-    P = build_factor_matrix({"F": data})
-    res = lfa_search(data, P, max_iterations=1)
-    assert len(res.rejected), "a screen that shrinks the space must say so"
-    assert len(res.rejected.moves) == len(res.rejected.reasons)
-    assert "refused" in res.rejected.summary()
-    assert "refused" in res.summary()
-
-
 def test_a_search_that_refuses_nothing_says_so():
     models, P = _example_factors()
     res = lfa_search(models["Topics"], P, max_iterations=1)
@@ -366,33 +330,28 @@ def test_a_search_that_refuses_nothing_says_so():
 # --------------------------------------------------------------------------
 
 
-def test_the_search_improves_on_the_root_by_its_own_heuristic():
-    models, P = _example_factors()
-    res = lfa_search(models["Topics"], P, max_iterations=8)
-    assert res.best.score("bic") < res.root.score("bic")
-    assert res.best.depth >= 1
-    assert res.states[0] is res.best, "states are ranked, best first"
+def test_the_search_improves_on_the_root_by_its_own_heuristic(search):
+    assert search.best.score("bic") < search.root.score("bic")
+    assert search.best.depth >= 1
+    assert search.states[0] is search.best, "states are ranked, best first"
 
 
-def test_every_evaluated_state_carries_an_optimality_certificate():
-    models, P = _example_factors()
-    res = lfa_search(models["Topics"], P, max_iterations=6)
-    assert all(s.is_optimal for s in res.states), (
+def test_every_evaluated_state_carries_an_optimality_certificate(search):
+    assert all(s.is_optimal for s in search.states), (
         "a frontier ordered by uncertified fits is ordered by optimizer noise")
-    assert "certified optimum" in res.summary(), (
+    assert "certified optimum" in search.summary(), (
         "and the count of uncertified states is reported, not left implicit")
 
 
-def test_the_search_beats_a_hand_authored_kc_model_on_its_own_criterion():
-    models, P = _example_factors()
+def test_the_search_beats_a_hand_authored_kc_model_on_its_own_criterion(search):
+    models, _ = _example_factors()
     fit = fit_afm(build_afm_design(models["Topics"]), models["Topics"].y,
                   warn_not_converged=False, warn_separated=False)
-    res = lfa_search(models["Topics"], P, max_iterations=8)
-    assert res.best.bic < fit.bic, (
-        f"searched BIC {res.best.bic:.3f} must beat the authored model's {fit.bic:.3f}")
+    assert search.best.bic < fit.bic, (
+        f"searched BIC {search.best.bic:.3f} must beat the authored model's {fit.bic:.3f}")
 
 
-def test_neither_criterion_recovers_the_planted_model_on_this_example():
+def test_neither_criterion_recovers_the_planted_model_on_this_example(search, search_aic):
     """An honest negative, pinned so nobody "fixes" the search to match hope.
 
     ``examples/student-step.txt`` is generated from ``Topics``, but at 480
@@ -400,38 +359,27 @@ def test_neither_criterion_recovers_the_planted_model_on_this_example():
     and AIC's prefers a finer one. Recovering the generating model is a
     property of the data, not something the search can promise.
     """
-    models, P = _example_factors()
+    models, _ = _example_factors()
     planted = frozenset(frozenset(np.flatnonzero(
         [kc == (name,) for kc in models["Topics"].kcs]).tolist())
         for name in models["Topics"].kc_names)
-    for heuristic in HEURISTICS:
-        res = lfa_search(models["Topics"], P, heuristic=heuristic,
-                         max_iterations=12)
+    searches = {"bic": search, "aic": search_aic}
+    assert set(searches) == set(HEURISTICS)
+    for res in searches.values():
         assert partition(res.best.labels) != planted
 
 
-def test_bic_stops_no_deeper_than_aic():
-    models, P = _example_factors()
-    bic = lfa_search(models["Topics"], P, heuristic="bic", max_iterations=12)
-    aic = lfa_search(models["Topics"], P, heuristic="aic", max_iterations=12)
-    assert bic.best.depth <= aic.best.depth, (
+def test_bic_stops_no_deeper_than_aic(search, search_aic):
+    assert search.best.depth <= search_aic.best.depth, (
         "BIC charges log(N) per parameter against AIC's 2, so it stops earlier")
 
 
-def test_the_search_is_deterministic():
+def test_warm_starting_does_not_move_the_optimum(search):
     models, P = _example_factors()
-    runs = [lfa_search(models["Topics"], P, max_iterations=5) for _ in range(2)]
-    assert [s.bic for s in runs[0].states] == [s.bic for s in runs[1].states]
-    assert runs[0].frame().equals(runs[1].frame())
-
-
-def test_warm_starting_does_not_move_the_optimum():
-    models, P = _example_factors()
-    warm = lfa_search(models["Topics"], P, max_iterations=5, warm_start=True)
-    cold = lfa_search(models["Topics"], P, max_iterations=5, warm_start=False)
-    assert warm.n_evaluated == cold.n_evaluated
-    assert warm.best.labels == cold.best.labels
-    assert warm.best.ll == pytest.approx(cold.best.ll, abs=1e-6), (
+    cold = lfa_search(models["Topics"], P, max_iterations=8, warm_start=False)
+    assert search.n_evaluated == cold.n_evaluated
+    assert search.best.labels == cold.best.labels
+    assert search.best.ll == pytest.approx(cold.best.ll, abs=1e-6), (
         "the objective is convex, so the start point cannot change the optimum")
 
 
@@ -451,15 +399,15 @@ def test_the_search_stops_on_a_no_improvement_streak():
 
 def test_the_frontier_can_be_exhausted():
     P = FactorMatrix(("p##a", "p##b"), ("only",), (frozenset({"p##a"}),))
-    rows = _mixed("s1", "a", "X", 4) + _mixed("s1", "b", "X", 4) + \
-        _mixed("s2", "a", "X", 4) + _mixed("s2", "b", "X", 4)
-    data = from_frame(_frame(rows), "F")
+    rows = mixed("s1", "a", "X", 4) + mixed("s1", "b", "X", 4) + \
+        mixed("s2", "a", "X", 4) + mixed("s2", "b", "X", 4)
+    data = step_data(rows, "F")
     res = lfa_search(data, P, max_iterations=20, patience=0,
                      min_opportunities=1)
     assert res.stopped == "exhausted", "one factor affords exactly one split"
 
 
-def test_lineage_merge_changes_nothing_when_the_frontier_never_fills():
+def test_lineage_merge_changes_nothing_when_the_frontier_never_fills(search):
     """The documented scope of Stage 1's merge, pinned.
 
     Undoing a split reaches a state that was already scored as a child, so it
@@ -467,24 +415,45 @@ def test_lineage_merge_changes_nothing_when_the_frontier_never_fills():
     beam has evicted something.
     """
     models, P = _example_factors()
-    with_merge = lfa_search(models["Topics"], P, max_iterations=6, merges="lineage")
-    without = lfa_search(models["Topics"], P, max_iterations=6, merges="none")
-    assert with_merge.best.labels == without.best.labels
-    assert with_merge.n_evaluated == without.n_evaluated
+    without = lfa_search(models["Topics"], P, max_iterations=8, merges="none")
+    assert search.best.labels == without.best.labels, "search merges by lineage"
+    assert search.n_evaluated == without.n_evaluated
 
 
-def test_the_same_split_is_never_offered_twice_on_one_lineage():
-    models, P = _example_factors()
-    res = lfa_search(models["Topics"], P, max_iterations=10)
-    for state in res.states:
+def test_the_children_of_a_state_in_the_order_an_expansion_scores_them():
+    """Splits first, every skill by every factor, then the undo of each split
+    on the lineage, then every pair of skills merged. ``split all by f`` is on
+    the lineage, so it is not offered again, and the splits of ``all*f`` are
+    degenerate."""
+    parent = LFAState(labels=("all*f", "all", "all"), history=(SPLIT_F,), ll=0.0,
+                      aic=0.0, bic=0.0, n_kcs=2, n_params=0, is_optimal=True,
+                      n_separated=0)
+    children = _children(parent, F_AND_G, ("all",) * 3, "both")
+    assert [(labels, history) for labels, history, _, _ in children] == [
+        (("all*f", "all*g", "all"), (SPLIT_F, SPLIT_G)),
+        (("all",) * 3, ()),
+        (("all+all*f",) * 3, (SPLIT_F, Move("merge", "all", "all*f"))),
+    ]
+    # What a refusal records. The undo used to be logged under the last move
+    # left on its history, here none at all ("root").
+    assert [move for *_, move in children] == [
+        "split all by g", "undo split all by f", "merge all and all*f"]
+
+
+def test_the_same_split_is_never_offered_twice_on_one_lineage(search):
+    for state in search.states:
         pairs = [(m.skill, m.factor) for m in state.history]
         assert len(pairs) == len(set(pairs))
 
 
-def test_an_unknown_heuristic_raises():
+@pytest.mark.parametrize("option,message", [
+    ({"heuristic": "rmse"}, "heuristic must be one of"),
+    ({"merges": "pairwise-ish"}, "merges must be one of"),
+])
+def test_an_unknown_heuristic_or_merge_mode_raises(option, message):
     models, P = _example_factors()
-    with pytest.raises(ValueError, match="heuristic must be one of"):
-        lfa_search(models["Topics"], P, heuristic="rmse")
+    with pytest.raises(ValueError, match=message):
+        lfa_search(models["Topics"], P, **option)
 
 
 def test_a_factor_matrix_must_cover_every_step_being_fitted():
@@ -566,17 +535,6 @@ def test_the_worker_count_does_not_move_a_single_digit():
     assert one.frame().equals(two.frame())
 
 
-def test_n_jobs_follows_joblibs_convention():
-    from leapfit.lfa import _worker_count
-    cores = os.cpu_count() or 1
-    assert _worker_count(1, 100) == 1
-    assert _worker_count(None, 100) == 1, "None is serial, as in crossval"
-    assert _worker_count(0, 100) == 1
-    assert _worker_count(3, 100) == 3
-    assert _worker_count(-1, 100) == cores, "-1 is every core"
-    assert _worker_count(-2, 100) == max(1, cores - 1), "-2 is all but one"
-
-
 def test_a_serial_search_leaves_no_observations_pinned_in_the_caller():
     """The serial path shares the worker's globals; it must not keep them."""
     from leapfit.lfa import _WORKER
@@ -590,34 +548,37 @@ def test_a_serial_search_leaves_no_observations_pinned_in_the_caller():
 # --------------------------------------------------------------------------
 
 
-def _validated(**kwargs):
-    models, P = _example_factors()
-    res = lfa_search(models["Topics"], P, max_iterations=8)
-    kwargs.setdefault("n", 4)
-    kwargs.setdefault("seeds", (0, 1, 2))
-    return models, res, validate_top(res, models["Topics"], **kwargs)
+@pytest.fixture(scope="module")
+def validation(search):
+    models, _ = _example_factors()
+    return validate_top(search, models["Topics"], n=4, seeds=(0, 1, 2))
 
 
-def test_every_candidate_is_scored_on_the_same_folds():
+@pytest.fixture(scope="module")
+def validation_with_authored(search):
+    """``validation``, with both authored KC models joining the comparison."""
+    models, _ = _example_factors()
+    return validate_top(search, models["Topics"], n=4, seeds=(0, 1, 2), extra=models)
+
+
+def test_every_candidate_is_scored_on_the_same_folds(validation):
     """Shared folds are what make the contrast paired rather than two means."""
-    _, _, val = _validated()
-    per_fold = val.folds.groupby(["seed", "fold"])["n_test"].nunique()
+    per_fold = validation.folds.groupby(["seed", "fold"])["n_test"].nunique()
     assert (per_fold == 1).all(), (
         "one held-out row count per (seed, fold) means every model saw that fold")
-    counts = val.folds.groupby("model").size()
+    counts = validation.folds.groupby("model").size()
     assert counts.nunique() == 1, "and every model was scored on all of them"
 
 
-def test_the_root_and_authored_models_join_the_comparison():
-    models, _, val = _validated(extra=None)
-    assert "root" in set(val.frame()["model"]), "the search's starting point"
-    _, _, with_extra = _validated(extra=models)
-    named = set(with_extra.frame()["model"])
+def test_the_root_and_authored_models_join_the_comparison(validation,
+                                                          validation_with_authored):
+    assert "root" in set(validation.frame()["model"]), "the search's starting point"
+    named = set(validation_with_authored.frame()["model"])
     assert {"Topics", "Skills", "root"} <= named, (
         "an authored KC model is the comparison that says whether searching helped")
 
 
-def test_validation_reports_whether_the_criterion_agrees_with_held_out_rmse():
+def test_validation_reports_whether_the_criterion_agrees_with_held_out_rmse(validation):
     """On this example it does not, and that is the point of the stage.
 
     BIC prefers a 2-KC model; pooled item-blocked RMSE prefers a 3-KC one. The
@@ -625,47 +586,42 @@ def test_validation_reports_whether_the_criterion_agrees_with_held_out_rmse():
     if a change ever made the criterion and the held-out score agree on this
     data, that would be a result worth noticing, not a silent improvement.
     """
-    _, _, val = _validated()
-    assert not val.agrees
-    assert val.winner != val.frame().iloc[0]["model"]
-    assert "DISAGREE" in val.summary()
+    assert not validation.agrees
+    assert validation.winner != validation.frame().iloc[0]["model"]
+    assert "DISAGREE" in validation.summary()
 
 
-def test_the_authored_model_can_beat_the_criterions_pick_out_of_sample():
-    authored, _ = _example_factors()
-    _, _, val = _validated(extra=authored)
-    frame = val.frame().set_index("model")
+def test_the_authored_model_can_beat_the_criterions_pick_out_of_sample(
+        validation_with_authored):
+    frame = validation_with_authored.frame().set_index("model")
     assert frame.loc["Topics", "search_rank"] > frame.loc["Topics", "cv_rank"], (
         "the planted model is penalised in sample and rewarded out of sample")
 
 
-def test_contrasts_difference_within_fold_and_exclude_the_baseline():
-    _, _, val = _validated()
-    assert val.baseline == "root", "the search's starting point by default"
-    assert val.baseline not in set(val.contrasts["model"])
-    assert (val.contrasts["n_folds"] == 9).all(), "3 folds x 3 seeds, paired"
+def test_contrasts_difference_within_fold_and_exclude_the_baseline(validation):
+    assert validation.baseline == "root", "the search's starting point by default"
+    assert validation.baseline not in set(validation.contrasts["model"])
+    assert (validation.contrasts["n_folds"] == 9).all(), "3 folds x 3 seeds, paired"
 
 
-def test_the_baseline_can_be_named():
-    _, res, _ = _validated()
+def test_the_baseline_can_be_named(search):
     models, _ = _example_factors()
-    val = validate_top(res, models["Topics"], n=3, baseline="rank1")
+    val = validate_top(search, models["Topics"], n=3, baseline="rank1")
     assert val.baseline == "rank1"
     assert "rank1" not in set(val.contrasts["model"])
 
 
-def test_an_unknown_baseline_raises():
-    _, res, _ = _validated()
+def test_an_unknown_baseline_raises(search):
     models, _ = _example_factors()
     with pytest.raises(KeyError, match="baseline"):
-        validate_top(res, models["Topics"], n=2, baseline="nope")
+        validate_top(search, models["Topics"], n=2, baseline="nope")
 
 
-def test_an_extra_model_over_other_rows_cannot_be_paired():
-    models, res, _ = _validated()
+def test_an_extra_model_over_other_rows_cannot_be_paired(search):
+    models, _ = _example_factors()
     short = _constant_student_data()
     with pytest.raises(ValueError, match="different row set"):
-        validate_top(res, models["Topics"], n=2, extra={"other": short})
+        validate_top(search, models["Topics"], n=2, extra={"other": short})
 
 
 def test_validation_scores_in_the_mode_the_search_used():
@@ -680,103 +636,17 @@ def test_validation_scores_in_the_mode_the_search_used():
     assert frame.loc["rank1", "n_params"] == res.states[0].n_params
 
 
-def test_n_must_be_at_least_one():
-    models, res, _ = _validated()
+def test_n_must_be_at_least_one(search):
+    models, _ = _example_factors()
     with pytest.raises(ValueError, match="n must be at least 1"):
-        validate_top(res, models["Topics"], n=0)
+        validate_top(search, models["Topics"], n=0)
 
 
-def test_rank_correlation_needs_three_candidates():
-    models, P = _example_factors()
-    res = lfa_search(models["Topics"], P, max_iterations=3)
-    val = validate_top(res, models["Topics"], n=1, include_root=True)
+def test_rank_correlation_needs_three_candidates(search):
+    models, _ = _example_factors()
+    val = validate_top(search, models["Topics"], n=1, include_root=True)
     assert val.rank_correlation() != val.rank_correlation(), "NaN for two"
     assert "undefined" in val.summary()
-
-
-# --------------------------------------------------------------------------
-# The leapfit-lfa console script
-# --------------------------------------------------------------------------
-
-
-def _lfa_cli(*extra, export=EXAMPLE):
-    from leapfit.cli import main_lfa
-    return main_lfa([export, "--max-iterations", "2", "--validate", "0", *extra])
-
-
-def test_cli_lfa_writes_the_frontier_and_the_refusals(tmp_path):
-    frontier, refusals = tmp_path / "f.csv", tmp_path / "r.csv"
-    assert _lfa_cli("--out", str(frontier), "--refusals", str(refusals)) == 0
-    table = pd.read_csv(frontier)
-    assert {"rank", "n_kcs", "n_params", "bic", "is_optimal", "history"} <= set(table.columns)
-    assert table["rank"].tolist() == list(range(1, len(table) + 1))
-    # Written even when nothing was refused: an empty file is a result, a
-    # missing one cannot be told from a run that never asked.
-    assert set(pd.read_csv(refusals).columns) == {"move", "reason"}
-
-
-def test_cli_lfa_writes_a_kc_model_ready_to_join(tmp_path):
-    out = tmp_path / "q.txt"
-    assert _lfa_cli("--qmatrix", str(out), "--kc-model-name", "Discovered") == 0
-    table = pd.read_csv(out, sep="\t", dtype=str)
-    assert list(table.columns) == ["Problem Name", "Step Name", "KC (Discovered)"]
-    assert len(table) == 40, "one row per step, not per observation"
-    assert table["KC (Discovered)"].nunique() >= 2, "the search split something"
-
-
-def test_cli_lfa_annotates_the_export_under_the_discovered_model(tmp_path):
-    out = tmp_path / "annotated.txt"
-    assert _lfa_cli("--predictions", str(out), "--kc-model-name", "Found") == 0
-    written = pd.read_csv(out, sep="\t", dtype=str, keep_default_na=False)
-    assert "Predicted Error Rate (Found)" in written.columns
-    assert (written["Predicted Error Rate (Found)"] != "").all()
-    assert "KC (Topics)" in written.columns, "the export round-trips verbatim"
-
-
-def test_cli_lfa_validates_the_shortlist_and_writes_it(tmp_path):
-    from leapfit.cli import main_lfa
-    out = tmp_path / "v.csv"
-    assert main_lfa([EXAMPLE, "--max-iterations", "2", "--validate", "2",
-                     "--compare", "Topics", "--validation", str(out)]) == 0
-    table = pd.read_csv(out)
-    assert {"cv_rmse", "search_rank", "cv_rank"} <= set(table.columns)
-    assert "Topics" in set(table["model"]), "--compare joins the comparison"
-    assert "root" in set(table["model"])
-
-
-def test_cli_lfa_says_so_rather_than_writing_an_empty_validation(tmp_path, capsys):
-    out = tmp_path / "v.csv"
-    assert _lfa_cli("--validation", str(out)) == 0
-    assert not out.exists()
-    assert "--validate 0 skipped it" in capsys.readouterr().err
-
-
-def test_cli_lfa_excludes_a_multi_kc_model_from_the_factors(tmp_path, capsys):
-    """The reference aborts; this reports and proceeds with what is eligible."""
-    rows = _mixed("s1", "a", "X", 4) + _mixed("s1", "b", "Y", 4) + \
-        _mixed("s2", "a", "X", 4) + _mixed("s2", "b", "Y", 4)
-    df = _frame(rows, "clean")
-    df["KC (wide)"] = "P~~Q"
-    df["Opportunity (wide)"] = df["Opportunity (clean)"] + "~~1"
-    export = tmp_path / "export.txt"
-    df.to_csv(export, sep="\t", index=False, lineterminator="\n")
-
-    assert _lfa_cli("--min-opportunities", "1", export=str(export)) == 0
-    err = capsys.readouterr().err
-    assert "excluding 'wide'" in err and "more than one KC" in err
-
-
-def test_cli_lfa_refuses_an_unknown_model_name(tmp_path, capsys):
-    assert _lfa_cli("--factors", "Nope") == 1
-    assert "Unknown KC model" in capsys.readouterr().err
-    assert _lfa_cli("--compare", "Nope") == 1
-    assert "is not a KC model" in capsys.readouterr().err
-
-
-def test_cli_lfa_lists_the_models_and_exits(capsys):
-    from leapfit.cli import main_lfa
-    assert main_lfa([EXAMPLE, "--list-models"]) == 0
-    assert capsys.readouterr().out.split() == ["Skills", "Topics"]
 
 
 # --------------------------------------------------------------------------
@@ -788,8 +658,8 @@ def _three_step_data():
     rows = []
     for student in ("s1", "s2", "s3"):
         for step in ("a", "b", "c"):
-            rows += _mixed(student, step, step, 6)
-    return from_frame(_frame(rows), "F")
+            rows += mixed(student, step, step, 6)
+    return step_data(rows, "F")
 
 
 def _two_factor_matrix(data):
@@ -853,18 +723,6 @@ def test_a_merge_is_never_offered_twice_on_one_lineage():
         assert len(moves) == len(set(moves))
 
 
-def test_merges_must_be_a_known_mode():
-    models, P = _example_factors()
-    with pytest.raises(ValueError, match="merges must be one of"):
-        lfa_search(models["Topics"], P, merges="pairwise-ish")
-
-
-def test_the_cli_offers_the_merge_operators(tmp_path):
-    out = tmp_path / "f.csv"
-    assert _lfa_cli("--merges", "both", "--out", str(out)) == 0
-    assert len(pd.read_csv(out)) > 1
-
-
 def test_merging_pays_off_from_a_fine_grained_model_not_from_the_root():
     """Why the operator's value is coupled to where the search starts.
 
@@ -924,8 +782,8 @@ def test_a_root_must_label_every_step():
 
 def test_a_multi_kc_model_cannot_be_a_root():
     _, P = _example_factors()
-    df = _frame([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
-                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}])
+    df = rollup([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
+                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}], "F")
     with pytest.raises(ValueError, match="more than one"):
         root_labels(P, from_frame(df, "F"))
 
@@ -979,10 +837,3 @@ def test_a_separation_already_in_the_root_does_not_refuse_every_move():
     assert result.n_evaluated > 1, (
         "and moves are still scored rather than blanket-refused")
     assert "came in with the root" in result.summary()
-
-
-def test_the_cli_can_start_from_an_authored_kc_model(tmp_path):
-    out = tmp_path / "f.csv"
-    assert _lfa_cli("--root", "Skills", "--merges", "pairwise",
-                    "--out", str(out)) == 0
-    assert len(pd.read_csv(out)) > 1

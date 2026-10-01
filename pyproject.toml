@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "leapfit"
-version = "0.6.0"
+version = "0.7.0"
 description = "Student models over DataShop student-step data, validated against LearnSphere and CRAN LKT"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -59,9 +59,10 @@ packages = ["leapfit"]
 
 # hatchling honours VCS ignores, and this repo inherits a research-workspace
 # `.gitignore` that drops all `*.md`. README survives only because it is the
-# declared readme; the changelog has to be named or the sdist ships without it.
+# declared readme; every other Markdown file has to be named here or the sdist
+# ships without it.
 [tool.hatch.build.targets.sdist]
-artifacts = ["CHANGELOG.md"]
+artifacts = ["CHANGELOG.md", "examples/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -95,3 +96,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E741"]
+
+[tool.ruff.lint.isort]
+# tests/helpers.py is imported as a top-level module (pytest puts tests/ on
+# sys.path), so without this it would sort among the third-party imports.
+known-local-folder = ["helpers"]

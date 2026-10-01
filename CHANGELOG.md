@@ -3,6 +3,157 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## 0.7.0 — 2026-10-01
+
+### Changed
+
+- **Fits are about 1.6-1.9x faster, with the same results.** The objective
+  and its gradient are evaluated together, from one product with the design
+  and one exponential per row, where they used to be computed separately.
+  On the E-learning 2022 export a TNC fit of `LOs-new-MCQ` takes 0.24 s
+  instead of 0.39 s, and of `Unique-step-MCQ` 0.46 s instead of 0.86 s, with
+  the same number of evaluations and the same optimum to the last bit on the
+  machine measured. Every cross-validation fold, LFA candidate and LKT
+  evaluation inherits it. `fit_lkt_pars` also builds what does not depend
+  on a parameter (each component's practice sequences, and the clock) once
+  per search rather than once per evaluation. Together these take the
+  vignette's RPFA search from 10.6 s to 5.0 s.
+- **One cross-validation engine.** `cross_validate` and
+  `repeated_cross_validate` are `paired_cross_validate` over a single
+  design, scored by `paired_scores`, where they were a second
+  implementation of the same folds. The scores are the same, except that
+  the pooled RMSE is now `sqrt(sum(sse) / sum(n_test))` rather than the
+  RMSE of the concatenated residuals: the same quantity, summed in a
+  different order, so it can move in the last bit (by 5.6e-17 where it
+  moved in the checks). Workers no longer send each fold's residuals back.
+  `repeated_cross_validate` returns one row per distinct seed.
+- `leapfit-afm --cv-folds` writes one row per KC model, scheme, seed and
+  fold for every run. An independent run, `--no-paired` or a single KC
+  model, used to write one row per seed with `--seeds` and one per fold
+  without, each with its own columns. It now writes the paired layout,
+  with an empty `seed` for an unseeded run. The three cross-validation
+  paths in the command line are now one.
+- Identification loses a special case. A block that partitions the rows
+  exactly as another does (one factor under two names, such as the export's
+  own `KC (...)` column read beside the parsed KC) had a check of its own.
+  The general check refuses it just the same, as a block identification
+  would drop whole, naming the block that spans it, and its message now
+  says such a block may be a factor already in the design under another
+  name, as well as a parent. The special case also refused cohorts that
+  are each one student on one KC, where those two blocks pair level for
+  level. Those are now identified as a lone cohort is: each cohort gives up
+  its only student.
+- `leapfit-lfa` reads the export once, as `leapfit-afm` does, rather than
+  once per KC model it loads: the factor models, `--root` and each
+  `--compare`. On the E-learning 2022 export, which has 100 KC models,
+  loading 10 of them took 5.6 s and now takes 1.0 s, and the default
+  `--factors` loads all 100. An unknown `--root` is now refused before
+  anything is loaded, like an unknown `--compare`.
+- The unit tests are organised by the module they exercise. `test_data`,
+  `test_design`, `test_fit`, `test_crossval` and `test_cli` join the family
+  files, which keep only what is specific to their family. The builders the
+  files share (`rollup`, `step_data`, `synthetic` and the rest) live in
+  `tests/helpers.py`; each family file used to define its own copy. The
+  example export is loaded once per session, by a fixture in
+  `tests/conftest.py`.
+- Test cases that repeated what another test already checks are removed
+  or folded into that test, and parametrized tests replace near-identical
+  ones. Expensive results are now computed once per module: the LFA search
+  and validation on the example, the LKT vignette's chunk fits and parameter
+  search, and the LearnSphere export, which was read 33 times. With the new
+  regression tests, the suite without data runs 315 tests in about 16 s,
+  down from 330 in 28 s; with every fixture it takes 56 s, down from 137 s,
+  the faster fits included. The console-script check now covers
+  `leapfit-pfa` too.
+
+### Added
+
+- `StepData.prior_counts(labels=None)`: each observation's prior successes
+  and failures per label, strictly before the attempt and over
+  `practice_order`. It is now the one implementation behind
+  `StepData.recomputed_opportunities`, `pfa.success_failure_counts` and
+  `lkt.history_counts`, which each had their own copy of the loop; what
+  they return is unchanged. LKT builds its features over the same grouping
+  of each student's practice, so the tests that only checked the copies
+  agree with each other are gone.
+- `Block.from_levels(name, labels, values=None)`: a block with one column
+  per level, from each row's labels and, optionally, the value each label
+  carries, with the same `l2`, `lower` and `upper` as `Block.build`. The
+  AFM and PFA builders construct every block through it, where each built
+  its own sparse triplets, and give the same matrices.
+- `Aliased.in_blocks(*blocks)` and `Separated.in_blocks(*blocks)`: the
+  columns in the named blocks, by their names within the block. The KC and
+  component tables and the LFA screens read separation through it, where
+  each combined `by_block()` entries by hand; the two records now share
+  their column handling instead of each defining it.
+- `LFAState.separated`, the separated columns that `n_separated` counts, and
+  `LFAState.path`, its moves as the frontier and validation tables print
+  them. The search reads the root's separation off its state, where it
+  rebuilt the root's design a second time to find it.
+- `Design.get(name)`: the block of that name, or `None`. It replaces five
+  hand-written lookups across the package and the tests.
+- `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
+  `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
+  the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them
+  back and forth on every fit.
+- A Recipes section in the README. It computes what this release removes as
+  methods and options from what every fit carries: the Brier score, RMSE,
+  the unpenalized AIC and BIC, the coefficient table, predictions from a
+  bare matrix and a ridge on PFA's students. It also gives the held-out
+  Brier score from cross-validation.
+
+### Removed
+
+- Public API that nothing in the package, its tests or its examples
+  called: `LogisticFit.coefficients()` and the `coefficient_frame` it
+  wrapped, `LogisticFit.rmse()` and `LogisticFit.brier()`, and
+  `LogisticFit.aic_unpenalized` and `bic_unpenalized`. A fit's `weights`
+  beside `design.columns` are the coefficients, `predict_proba` gives the
+  scores, and `ll_unpenalized` with `n_params` gives the unpenalized
+  criteria.
+- `LogisticFit.block()`, which only the tests called. It returned a block's
+  coefficients as an unlabelled array that skipped any column
+  identification had dropped, so every value after one sat a place early.
+  `kc_values` reports the same coefficients by KC, with `NaN` for a dropped
+  column, and `fit.weights[fit.design.slices()[name]]` is the array
+  `block(name)` returned.
+- `predict_proba`'s sparse-matrix input. It accepted a bare matrix in place
+  of a `Design`, which no caller passed, and now takes only a `Design`. For
+  a matrix `X` with the fit's columns, `scipy.special.expit(X @ fit.weights)`
+  gives the same probabilities.
+- Options no caller passed: `Design.identify`'s `prefer_drop` and `check`
+  (identification always takes reference levels from the student block
+  first, and always checks that the result is full rank), `Design.rank`'s
+  `tol`, and `build_pfa_design`'s `student_l2` (PFA's optional student
+  block is unpenalized, as it was by default).
+
+### Fixed
+
+- `leapfit-lfa` stopped with a traceback when two factor models covered as
+  many rows as each other but not the same ones. It grouped the models by
+  row count, and `build_factor_matrix` then refused the mismatch. It now
+  groups them by the rows they cover, and excludes the minority with its
+  reason, as it already did for a model over fewer rows.
+- The warning for a fit that stops short of its optimum said "AFM" for
+  every model family. It now names the family: "The PFA fit is not at a
+  stationary point", and so on.
+- A refused lineage merge was recorded under the wrong move: the last
+  move left on its history, or "root" when none was. It is now recorded
+  as the undo itself, `undo split <skill> by <factor>`.
+- `fit_pfa` takes `w0`, as `fit_afm` and `fit_lkt` do.
+- `paired_scores` returned an empty table, and `paired_contrasts` could not
+  find its baseline, for a run with `seed=None`, LabelKFold's deterministic
+  partition: grouping on the seed dropped the missing key. Both now keep it.
+- The source distribution ships `examples/README.md`. The repository's
+  `.gitignore` drops every `*.md` and hatchling honours it, so every release
+  so far packed the examples without their README. It is now named in
+  `artifacts`, as `CHANGELOG.md` already was.
+- `uv build` in a working copy no longer packs a second virtual environment,
+  such as `.venv-pybkt`, into the sdist. uv hides each environment from git
+  with a `.gitignore` inside it, which hatchling does not read, so building
+  0.6.0 that way failed on the environment's link to its interpreter.
+  `.venv*/` is now ignored at the root.
+
 ## 0.6.0 — 2026-09-30
 
 ### Changed

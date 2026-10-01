@@ -207,8 +207,7 @@ def _score_fold(job: tuple) -> dict:
     ).ravel() > 0
 
     return {
-        "n_train": len(train_idx), "n_test": len(test_idx),
-        "resid": resid,
+        "n_test": len(test_idx),
         "rmse": float(np.sqrt(np.mean(resid ** 2))),
         "sse": float(np.sum(resid ** 2)),
         "unseen_column_fraction": float(touches_unseen.mean()),
@@ -241,13 +240,6 @@ def _run_folds(jobs: list[tuple], models: dict[str, Design], y: np.ndarray,
         return list(pool.map(_score_fold, jobs))
 
 
-def _combine(scored: list[dict], convention: str) -> float:
-    if convention == "per_fold":
-        return float(np.mean([s["rmse"] for s in scored]))
-    resid = np.concatenate([s["resid"] for s in scored])
-    return float(np.sqrt(np.mean(resid ** 2)))
-
-
 def cross_validate(design: Design, data: StepData, *, scheme: str = "item_blocked",
                    n_folds: int = 3, seed: int | None = None,
                    convention: str = "per_fold", method: str = DEFAULT_METHOD,
@@ -256,23 +248,24 @@ def cross_validate(design: Design, data: StepData, *, scheme: str = "item_blocke
 
     :param n_jobs: worker processes to fit folds in, ``-1`` for every core.
         The result does not depend on it.
+
+    The single-model case of :func:`paired_cross_validate`, scored by
+    :func:`paired_scores`.
     """
     if convention not in CONVENTIONS:
         raise ValueError(f"convention must be one of {CONVENTIONS}, got {convention!r}")
-
-    y = np.asarray(data.y, dtype=float)
-    test_folds = _checked_folds(data, scheme, n_folds, seed, convention)
-    jobs = [(_SOLE, seed, f, idx) for f, idx in enumerate(test_folds)]
-    scored = _run_folds(jobs, {_SOLE: design}, y, method, max_fun, n_jobs)
-
+    folds = paired_cross_validate(
+        {_SOLE: design}, data, scheme=scheme, n_folds=n_folds, seeds=(seed,),
+        convention=convention, method=method, max_fun=max_fun, n_jobs=n_jobs)
     results = tuple(
-        FoldResult(fold=f, n_train=s["n_train"], n_test=s["n_test"],
-                   rmse=s["rmse"], unseen_column_fraction=s["unseen_column_fraction"],
-                   converged=s["converged"])
-        for f, s in enumerate(scored)
+        FoldResult(fold=int(r.fold), n_train=len(data) - int(r.n_test), n_test=int(r.n_test),
+                   rmse=float(r.rmse), unseen_column_fraction=float(r.unseen_column_fraction),
+                   converged=bool(r.converged))
+        for r in folds.itertuples()
     )
+    rmse = float(paired_scores(folds, convention)["rmse"].iloc[0])
     return CVResult(scheme=scheme, convention=convention, n_folds=n_folds,
-                    seed=seed, rmse=_combine(scored, convention), folds=results)
+                    seed=seed, rmse=rmse, folds=results)
 
 
 def repeated_cross_validate(design: Design, data: StepData, *, seeds,
@@ -283,35 +276,22 @@ def repeated_cross_validate(design: Design, data: StepData, *, seeds,
                             n_jobs: int | None = 1) -> pd.DataFrame:
     """Repeat CV over seeds, as published KC-model comparisons commonly do.
 
-    Returns one row per seed. Note that averaging these and running a t-test
-    over them treats non-independent resamples as independent; the spread is
-    a description of partition sensitivity, not a standard error.
+    Returns one row per distinct seed. Note that averaging these and running
+    a t-test over them treats non-independent resamples as independent; the
+    spread is a description of partition sensitivity, not a standard error.
 
-    Every (seed, fold) pair is one job in a single pool, rather than one pool
-    per seed: a 50-seed 3-fold protocol is 150 independent fits, and cutting it
-    at the seed boundary would idle every core past the third.
+    The single-model case of :func:`paired_cross_validate`, scored by
+    :func:`paired_scores`. Every (seed, fold) pair is one job in a single pool,
+    rather than one pool per seed: a 50-seed 3-fold protocol is 150 independent
+    fits, and cutting it at the seed boundary would idle every core past the
+    third.
     """
-    seeds = list(seeds)
-    y = np.asarray(data.y, dtype=float)
-
-    jobs, widths = [], []
-    for seed in seeds:
-        folds = _checked_folds(data, scheme, n_folds, seed, convention)
-        widths.append(len(folds))
-        jobs += [(_SOLE, seed, f, idx) for f, idx in enumerate(folds)]
-    scored = _run_folds(jobs, {_SOLE: design}, y, method, max_fun, n_jobs)
-
-    rows, start = [], 0
-    for seed, width in zip(seeds, widths):
-        chunk, start = scored[start:start + width], start + width
-        rows.append({
-            "seed": seed, "scheme": scheme, "convention": convention,
-            "rmse": _combine(chunk, convention),
-            "unseen_column_fraction": float(np.mean(
-                [s["unseen_column_fraction"] for s in chunk])),
-            "all_converged": all(s["converged"] for s in chunk),
-        })
-    return pd.DataFrame(rows)
+    folds = paired_cross_validate(
+        {_SOLE: design}, data, scheme=scheme, n_folds=n_folds, seeds=tuple(seeds),
+        convention=convention, method=method, max_fun=max_fun, n_jobs=n_jobs)
+    scores = paired_scores(folds, convention)
+    return scores.drop(columns="model").assign(scheme=scheme, convention=convention)[
+        ["seed", "scheme", "convention", "rmse", "unseen_column_fraction", "all_converged"]]
 
 
 def paired_cross_validate(models: dict[str, Design], data: StepData, *,
@@ -373,18 +353,17 @@ def paired_scores(folds: pd.DataFrame, convention: str) -> pd.DataFrame:
     """Per-(model, seed) RMSE from a paired table, under either convention.
 
     A :func:`paired_cross_validate` table carries enough per fold (``rmse``,
-    ``sse``, ``n_test``) to reconstruct what :func:`repeated_cross_validate`
-    would report under either convention — from the same fits, on folds shared
-    across models rather than drawn per model. ``per_fold`` is the mean of the
-    fold RMSEs; ``pooled`` is ``sqrt(sum(sse) / sum(n_test))``, identical to
-    pooling the held-out residuals.
+    ``sse``, ``n_test``) for either convention, so one set of fits serves
+    both. ``per_fold`` is the mean of the fold RMSEs; ``pooled`` is
+    ``sqrt(sum(sse) / sum(n_test))``, the RMSE of the pooled held-out
+    residuals. :func:`cross_validate` and :func:`repeated_cross_validate` are
+    this, over a table of one model.
 
-    Returns one row per (model, seed), with the same score columns as
-    :func:`repeated_cross_validate`.
+    Returns one row per (model, seed), a seed of ``None`` included.
     """
     if convention not in CONVENTIONS:
         raise ValueError(f"convention must be one of {CONVENTIONS}, got {convention!r}")
-    grouped = folds.groupby(["model", "seed"], sort=False)
+    grouped = folds.groupby(["model", "seed"], sort=False, dropna=False)
     rmse = (grouped["rmse"].mean() if convention == "per_fold"
             else np.sqrt(grouped["sse"].sum() / grouped["n_test"].sum()))
     return pd.DataFrame({
@@ -401,7 +380,8 @@ def paired_contrasts(folds: pd.DataFrame, baseline: str) -> pd.DataFrame:
     interval is over folds, which describes how consistently it wins; with a
     handful of folds it is a description, not an inferential claim.
     """
-    wide = folds.pivot_table(index=["seed", "fold"], columns="model", values="rmse")
+    wide = folds.pivot_table(index=["seed", "fold"], columns="model", values="rmse",
+                             dropna=False)
     if baseline not in wide.columns:
         raise KeyError(f"baseline {baseline!r} not among {list(wide.columns)}")
     out = []

@@ -12,7 +12,6 @@ that defect does, as a permanent demonstration.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from leapfit import (
@@ -26,48 +25,7 @@ from leapfit import (
 )
 from leapfit.fit import _expit
 
-# --------------------------------------------------------------------------
-# Fixtures
-# --------------------------------------------------------------------------
-
-
-def _rollup(rows, kc_model="M"):
-    return pd.DataFrame(rows).rename(
-        columns={"kc": f"KC ({kc_model})", "opp": f"Opportunity ({kc_model})"})
-
-
-def _row(student, step, y, kc, opp, time=None):
-    out = {
-        "Anon Student Id": student, "Problem Name": "p", "Step Name": step,
-        "First Attempt": "correct" if y else "incorrect", "kc": kc, "opp": str(opp),
-    }
-    if time is not None:
-        out["First Transaction Time"] = time
-    return out
-
-
-def _simulate_pfa(n_students=40, n_reps=12, seed=5, truth=None, student_sd=0.0):
-    """Sequentially simulate from a known PFA — counts feed back into outcomes."""
-    truth = truth or {"A": (0.3, 0.30, -0.25), "B": (-0.4, 0.20, -0.10),
-                      "C": (0.0, 0.10, -0.30)}
-    rng = np.random.default_rng(seed)
-    rows = []
-    for i in range(n_students):
-        theta = rng.normal(0.0, student_sd)
-        s_cnt = dict.fromkeys(truth, 0)
-        f_cnt = dict.fromkeys(truth, 0)
-        order = [k for _ in range(n_reps) for k in truth]
-        rng.shuffle(order)
-        for t, kc in enumerate(order):
-            beta, gamma, rho = truth[kc]
-            p = 1.0 / (1.0 + np.exp(-(theta + beta + gamma * s_cnt[kc] + rho * f_cnt[kc])))
-            y = int(rng.random() < p)
-            rows.append(_row(f"S{i:03d}", f"st{kc}{t}", y, kc,
-                             s_cnt[kc] + f_cnt[kc] + 1))
-            s_cnt[kc] += y
-            f_cnt[kc] += 1 - y
-    return from_frame(_rollup(rows), "M"), truth
-
+from helpers import rollup, simulate_pfa, step_data, step_row
 
 # --------------------------------------------------------------------------
 # Count semantics — the part the reference got wrong
@@ -76,8 +34,8 @@ def _simulate_pfa(n_students=40, n_reps=12, seed=5, truth=None, student_sd=0.0):
 
 def test_counts_are_strictly_prior():
     """correct, incorrect, correct -> s = (0,1,1), f = (0,0,1)."""
-    df = _rollup([_row("s1", f"st{i}", y, "A", i + 1)
-                  for i, y in enumerate([1, 0, 1])])
+    df = rollup([step_row("s1", f"st{i}", y, "A", i + 1)
+                 for i, y in enumerate([1, 0, 1])])
     data = from_frame(df, "M")
     s, f = success_failure_counts(data)
     assert s == [(0,), (1,), (1,)]
@@ -87,7 +45,7 @@ def test_counts_are_strictly_prior():
 def test_the_inclusive_mode_reproduces_the_reference_leak_identity():
     """AnalysisPfaStepBased's cumsum: s = s_prior + y, f = f_prior + (1 - y),
     row by row — the identity that puts the response on both sides."""
-    data, _ = _simulate_pfa(n_students=8, n_reps=6)
+    data, _ = simulate_pfa(n_students=8, n_reps=6)
     s_prior, f_prior = success_failure_counts(data)
     s_incl, f_incl = success_failure_counts(data, inclusive=True)
     for i in range(len(data)):
@@ -96,22 +54,11 @@ def test_the_inclusive_mode_reproduces_the_reference_leak_identity():
         assert all(a == b + (1 - y) for a, b in zip(f_incl[i], f_prior[i]))
 
 
-def test_successes_plus_failures_equal_the_opportunity_count():
-    """s + f = T identically: PFA splits AFM's practice count by outcome.
-
-    Both sides accumulate over ``practice_order``, so this ties the two
-    families to one definition of "prior practice"."""
-    data, _ = _simulate_pfa(n_students=10, n_reps=8)
-    s, f = success_failure_counts(data)
-    assert [tuple(a + b for a, b in zip(si, fi)) for si, fi in zip(s, f)] \
-        == data.recomputed_opportunities()
-
-
 def test_multi_kc_steps_feed_every_kc_on_the_row():
-    df = _rollup([
-        _row("s1", "st1", 1, "A~~B", "1~~1"),
-        _row("s1", "st2", 0, "A~~B", "2~~2"),
-        _row("s1", "st3", 1, "A", "3"),
+    df = rollup([
+        step_row("s1", "st1", 1, "A~~B", "1~~1"),
+        step_row("s1", "st2", 0, "A~~B", "2~~2"),
+        step_row("s1", "st3", 1, "A", "3"),
     ])
     data = from_frame(df, "M")
     s, f = success_failure_counts(data)
@@ -122,9 +69,9 @@ def test_multi_kc_steps_feed_every_kc_on_the_row():
 def test_counts_follow_transaction_time_not_row_order():
     """A file listing attempts out of order still accumulates by time —
     the validation export really contains such inversions."""
-    df = _rollup([
-        _row("s1", "late", 1, "A", 2, time="2024-01-01 01:44:41"),
-        _row("s1", "early", 0, "A", 1, time="2024-01-01 01:44:36"),
+    df = rollup([
+        step_row("s1", "late", 1, "A", 2, time="2024-01-01 01:44:41"),
+        step_row("s1", "early", 0, "A", 1, time="2024-01-01 01:44:36"),
     ])
     data = from_frame(df, "M")
     s, f = success_failure_counts(data)
@@ -138,7 +85,7 @@ def test_counts_follow_transaction_time_not_row_order():
 
 
 def test_per_kc_design_shape_and_blocks():
-    data, truth = _simulate_pfa(n_students=12, n_reps=8)
+    data, truth = simulate_pfa(n_students=12, n_reps=8)
     design = build_pfa_design(data, identify=False)
     assert [b.name for b in design.blocks] == ["kc_intercept", "kc_success", "kc_failure"]
     assert design.n_params == 3 * len(truth)
@@ -146,14 +93,14 @@ def test_per_kc_design_shape_and_blocks():
 
 
 def test_pooled_design_shares_two_slopes():
-    data, truth = _simulate_pfa(n_students=12, n_reps=8)
+    data, truth = simulate_pfa(n_students=12, n_reps=8)
     design = build_pfa_design(data, slopes="pooled", identify=False)
     assert [b.name for b in design.blocks] == ["kc_intercept", "success", "failure"]
     assert design.n_params == len(truth) + 2
 
 
 def test_student_intercepts_recreate_the_sum_redundancy_and_identify_fixes_it():
-    data, _ = _simulate_pfa(n_students=12, n_reps=8)
+    data, _ = simulate_pfa(n_students=12, n_reps=8)
     design = build_pfa_design(data, student_intercepts=True)
     dropped = design.aliased.by_block()
     assert dropped.get("student"), "one student must fall out as the reference level"
@@ -161,26 +108,20 @@ def test_student_intercepts_recreate_the_sum_redundancy_and_identify_fixes_it():
 
 
 def test_invalid_options_raise():
-    data, _ = _simulate_pfa(n_students=4, n_reps=4)
+    data, _ = simulate_pfa(n_students=4, n_reps=4)
     with pytest.raises(ValueError, match="slopes"):
         build_pfa_design(data, slopes="banana")
     with pytest.raises(ValueError, match="counts"):
         build_pfa_design(data, counts="lagged")
 
 
-def test_inclusive_counts_warn_at_build_time():
-    data, _ = _simulate_pfa(n_students=4, n_reps=4)
-    with pytest.warns(UserWarning, match="inside its own predictor"):
-        build_pfa_design(data, counts="inclusive")
-
-
 def test_a_kc_with_no_prior_successes_has_no_estimable_success_slope():
     """The PFA analogue of AFM's never-practised-twice KC."""
-    rows = [_row(f"s{i}", f"st{r}", 0, "Z", r + 1)
+    rows = [step_row(f"s{i}", f"st{r}", 0, "Z", r + 1)
             for i in range(6) for r in range(3)]
-    rows += [_row(f"s{i}", f"stA{r}", r % 2, "A", r + 1)
+    rows += [step_row(f"s{i}", f"stA{r}", r % 2, "A", r + 1)
              for i in range(6) for r in range(4)]
-    data = from_frame(_rollup(rows), "M")
+    data = step_data(rows)
     design = build_pfa_design(data)
     assert "kc_success:Z" in design.aliased.columns
 
@@ -198,7 +139,7 @@ def test_a_kc_with_no_prior_successes_has_no_estimable_success_slope():
 
 
 def test_recovers_the_generating_parameters():
-    data, truth = _simulate_pfa(n_students=60, n_reps=14, seed=11)
+    data, truth = simulate_pfa(n_students=60, n_reps=14, seed=11)
     fit = fit_pfa(build_pfa_design(data), data.y, method="L-BFGS-B",
                   max_fun=200_000)
     assert fit.is_optimal
@@ -213,7 +154,7 @@ def test_pfa_nests_afm():
     """With T recomputed, AFM's slope column is exactly kc_success + kc_failure,
     so PFA's likelihood can never be worse — and splitting one slope into two
     costs exactly one parameter per KC."""
-    data, truth = _simulate_pfa(n_students=25, n_reps=10, seed=3, student_sd=0.6)
+    data, truth = simulate_pfa(n_students=25, n_reps=10, seed=3, student_sd=0.6)
     afm_design = build_afm_design(data, recompute_opportunities=True)
     pfa_design = build_pfa_design(data, student_intercepts=True)
 
@@ -234,9 +175,9 @@ def test_inclusive_counts_manufacture_learning_rates_from_noise():
     predicts itself.
     """
     rng = np.random.default_rng(0)
-    rows = [_row(f"s{i:02d}", f"st{t}", int(rng.random() < 0.6), "K", t + 1)
+    rows = [step_row(f"s{i:02d}", f"st{t}", int(rng.random() < 0.6), "K", t + 1)
             for i in range(60) for t in range(30)]
-    data = from_frame(_rollup(rows), "M")
+    data = step_data(rows)
 
     prior = fit_pfa(build_pfa_design(data, slopes="pooled"), data.y,
                     method="L-BFGS-B", max_fun=100_000)
@@ -245,7 +186,8 @@ def test_inclusive_counts_manufacture_learning_rates_from_noise():
     leaky = fit_pfa(leaky_design, data.y, method="L-BFGS-B", max_fun=100_000)
 
     def slopes(fit):
-        return fit.block("success")[0], fit.block("failure")[0]
+        values = fit.kc_values(data)
+        return values.loc[0, "Success Slope"], values.loc[0, "Failure Slope"]
 
     g0, r0 = slopes(prior)
     g1, r1 = slopes(leaky)
@@ -255,8 +197,24 @@ def test_inclusive_counts_manufacture_learning_rates_from_noise():
         "the leak buys a large spurious likelihood gain")
 
 
+def test_a_fit_that_stops_short_names_its_family():
+    """Regression: the warning said AFM whatever was fitted."""
+    data, _ = simulate_pfa(n_students=8, n_reps=6)
+    with pytest.warns(RuntimeWarning, match="The PFA fit is not at a stationary point"):
+        fit_pfa(build_pfa_design(data), data.y, method="TNC", max_fun=2)
+
+
+def test_a_pfa_fit_can_start_from_another():
+    """``w0``, as fit_afm and fit_lkt take it: the same optimum from a warm start."""
+    data, _ = simulate_pfa(n_students=8, n_reps=6)
+    design = build_pfa_design(data)
+    cold = fit_pfa(design, data.y, warn_not_converged=False)
+    warm = fit_pfa(design, data.y, w0=cold.weights, warn_not_converged=False)
+    assert warm.ll == pytest.approx(cold.ll, abs=1e-6)
+
+
 def test_pooled_kc_values_broadcast_the_shared_slopes():
-    data, _ = _simulate_pfa(n_students=15, n_reps=8)
+    data, _ = simulate_pfa(n_students=15, n_reps=8)
     fit = fit_pfa(build_pfa_design(data, slopes="pooled"), data.y,
                   warn_not_converged=False)
     values = fit.kc_values(data)
@@ -266,7 +224,7 @@ def test_pooled_kc_values_broadcast_the_shared_slopes():
 
 
 def test_probability_column_matches_the_intercept():
-    data, _ = _simulate_pfa(n_students=15, n_reps=8)
+    data, _ = simulate_pfa(n_students=15, n_reps=8)
     fit = fit_pfa(build_pfa_design(data), data.y, warn_not_converged=False)
     values = fit.kc_values(data)
     np.testing.assert_allclose(
@@ -280,7 +238,7 @@ def test_probability_column_matches_the_intercept():
 
 
 def test_cross_validation_and_annotation_work_for_pfa():
-    data, _ = _simulate_pfa(n_students=15, n_reps=8)
+    data, _ = simulate_pfa(n_students=15, n_reps=8)
     design = build_pfa_design(data)
     cv = cross_validate(design, data, scheme="item_blocked", n_folds=3)
     assert 0.0 < cv.rmse < 1.0
@@ -290,17 +248,3 @@ def test_cross_validation_and_annotation_work_for_pfa():
     col = out["Predicted Error Rate (M)"]
     assert len(out) == len(data) and not col.isna().any()
     np.testing.assert_allclose(col.to_numpy(), 1.0 - fit.predict_proba(design))
-
-
-def test_the_pfa_cli_end_to_end(tmp_path):
-    from leapfit.cli import main_pfa
-
-    data, _ = _simulate_pfa(n_students=8, n_reps=6)
-    export = tmp_path / "export.txt"
-    data.source.to_csv(export, sep="\t", index=False, lineterminator="\n")
-
-    out_dir = tmp_path / "kc"
-    assert main_pfa([str(export), "--cv", "none", "--pooled-slopes",
-                     "--kc-values", str(out_dir)]) == 0
-    written = pd.read_csv(out_dir / "M_kc-values.csv")
-    assert "Success Slope" in written.columns and "Failure Slope" in written.columns

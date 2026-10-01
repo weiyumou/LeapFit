@@ -83,26 +83,24 @@ import pandas as pd
 
 from leapfit import (
     CONVENTIONS,
+    DEFAULT_METHOD,
     HEURISTICS,
     MERGES,
     SCHEMES,
     build_afm_design,
     build_factor_matrix,
     build_pfa_design,
-    cross_validate,
     fit_afm,
     fit_pfa,
     from_frame,
     lfa_search,
     list_kc_models,
-    load_student_step,
     paired_contrasts,
     paired_cross_validate,
     paired_scores,
-    repeated_cross_validate,
     validate_top,
 )
-from leapfit.lfa import BEAM, MAX_ITERATIONS, MIN_OPPORTUNITIES, PATIENCE, relabel
+from leapfit.lfa import BEAM, MAX_ITERATIONS, MIN_OPPORTUNITIES, PATIENCE, _state_design
 
 
 def parse_seeds(spec: str | None) -> list[int] | None:
@@ -149,7 +147,7 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
                    help="KC model to contrast the others against in paired CV "
                         "(default: the model with the best mean cv_rmse per "
                         "scheme)")
-    p.add_argument("--method", default="TNC",
+    p.add_argument("--method", default=DEFAULT_METHOD,
                    help="TNC reproduces LearnSphere; L-BFGS-B converges tighter")
     p.add_argument("--max-fun", type=int, default=None,
                    help="function-evaluation budget; default = solver default, "
@@ -183,10 +181,9 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
                         "against the baseline, paired by fold) to this CSV")
     p.add_argument("--cv-folds", metavar="FILE",
                    help="write the cross-validation detail behind the means to "
-                        "this CSV — one row per KC model, scheme, seed and fold "
-                        "for paired CV (per seed for independent repeated CV; "
-                        "per fold for a single run), so a reported mean can be "
-                        "traced to the runs behind it")
+                        "this CSV — one row per KC model, scheme, seed and fold, "
+                        "paired or not — so a reported mean can be traced to the "
+                        "runs behind it")
     p.add_argument("--identification", metavar="FILE",
                    help="write every aliased column and the reason it was dropped "
                         "to this CSV: what the parameter count excludes, and why")
@@ -199,22 +196,46 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
     return p
 
 
-def _build_and_fit(args, family: str, data, method: str, max_fun):
+def _build_and_fit(args, family: str, data):
     """The one family-specific step: assemble the design, fit it."""
     if family == "afm":
         design = build_afm_design(
             data, learnsphere_compat=args.learnsphere_compat,
             student_l2=args.student_l2,
             recompute_opportunities=args.recompute_opportunities)
-        fit = fit_afm(design, data.y, method=method, max_fun=max_fun)
+        fit = fit_afm(design, data.y, method=args.method, max_fun=args.max_fun)
     else:
         design = build_pfa_design(
             data,
             slopes="pooled" if args.pooled_slopes else "per_kc",
             student_intercepts=args.student_intercepts,
             counts="inclusive" if args.inclusive_counts else "prior")
-        fit = fit_pfa(design, data.y, method=method, max_fun=max_fun)
+        fit = fit_pfa(design, data.y, method=args.method, max_fun=args.max_fun)
     return design, fit
+
+
+def _read_export(path: str) -> pd.DataFrame:
+    """The export as :func:`~leapfit.load_student_step` reads it, read once
+    for every KC model in it."""
+    return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+
+
+def _kc_models(args, requested: list[str] | None) -> tuple[int | None, list[str], list[str]]:
+    """The export's KC models and the ones asked for, or the exit code to stop
+    with: 0 once ``--list-models`` has printed them, 1 if the export has none
+    or a requested one is not among them."""
+    available = list_kc_models(args.export)
+    if args.list_models:
+        print("\n".join(available) or "(no KC models found)")
+        return 0, available, []
+    if not available:
+        print(f"No 'KC (...)' columns in {args.export}", file=sys.stderr)
+        return 1, available, []
+    wanted = requested or available
+    if unknown := [m for m in wanted if m not in available]:
+        print(f"Unknown KC model(s) {unknown}. Available: {available}", file=sys.stderr)
+        return 1, available, wanted
+    return None, available, wanted
 
 
 def _shared_rows(fitted: list) -> bool:
@@ -237,114 +258,68 @@ class _Fitted:
             name, data, design, fit, row
 
 
-def _independent_cv(args, fitted: list, schemes: list[str], seeds, suffix,
-                    fold_rows: list) -> None:
-    """The pre-paired protocol: each model scored on its own folds."""
-    print("\n=== cross-validation: independent folds per model ===", file=sys.stderr)
-    for entry in fitted:
-        for scheme in schemes:
-            cv_kwargs = {"scheme": scheme, "n_folds": args.folds,
-                         "convention": args.convention, "method": args.method,
-                         "max_fun": args.max_fun, "n_jobs": args.jobs}
-            s = suffix(scheme)
-            if seeds:
-                table = repeated_cross_validate(entry.design, entry.data,
-                                                seeds=seeds, **cv_kwargs)
-                entry.row |= {
-                    f"cv_rmse{s}": table["rmse"].mean(),
-                    f"cv_rmse_sd{s}": table["rmse"].std(ddof=1),
-                    f"cv_runs{s}": len(table),
-                    f"cv_unseen_fraction{s}": table["unseen_column_fraction"].mean(),
-                    f"cv_all_converged{s}": bool(table["all_converged"].all()),
-                }
-                detail = table
-                print(f"  {entry.name}: {scheme} / {args.convention} over "
-                      f"{len(table)} seeds: RMSE = {entry.row[f'cv_rmse{s}']:.4f} "
-                      f"({entry.row[f'cv_rmse_sd{s}']:.4f})", file=sys.stderr)
-            else:
-                result = cross_validate(entry.design, entry.data, seed=None,
-                                        **cv_kwargs)
-                entry.row |= {
-                    f"cv_rmse{s}": result.rmse,
-                    f"cv_rmse_sd{s}": np.nan,
-                    f"cv_runs{s}": 1,
-                    f"cv_unseen_fraction{s}": float(np.mean(
-                        [f.unseen_column_fraction for f in result.folds])),
-                    f"cv_all_converged{s}": all(f.converged for f in result.folds),
-                }
-                detail = result.frame
-                print(f"  {entry.name}: {result.summary()}", file=sys.stderr)
-
-            if args.cv_folds:
-                detail = detail.copy()
-                if "scheme" not in detail:
-                    detail.insert(0, "scheme", scheme)
-                detail.insert(0, "kc_model", entry.name)
-                fold_rows.append(detail)
+def _cv_columns(scores: pd.DataFrame, s: str) -> dict:
+    """The table's held-out columns, from one model's per-seed scores."""
+    return {
+        f"cv_rmse{s}": float(scores["rmse"].mean()),
+        f"cv_rmse_sd{s}": float(scores["rmse"].std(ddof=1)),
+        f"cv_runs{s}": len(scores),
+        f"cv_unseen_fraction{s}": float(scores["unseen_column_fraction"].mean()),
+        f"cv_all_converged{s}": bool(scores["all_converged"].all()),
+    }
 
 
-def _paired_cv(args, fitted: list, schemes: list[str], seeds, suffix,
-               fold_rows: list, contrast_rows: list) -> None:
-    """Shared folds across all models; scores and contrasts from one set of fits."""
-    seeds = seeds or [0]
-    models = {entry.name: entry.design for entry in fitted}
-    data = fitted[0].data
-    print(f"\n=== cross-validation: paired, folds shared by all {len(models)} "
-          f"models ({len(seeds)} seed(s); --no-paired for the independent "
-          "protocol) ===", file=sys.stderr)
+def _cross_validate(args, fitted: list, schemes: list[str], seeds, suffix, paired: bool,
+                    fold_rows: list, contrast_rows: list) -> None:
+    """Score every model under each scheme, on folds shared by all of them when
+    ``paired`` and on each model's own otherwise; contrasts need shared folds."""
+    if paired:
+        seeds = seeds or [0]  # shared folds must be seeded
+        groups = [fitted]
+        print(f"\n=== cross-validation: paired, folds shared by all {len(fitted)} "
+              f"models ({len(seeds)} seed(s); --no-paired for the independent "
+              "protocol) ===", file=sys.stderr)
+    else:
+        seeds = seeds or [None]
+        groups = [[entry] for entry in fitted]
+        print("\n=== cross-validation: independent folds per model ===", file=sys.stderr)
 
     for scheme in schemes:
-        folds = paired_cross_validate(
-            models, data, scheme=scheme, n_folds=args.folds, seeds=tuple(seeds),
-            convention=args.convention, method=args.method,
-            max_fun=args.max_fun, n_jobs=args.jobs)
-        scores = paired_scores(folds, args.convention)
         s = suffix(scheme)
-
         print(f"  {scheme} / {args.convention} / {args.folds} folds:", file=sys.stderr)
-        for entry in fitted:
-            sc = scores[scores["model"] == entry.name]
-            entry.row |= {
-                f"cv_rmse{s}": float(sc["rmse"].mean()),
-                f"cv_rmse_sd{s}": float(sc["rmse"].std(ddof=1)),
-                f"cv_runs{s}": len(sc),
-                f"cv_unseen_fraction{s}": float(sc["unseen_column_fraction"].mean()),
-                f"cv_all_converged{s}": bool(sc["all_converged"].all()),
-            }
-            print(f"    {entry.name}: RMSE = {entry.row[f'cv_rmse{s}']:.4f}"
-                  f" | {entry.row[f'cv_unseen_fraction{s}']:.1%} of held-out "
-                  "rows hit an unseen column", file=sys.stderr)
+        for group in groups:
+            folds = paired_cross_validate(
+                {entry.name: entry.design for entry in group}, group[0].data,
+                scheme=scheme, n_folds=args.folds, seeds=tuple(seeds),
+                convention=args.convention, method=args.method,
+                max_fun=args.max_fun, n_jobs=args.jobs)
+            scores = paired_scores(folds, args.convention)
+            for entry in group:
+                entry.row |= _cv_columns(scores[scores["model"] == entry.name], s)
+                print(f"    {entry.name}: RMSE = {entry.row[f'cv_rmse{s}']:.4f}"
+                      f" | {entry.row[f'cv_unseen_fraction{s}']:.1%} of held-out "
+                      "rows hit an unseen column", file=sys.stderr)
+            if args.cv_folds:
+                fold_rows.append(
+                    folds.rename(columns={"model": "kc_model"}).assign(scheme=scheme)[
+                        ["kc_model", "scheme", "seed", "fold", "n_test", "rmse", "sse",
+                         "unseen_column_fraction", "converged", "is_optimal"]])
 
-        baseline = args.baseline or scores.groupby("model")["rmse"].mean().idxmin()
-        contrasts = paired_contrasts(folds, baseline=baseline)
-        contrasts.insert(0, "scheme", scheme)
-        contrast_rows.append(contrasts)
-        for c in contrasts.itertuples():
-            print(f"    {c.model} vs {baseline}: {c.mean_diff:+.6f} "
-                  f"(better in {c.folds_better}/{c.n_folds} folds)", file=sys.stderr)
-
-        if args.cv_folds:
-            fold_rows.append(
-                folds.rename(columns={"model": "kc_model"}).assign(scheme=scheme)[
-                    ["kc_model", "scheme", "seed", "fold", "n_test", "rmse", "sse",
-                     "unseen_column_fraction", "converged", "is_optimal"]])
+        if paired:
+            baseline = args.baseline or scores.groupby("model")["rmse"].mean().idxmin()
+            contrasts = paired_contrasts(folds, baseline=baseline)
+            contrasts.insert(0, "scheme", scheme)
+            contrast_rows.append(contrasts)
+            for c in contrasts.itertuples():
+                print(f"    {c.model} vs {baseline}: {c.mean_diff:+.6f} "
+                      f"(better in {c.folds_better}/{c.n_folds} folds)", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
     args = build_parser(family).parse_args(argv)
-
-    available = list_kc_models(args.export)
-    if args.list_models:
-        print("\n".join(available) or "(no KC models found)")
-        return 0
-    if not available:
-        print(f"No 'KC (...)' columns in {args.export}", file=sys.stderr)
-        return 1
-
-    wanted = args.kc_models or available
-    if unknown := [m for m in wanted if m not in available]:
-        print(f"Unknown KC model(s) {unknown}. Available: {available}", file=sys.stderr)
-        return 1
+    code, _, wanted = _kc_models(args, args.kc_models)
+    if code is not None:
+        return code
     if args.baseline and args.baseline not in wanted:
         print(f"--baseline {args.baseline!r} is not among the fitted KC models "
               f"{wanted}", file=sys.stderr)
@@ -360,17 +335,17 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
     suffix = (lambda s: "") if len(schemes) == 1 else (lambda s: f"_{s}")
 
     seeds = parse_seeds(args.seeds)
-    rows, fold_rows, alias_rows, contrast_rows = [], [], [], []
+    fold_rows, alias_rows, contrast_rows = [], [], []
     annotated = None  # the input table, gaining one prediction column per model
 
     # ---- fit every model once; CV needs them all before it can share folds ----
-    export = pd.read_csv(args.export, sep="\t", dtype=str, keep_default_na=False)
+    export = _read_export(args.export)
     fitted: list[_Fitted] = []
     for name in wanted:
         data = from_frame(export, kc_model=name)
         print(f"\n=== {name} ===\n{data.summary()}", file=sys.stderr)
 
-        design, fit = _build_and_fit(args, family, data, args.method, args.max_fun)
+        design, fit = _build_and_fit(args, family, data)
         print(fit.summary(), file=sys.stderr)
 
         row = {
@@ -386,7 +361,6 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
             "bic": fit.bic,
             "is_optimal": fit.is_optimal,
         }
-        rows.append(row)
         fitted.append(_Fitted(name, data, design, fit, row))
 
         if args.identification:
@@ -416,13 +390,10 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
                   f"no KC label is dropped for that model): {coverage}. Shared "
                   "folds are impossible, so falling back to independent "
                   "per-model CV; no paired contrasts.", file=sys.stderr)
-        if paired:
-            _paired_cv(args, fitted, cv_schemes, seeds, suffix,
-                       fold_rows, contrast_rows)
-        else:
-            _independent_cv(args, fitted, cv_schemes, seeds, suffix, fold_rows)
+        _cross_validate(args, fitted, cv_schemes, seeds, suffix, paired,
+                        fold_rows, contrast_rows)
 
-    table = pd.DataFrame(rows)
+    table = pd.DataFrame([entry.row for entry in fitted])
     print()
     print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     if contrast_rows:
@@ -523,7 +494,7 @@ def build_lfa_parser() -> argparse.ArgumentParser:
     p.add_argument("--learnsphere-compat", action="store_true",
                    help="score with the reference's conventions rather than "
                         "rank(X); reproduction only")
-    p.add_argument("--method", default="TNC", help="TNC or L-BFGS-B")
+    p.add_argument("--method", default=DEFAULT_METHOD, help="TNC or L-BFGS-B")
     p.add_argument("--max-fun", type=int, default=None, metavar="N")
     p.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
                    help="processes to score an expansion across; -1 is every "
@@ -565,8 +536,8 @@ def build_lfa_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _eligible_factor_models(export: str, wanted: list[str]) -> tuple[dict, list]:
-    """Load the requested models and drop the ones P cannot be built from.
+def _eligible_factor_models(export: pd.DataFrame, wanted: list[str]) -> tuple[dict, list]:
+    """Parse the requested models and drop the ones P cannot be built from.
 
     The reference aborts on an ineligible model. Reporting which ones and why,
     then proceeding with the rest, is more useful and no less explicit — the
@@ -575,7 +546,7 @@ def _eligible_factor_models(export: str, wanted: list[str]) -> tuple[dict, list]
     """
     loaded, excluded = {}, []
     for name in wanted:
-        data = load_student_step(export, kc_model=name)
+        data = from_frame(export, kc_model=name)
         if max((len(row) for row in data.kcs), default=0) > 1:
             excluded.append((name, "tags more than one KC on some rows"))
             continue
@@ -583,18 +554,23 @@ def _eligible_factor_models(export: str, wanted: list[str]) -> tuple[dict, list]
     if not loaded:
         return loaded, excluded
 
-    coverage: dict[int, list[str]] = {}
+    # Grouped by the rows covered, not by how many: two models can each blank
+    # a different step and land on the same count.
+    coverage: dict[bytes, list[str]] = {}
     for name, data in loaded.items():
-        coverage.setdefault(len(data), []).append(name)
+        coverage.setdefault(data.source_rows.tobytes(), []).append(name)
     if len(coverage) > 1:
         keep = max(coverage.values(), key=len)
-        for size, names in coverage.items():
+        majority = len(loaded[keep[0]])
+        for names in coverage.values():
             if names is keep:
                 continue
             for name in names:
-                majority = len(loaded[keep[0]])
-                reason = (f"covers {size:,} observations, not "
-                          f"{majority:,} like the majority")
+                size = len(loaded[name])
+                reason = (f"covers {size:,} observations, not {majority:,} like the "
+                          "majority" if size != majority else
+                          f"covers {size:,} observations like the majority, but not "
+                          "the same rows")
                 excluded.append((name, reason))
                 del loaded[name]
     return loaded, excluded
@@ -613,27 +589,18 @@ def _qmatrix_frame(data, labels_by_step: dict, kc_name: str) -> pd.DataFrame:
 def main_lfa(argv: list[str] | None = None) -> int:
     """The ``leapfit-lfa`` console script."""
     args = build_lfa_parser().parse_args(argv)
-
-    available = list_kc_models(args.export)
-    if args.list_models:
-        print("\n".join(available) or "(no KC models found)")
-        return 0
-    if not available:
-        print(f"No 'KC (...)' columns in {args.export}", file=sys.stderr)
-        return 1
-
-    wanted = args.factor_models or available
-    if unknown := [m for m in wanted if m not in available]:
-        print(f"Unknown KC model(s) {unknown}. Available: {available}",
-              file=sys.stderr)
-        return 1
-    for name in args.compare_models or []:
-        if name not in available:
-            print(f"--compare {name!r} is not a KC model in the export. "
+    code, available, wanted = _kc_models(args, args.factor_models)
+    if code is not None:
+        return code
+    named = [("--root", args.root)] + [("--compare", m) for m in args.compare_models or []]
+    for flag, name in named:
+        if name is not None and name not in available:
+            print(f"{flag} {name!r} is not a KC model in the export. "
                   f"Available: {available}", file=sys.stderr)
             return 1
 
-    loaded, excluded = _eligible_factor_models(args.export, wanted)
+    export = _read_export(args.export)
+    loaded, excluded = _eligible_factor_models(export, wanted)
     for name, reason in excluded:
         print(f"excluding {name!r} from the difficulty factors: {reason}",
               file=sys.stderr)
@@ -650,13 +617,13 @@ def main_lfa(argv: list[str] | None = None) -> int:
     for column, reason in zip(factors.dropped, factors.reasons):
         print(f"  dropped {column}: {reason}", file=sys.stderr)
 
+    def model(name: str):
+        """A KC model's observations, parsed once whichever option names it."""
+        return loaded[name] if name in loaded else from_frame(export, kc_model=name)
+
     root = None
     if args.root:
-        if args.root not in available:
-            print(f"--root {args.root!r} is not a KC model in the export. "
-                  f"Available: {available}", file=sys.stderr)
-            return 1
-        root = load_student_step(args.export, kc_model=args.root)
+        root = model(args.root)
         print(f"root: {args.root} ({len(root.kc_names)} KCs)", file=sys.stderr)
 
     result = lfa_search(
@@ -681,8 +648,7 @@ def main_lfa(argv: list[str] | None = None) -> int:
 
     validation = None
     if args.validate:
-        extra = {name: load_student_step(args.export, kc_model=name)
-                 for name in args.compare_models or []}
+        extra = {name: model(name) for name in args.compare_models or []}
         seeds = parse_seeds(args.seeds) or [0]
         print(f"\n=== held-out check of the top {args.validate}, folds shared "
               f"by every candidate ===", file=sys.stderr)
@@ -717,11 +683,9 @@ def main_lfa(argv: list[str] | None = None) -> int:
             args.qmatrix, sep="\t", index=False, lineterminator="\n")
         print(f"wrote {args.qmatrix}", file=sys.stderr)
     if args.predictions:
-        scored = relabel(data, factors.steps, result.best.labels)
+        scored, design = _state_design(data, factors.steps, result.best.labels,
+                                       args.learnsphere_compat)
         scored = dataclasses.replace(scored, kc_model=args.kc_model_name)
-        design = build_afm_design(scored,
-                                  learnsphere_compat=args.learnsphere_compat,
-                                  recompute_opportunities=False)
         fit = fit_afm(design, scored.y, method=args.method,
                       max_fun=args.max_fun, warn_separated=False)
         fit.annotate(scored).to_csv(args.predictions, sep="\t", index=False,
