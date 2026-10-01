@@ -2,7 +2,8 @@
 
 What the reader requires and what it refuses, how it orders practice and
 numbers opportunities, the clock it keeps for the families that need one,
-and how a transaction export is rolled up into a student-step one first.
+and how a transaction export, or a file made for DataShop's import, is rolled
+up into a student-step one first.
 """
 
 from __future__ import annotations
@@ -265,7 +266,7 @@ def test_an_export_without_a_clock_refuses_rather_than_substituting_one(example)
 
 
 # --------------------------------------------------------------------------
-# Transaction exports, rolled up into student-steps
+# Transaction exports and import files, rolled up into student-steps
 # --------------------------------------------------------------------------
 
 
@@ -352,18 +353,22 @@ def test_a_repeated_kc_header_in_the_file_reads_as_one_model(tmp_path):
 
 
 def test_opportunities_count_in_practice_order_and_the_rows_come_back_in_it():
-    """By time; within a second by problem start, as DataShop counts the earlier
-    problem view first; then by the export's own order. Returned in that order,
+    """By time; within a second by problem view, as DataShop counts a problem's
+    earlier view first; then by the file's own order. Returned in that order,
     the rows give the reader the same practice order, so a recount agrees."""
-    started = {"early": 0, "tie-late": 8, "tie-early": 2, "same-1": 3, "same-2": 3, "late": 0}
-    times = {"early": 1, "tie-late": 10, "tie-early": 10, "same-1": 20, "same-2": 20, "late": 30}
+    def at(t, view, step, outcome="CORRECT"):
+        return tx_row("s1", step, outcome, t, **{"Problem View": str(view)})
+
     steps = rollup_transactions(pd.DataFrame([
-        tx_row("s1", step, "INCORRECT" if step == "late" else "CORRECT", times[step],
-               **{"Problem Name": step, "Problem Start Time": stamp(started[step])})
-        for step in ["late", "tie-late", "same-1", "tie-early", "same-2", "early"]]))
-    assert steps["Step Name"].tolist() == ["early", "tie-early", "tie-late", "same-1",
-                                           "same-2", "late"]
-    assert steps["Opportunity (M)"].tolist() == ["1", "2", "3", "4", "5", "6"]
+        at(30, 1, "late", "INCORRECT"),
+        at(10, 2, "second-view"), at(10, 2, "second-view-too"),
+        at(20, 1, "same-1"), at(20, 1, "same-2"),
+        at(10, 1, "first-view"),
+        at(1, 1, "early"),
+    ]))
+    assert steps["Step Name"].tolist() == ["early", "first-view", "second-view",
+                                           "second-view-too", "same-1", "same-2", "late"]
+    assert steps["Opportunity (M)"].tolist() == ["1", "2", "3", "4", "5", "6", "7"]
     assert len(from_frame(steps, "M").opportunity_disagreements()) == 0
 
 
@@ -407,9 +412,14 @@ def test_a_step_without_a_kc_keeps_empty_cells_and_is_skipped():
     (lambda tx: tx.assign(**{"Sample Name": ["All Data", "Other"]}), ValueError, "2 samples"),
     (lambda tx: tx.assign(**{"Step Name": "st1"}), ValueError, "share their encounter"),
     (lambda tx: tx.assign(**{"Attempt At Step": ""}), ValueError, "No transaction has"),
+    (lambda tx: tx.drop(columns="Attempt At Step").assign(**{"Step Name": ""}), ValueError,
+     "No transaction names a step"),
     (lambda tx: tx.drop(columns="Problem View"), KeyError, "Problem View"),
+    (lambda tx: tx.assign(**{"Event Type": ["assess", ""]}), ValueError,
+     "'Event Type' is set on 1 of 2"),
+    (lambda tx: tx.assign(Time=["soon", stamp(1)]), ValueError, "no format DataShop imports"),
 ])
-def test_an_export_that_cannot_be_rolled_up_faithfully_is_refused(change, error, match):
+def test_transactions_that_cannot_be_rolled_up_faithfully_are_refused(change, error, match):
     tx = pd.DataFrame([tx_row("s1", "st1", "CORRECT", 0), tx_row("s1", "st2", "CORRECT", 1)])
     with pytest.raises(error, match=match):
         rollup_transactions(change(tx))
@@ -437,3 +447,49 @@ def test_the_example_comes_back_from_a_transaction_export_of_itself(example):
     refit = fit_afm(build_afm_design(again), again.y)
     assert refit.ll == pytest.approx(fit.ll, rel=1e-9)
     assert refit.n_params == fit.n_params
+
+
+def test_a_file_made_for_import_rolls_up_as_its_export_does(example):
+    """DataShop ignores an import's attempt numbers and makes its own, so a file
+    without them gives the table its export gives. A blank Event Type, as
+    DataShop's exports carry it, changes nothing."""
+    export = as_transactions(example.source).assign(**{"Event Type": ""})
+    imported = export.drop(columns="Attempt At Step")
+    pd.testing.assert_frame_equal(rollup_transactions(imported), rollup_transactions(export))
+
+
+def test_an_import_numbers_the_attempts_at_each_step_by_time():
+    """Wherever the file lists them: the earliest transaction that names the
+    step in its problem view is the first attempt, and one that names no step
+    is no attempt at all."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "CORRECT", 9),
+        tx_row("s1", "", "", 0),
+        tx_row("s1", "st1", "HINT", 4),
+        tx_row("s1", "st1", "INCORRECT", 6, **{"Problem View": "2"}),
+    ]).drop(columns="Attempt At Step"))
+    assert steps[["Problem View", "First Attempt", "First Transaction Time"]].values.tolist() == [
+        ["1", "hint", stamp(4)], ["2", "incorrect", stamp(6)]]
+
+
+def test_unix_milliseconds_are_ordered_as_times_and_written_in_utc():
+    """As text, 1000000000000 sorts before 999999999999."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "CORRECT", 0, Time="1000000000000"),
+        tx_row("s1", "st2", "INCORRECT", 0, Time="999999999999"),
+        tx_row("s1", "st3", "CORRECT", 0, Time="1411017161123"),
+    ]))
+    assert steps["Step Name"].tolist() == ["st2", "st1", "st3"]
+    assert steps["First Transaction Time"].tolist() == [
+        "2001-09-09 01:46:39.999", "2001-09-09 01:46:40", "2014-09-18 05:12:41.123"]
+    assert steps["Opportunity (M)"].tolist() == ["1", "2", "3"]
+
+
+@pytest.mark.parametrize("written", [
+    "2015-09-01 00:21:02", "2015-09-01 00:21:02:000", "2015/09/01 00:21:02.000",
+    "09/01/2015 00:21:02", "09/01/15 00:21:02:000", "September 01, 2015 12:21:02 AM",
+    "1441066862000", "1.441066862E12",
+])
+def test_each_time_format_datashop_imports_is_written_as_its_exports_write_it(written):
+    steps = rollup_transactions(pd.DataFrame([tx_row("s1", "st1", "CORRECT", 0, Time=written)]))
+    assert steps["First Transaction Time"].tolist() == ["2015-09-01 00:21:02"]

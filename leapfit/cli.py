@@ -42,10 +42,10 @@ With one ``--cv`` the table's columns are ``cv_rmse``, ``cv_rmse_sd``, ...; with
 several they carry a ``_<scheme>`` suffix, because there is then no single
 held-out score to name.
 
-Every command reads a student-step export. A transaction export works too: it
-is rolled up into its student-step table first, as
-:func:`~leapfit.rollup_transactions` does, and ``--predictions`` then writes
-that table.
+Every command reads a student-step export. A transaction export works too, and
+so does a file made for DataShop's import: it is rolled up into its
+student-step table first, as :func:`~leapfit.rollup_transactions` does, and
+``--predictions`` then writes that table.
 
 ``python -m leapfit.cli ...`` is ``leapfit-afm`` from a source checkout.
 
@@ -122,8 +122,8 @@ def parse_seeds(spec: str | None) -> list[int] | None:
 def build_parser(family: str = "afm") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=f"leapfit-{family}", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("export", help="DataShop student-step or transaction export "
-                                  "(tab-delimited)")
+    p.add_argument("export", help="DataShop student-step export, transaction export, "
+                                  "or file made for import (tab-delimited)")
     p.add_argument("--kc-model", action="append", dest="kc_models", metavar="NAME",
                    help="KC model to fit; repeat for several. Default: all.")
     p.add_argument("--list-models", action="store_true",
@@ -199,8 +199,8 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
     p.add_argument("--predictions", metavar="FILE",
                    help="write the input file back out with one 'Predicted Error "
                         "Rate (<model>)' column per fitted KC model (DataShop's "
-                        "convention; rows without a KC stay blank). A transaction "
-                        "export is written as the student-step table it rolls up to")
+                        "convention; rows without a KC stay blank). Transactions "
+                        "are written as the student-step table they roll up to")
     return p
 
 
@@ -224,10 +224,11 @@ def _build_and_fit(args, family: str, data):
 
 def _read_export(path: str) -> pd.DataFrame:
     """The export as :func:`~leapfit.load_student_step` reads it, read once
-    for every KC model in it. A transaction export is rolled up into its
-    student-step table first, as :func:`~leapfit.load_transactions` does."""
+    for every KC model in it. Transactions, exported or made for import, are
+    rolled up into their student-step table first, as
+    :func:`~leapfit.load_transactions` does."""
     export = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-    if "First Attempt" in export.columns or "Attempt At Step" not in export.columns:
+    if "First Attempt" in export.columns or "Time" not in export.columns:
         return export
     steps = rollup_transactions(export)
     print(f"{path}: {len(export):,} transactions rolled up into {len(steps):,} "
@@ -465,8 +466,8 @@ def build_lfa_parser() -> argparse.ArgumentParser:
         prog="leapfit-lfa",
         description="Search for a KC model with Learning Factors Analysis, "
                     "scored by AFM, then validate the shortlist out of sample.")
-    p.add_argument("export", help="DataShop student-step or transaction export "
-                                  "(tab-delimited)")
+    p.add_argument("export", help="DataShop student-step export, transaction export, "
+                                  "or file made for import (tab-delimited)")
     p.add_argument("--root", metavar="NAME",
                    help="KC model to start the search from (default: the "
                         "'All' model, one skill on every step — which is what "
@@ -548,8 +549,8 @@ def build_lfa_parser() -> argparse.ArgumentParser:
                         "--predictions (default: LFA_search)")
     p.add_argument("--predictions", metavar="FILE",
                    help="the export plus a Predicted Error Rate column for the "
-                        "winning model; a transaction export is written as the "
-                        "student-step table it rolls up to")
+                        "winning model; transactions are written as the "
+                        "student-step table they roll up to")
     return p
 
 

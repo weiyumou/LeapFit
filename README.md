@@ -10,8 +10,8 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
-  A transaction export is rolled up into those columns first, the way
-  DataShop's own student-step export is.
+  Transactions, exported from DataShop or made for its import, are rolled up
+  into those columns first, the way DataShop's own student-step export is.
 - **Grounded.** AFM, PFA and LFA are adapted from LearnSphere's reference
   components and validated for equivalence against their output, so results
   stay comparable with numbers DataShop already reports. LKT is validated
@@ -245,10 +245,11 @@ the parser does not recognize (a file coding `1`/`0` needs
 [`examples/generate.py`](examples/generate.py) is a minimal reference for
 producing compatible files from your own data.
 
-### Transaction exports
+### Transactions
 
 A DataShop transaction export, one row per action rather than per step, is
-rolled up into its student-step table first:
+rolled up into its student-step table first. So is a file made for DataShop's
+import, which lacks the columns DataShop adds on import:
 
 ```python
 import pandas as pd
@@ -262,17 +263,23 @@ steps  = rollup_transactions(pd.read_csv("transactions.txt", sep="\t", dtype=str
 models = {m: from_frame(steps, m) for m in ("Topics", "Skills")}
 ```
 
-The commands accept one too, and say on stderr that they rolled it up. A
+The commands accept either, and say on stderr that they rolled it up. A
 step's row is the student's first attempt at it in one problem view, the
 transaction DataShop numbered `Attempt At Step` 1, and its `Outcome` becomes
-`First Attempt`. A step's KCs in a model are every label in the model's
-`KC (<model>)` columns, which the export repeats once per KC, and
-`Opportunity (<model>)` counts each student's encounters with each KC, in
-practice order. Where the export has `Duration (sec)`, the step's durations
-add up to `Step Duration (sec)`. Checked against DataShop's own student-step
-exports of two datasets, every row, outcome and time agrees on both, and every
-column on one; the docstring of `rollup_transactions` records where the other
-differs, and why.
+`First Attempt`. A file made for import has no `Attempt At Step`, because
+DataShop numbers the attempts itself on import, so they are numbered the same
+way: every transaction that names a step, in time order. Its `Time` may be in
+any format DataShop's import reads, and comes back as DataShop's exports
+write it, with Unix milliseconds in UTC. It must carry `Problem View`, which
+DataShop can derive on import and this does not. A step's KCs in a model are
+every label in the model's `KC (<model>)` columns, which the export repeats
+once per KC, and `Opportunity (<model>)` counts each student's encounters with
+each KC, in practice order. Where the file has `Duration (sec)`, the step's
+durations add up to `Step Duration (sec)`. Checked against DataShop's own
+student-step exports of three datasets, one of them rolled up from the very
+file imported to make it, every row, outcome and time agrees on all three,
+and every column on one; the docstring of `rollup_transactions` records where
+the others differ, and why.
 
 ## What you get beyond point estimates
 
@@ -317,8 +324,8 @@ differs, and why.
   except for one appended `Predicted Error Rate (<model>)` column per fitted KC
   model, following DataShop's convention (error rate = `1 − P(correct)`, blank
   for rows without a KC), so learning-curve tooling that reads DataShop exports
-  can consume the result directly. A transaction export comes back as the
-  student-step table it rolls up to.
+  can consume the result directly. Transactions come back as the
+  student-step table they roll up to.
 - **A compatibility switch.** `build_afm_design(data, learnsphere_compat=True)`
   reproduces LearnSphere's exact conventions (ridge, parameter counting) when
   you need to match a published table; the default is the statistically clean

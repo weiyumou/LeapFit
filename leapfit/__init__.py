@@ -12,8 +12,9 @@ R's ``stats::glm``.
 **One input format.** Every model here reads the same six columns of a DataShop
 student-step export — ``Anon Student Id``, ``Problem Name``, ``Step Name``,
 ``First Attempt``, ``KC (<model>)``, ``Opportunity (<model>)`` — so switching
-model families never means reshaping data. A transaction export is rolled up
-into those columns first, by ``load_transactions`` or ``rollup_transactions``.
+model families never means reshaping data. Transactions, exported or made for
+DataShop's import, are rolled up into those columns first, by
+``load_transactions`` or ``rollup_transactions``.
 
     from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
 

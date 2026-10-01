@@ -7,25 +7,34 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Added
 
-- **Transaction exports.** `load_transactions(path, kc_model)` reads a
-  DataShop transaction export, and `rollup_transactions(df)` rolls one up
-  into its student-step table, so every model can fit one. A step's row is
-  the transaction DataShop numbered `Attempt At Step` 1, in the export's own
-  problem view. A step with several KCs in a model, which the export writes
-  as that model's KC column repeated, gets every one of them, each with its
-  own opportunity count. Opportunities are counted in practice order, and
-  the rows come back in that order, so a recount agrees with them.
-  `Step Duration (sec)` is the sum of the step's transaction durations.
-  Against DataShop's own student-step exports of two datasets, every row,
-  outcome, time and KC agrees on both, apart from one KC model renamed
-  between the two exports of one of them. On one, every opportunity count and
-  every duration agrees too, and so does AFM's fit. On the other, every
-  duration but one does, but about a quarter of the opportunity counts do
-  not, because 76% of its steps share a second with another step of the
-  same student, and DataShop orders those by something neither export
-  records. `leapfit-afm`, `leapfit-pfa` and `leapfit-lfa` roll a transaction
-  export up the same way, and `--predictions` then writes the student-step
-  table.
+- **Transactions.** `load_transactions(path, kc_model)` reads a DataShop
+  transaction export, or a file made for DataShop's import, and
+  `rollup_transactions(df)` rolls one up into its student-step table, so every
+  model can fit one. A step's row is the transaction DataShop numbered
+  `Attempt At Step` 1, in the file's own problem view. A file made for import
+  has no such numbers, and they are made as DataShop makes them on import;
+  its times may be Unix milliseconds or any other format DataShop's import
+  reads. A step with several KCs in a model, which the export writes as that
+  model's KC column repeated, gets every one of them, each with its own
+  opportunity count. Opportunities are counted in practice order, a
+  problem's earlier view first within a second, and the rows come back in
+  that order, so a recount agrees with them. `Step Duration (sec)` is the sum
+  of the step's transaction durations. A file that sets `Event Type` is
+  refused, since DataShop then counts only some steps as opportunities.
+  Against DataShop's own student-step exports of three datasets, every row,
+  outcome and time agrees on all three, and every KC on the two whose
+  transactions carry KCs, apart from one model renamed between the two
+  exports of one of them. On the first, every opportunity count and every
+  duration agrees too, and so does AFM's fit. On the second, every duration
+  but one does, but about a quarter of the opportunity counts do not,
+  because 76% of its steps share a second with another step of the same
+  student, and DataShop orders those by something neither export records.
+  The third was rolled up from the very file imported to make it: every
+  count of the Unique-step model DataShop made agrees, and every count of
+  its Single-KC model but 0.7%, all inside seconds that several steps of one
+  problem share. `leapfit-afm`, `leapfit-pfa` and `leapfit-lfa` roll
+  transactions up the same way, and `--predictions` then writes the
+  student-step table.
 
 ### Fixed
 

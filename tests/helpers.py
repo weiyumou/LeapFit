@@ -185,11 +185,13 @@ def tx_row(student, step, outcome, t, attempt=1, kc="A", **extra):
 def as_transactions(steps):
     """A transaction export that rolls up to the student-step table ``steps``.
 
-    Each row becomes its step's first attempt, after a page view that has no
-    attempt number, and an incorrect first attempt is followed by a correct
-    second one. A step the student meets again is met in a new problem view.
-    The KC columns are copied but not the opportunity counts, which the rollup
-    has to make. A table without times gets one step a minute, in row order.
+    Each row becomes its step's first attempt, after a page view that names no
+    step, as DataShop's exports have it, and an incorrect first attempt is
+    followed by a correct second one. A step the student meets again is met
+    in a new problem view. The KC columns are copied but not the opportunity
+    counts, which the rollup has to make. A table without times gets one step
+    a minute, in row order. Without ``Attempt At Step``, it is the file that
+    was imported to make the export.
     """
     kc_columns = [c for c in steps.columns if c.startswith("KC (")]
     views: dict[tuple, int] = {}
@@ -202,7 +204,7 @@ def as_transactions(steps):
             (student, step["Problem Name"], name), 0) + 1
         common = {"Problem View": str(seen), "Problem Name": step["Problem Name"],
                   **{c: step[c] for c in kc_columns}}
-        rows.append(tx_row(student, name, "", t - 1, attempt="", kc=None, **common))
+        rows.append(tx_row(student, "", "", t - 1, attempt="", kc=None, **common))
         rows.append(tx_row(student, name, outcome.upper(), t, kc=None, **common))
         if outcome != "correct":
             rows.append(tx_row(student, name, "CORRECT", t + 5, attempt=2, kc=None, **common))
