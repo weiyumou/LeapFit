@@ -105,6 +105,16 @@ while the major version is 0, a minor bump may change the public API.
   beside `design.columns` are the coefficients, `predict_proba` gives the
   scores, and `ll_unpenalized` with `n_params` gives the unpenalized
   criteria.
+- `LogisticFit.block()`, which only the tests called. It returned a block's
+  coefficients as an unlabelled array that skipped any column
+  identification had dropped, so every value after one sat a place early.
+  `kc_values` reports the same coefficients by KC, with `NaN` for a dropped
+  column, and `fit.weights[fit.design.slices()[name]]` is the array
+  `block(name)` returned.
+- `predict_proba`'s sparse-matrix input. It accepted a bare matrix in place
+  of a `Design`, which no caller passed, and now takes only a `Design`. For
+  a matrix `X` with the fit's columns, `scipy.special.expit(X @ fit.weights)`
+  gives the same probabilities.
 - Options no caller passed: `Design.identify`'s `prefer_drop` and `check`
   (identification always takes reference levels from the student block
   first, and always checks that the result is full rank), `Design.rank`'s

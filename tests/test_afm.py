@@ -203,8 +203,9 @@ def test_recovers_known_parameters():
     fit = fit_afm(build_afm_design(data, bound_slopes=True), data.y,
                   method="L-BFGS-B", max_fun=5000)
 
-    intercepts = fit.block("kc_intercept")
-    slopes = fit.block("kc_slope")
+    values = fit.kc_values(data)
+    intercepts = values["Intercept (logit)"].to_numpy()
+    slopes = values["Slope"].to_numpy()
     # Intercepts are identified only up to the student mean; compare centred.
     np.testing.assert_allclose(
         intercepts - intercepts.mean(), truth["beta"] - truth["beta"].mean(),
@@ -218,7 +219,7 @@ def test_slopes_never_go_negative():
                      n_reps=20, gamma=np.array([-0.4, 0.3]))
     fit = fit_afm(build_afm_design(data, bound_slopes=True), data.y,
                   method="L-BFGS-B", max_fun=5000)
-    slopes = fit.block("kc_slope")
+    slopes = fit.kc_values(data)["Slope"].to_numpy()
     assert slopes.min() >= -1e-9
     assert slopes[0] == pytest.approx(0.0, abs=1e-6)
 

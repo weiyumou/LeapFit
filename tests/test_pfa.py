@@ -186,7 +186,8 @@ def test_inclusive_counts_manufacture_learning_rates_from_noise():
     leaky = fit_pfa(leaky_design, data.y, method="L-BFGS-B", max_fun=100_000)
 
     def slopes(fit):
-        return fit.block("success")[0], fit.block("failure")[0]
+        values = fit.kc_values(data)
+        return values.loc[0, "Success Slope"], values.loc[0, "Failure Slope"]
 
     g0, r0 = slopes(prior)
     g1, r1 = slopes(leaky)

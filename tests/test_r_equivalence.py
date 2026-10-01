@@ -117,8 +117,9 @@ def test_pooled_pfa_matches_r_glm(data, tmp_path):
 
     fit = fit_pfa(build_pfa_design(data, slopes="pooled"), data.y, **TIGHT)
     assert fit.ll_unpenalized == pytest.approx(r["loglik"], abs=1e-8)
-    assert fit.block("success")[0] == pytest.approx(r["s"], abs=1e-6)
-    assert fit.block("failure")[0] == pytest.approx(r["f"], abs=1e-6)
+    values = fit.kc_values(data)
+    assert values["Success Slope"].iloc[0] == pytest.approx(r["s"], abs=1e-6)
+    assert values["Failure Slope"].iloc[0] == pytest.approx(r["f"], abs=1e-6)
 
 
 def test_afm_matches_r_glm_in_likelihood_and_predictions(data, tmp_path):

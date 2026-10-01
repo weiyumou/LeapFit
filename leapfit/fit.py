@@ -57,7 +57,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
 from scipy.optimize import Bounds, minimize
 
 from leapfit.data import StepData
@@ -181,8 +180,8 @@ class LogisticFit:
     def bic(self) -> float:
         return -2.0 * self.ll + self.n_params * np.log(self.n_obs)
 
-    def predict_proba(self, design: Design | sparse.spmatrix) -> np.ndarray:
-        X = design.matrix if isinstance(design, Design) else sparse.csr_matrix(design)
+    def predict_proba(self, design: Design) -> np.ndarray:
+        X = design.matrix
         if X.shape[1] != len(self.weights):
             raise ValueError(
                 f"Design has {X.shape[1]} columns but the fit has {len(self.weights)} "
@@ -257,9 +256,6 @@ class LogisticFit:
         values[data.source_rows] = 1.0 - self.predict_proba(self.design)
         out[f"Predicted Error Rate ({data.kc_model})"] = values
         return out
-
-    def block(self, name: str) -> np.ndarray:
-        return self.weights[self.design.slices()[name]]
 
     def _kc_intercepts(self, data: StepData, centre: bool) -> np.ndarray:
         """Each KC's intercept in ``data.kc_names`` order, ``NaN`` where its
