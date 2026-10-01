@@ -28,7 +28,9 @@ from leapfit.lfa import (
     HEURISTICS,
     MERGES,
     FactorMatrix,
+    LFAState,
     Move,
+    _children,
     build_factor_matrix,
     lfa_search,
     merge,
@@ -416,6 +418,22 @@ def test_lineage_merge_changes_nothing_when_the_frontier_never_fills(search):
     without = lfa_search(models["Topics"], P, max_iterations=8, merges="none")
     assert search.best.labels == without.best.labels, "search merges by lineage"
     assert search.n_evaluated == without.n_evaluated
+
+
+def test_the_children_of_a_state_in_the_order_an_expansion_scores_them():
+    """Splits first, every skill by every factor, then the undo of each split
+    on the lineage, then every pair of skills merged. ``split all by f`` is on
+    the lineage, so it is not offered again, and the splits of ``all*f`` are
+    degenerate."""
+    parent = LFAState(labels=("all*f", "all", "all"), history=(SPLIT_F,), ll=0.0,
+                      aic=0.0, bic=0.0, n_kcs=2, n_params=0, is_optimal=True,
+                      n_separated=0)
+    children = _children(parent, F_AND_G, ("all",) * 3, "both")
+    assert [(labels, history) for labels, history, _ in children] == [
+        (("all*f", "all*g", "all"), (SPLIT_F, SPLIT_G)),
+        (("all",) * 3, ()),
+        (("all+all*f",) * 3, (SPLIT_F, Move("merge", "all", "all*f"))),
+    ]
 
 
 def test_the_same_split_is_never_offered_twice_on_one_lineage(search):

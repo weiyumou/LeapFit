@@ -53,6 +53,10 @@ while the major version is 0, a minor bump may change the public API.
   component tables and the LFA screens read separation through it, where
   each combined `by_block()` entries by hand; the two records now share
   their column handling instead of each defining it.
+- `LFAState.separated`, the separated columns that `n_separated` counts, and
+  `LFAState.path`, its moves as the frontier and validation tables print
+  them. The search reads the root's separation off its state, where it
+  rebuilt the root's design a second time to find it.
 - `Design.get(name)`: the block of that name, or `None`. It replaces five
   hand-written lookups across the package and the tests.
 - `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
