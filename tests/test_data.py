@@ -1,7 +1,8 @@
 """Reading a student-step export into ``StepData``.
 
 What the reader requires and what it refuses, how it orders practice and
-numbers opportunities, and the clock it keeps for the families that need one.
+numbers opportunities, the clock it keeps for the families that need one,
+and how a transaction export is rolled up into a student-step one first.
 """
 
 from __future__ import annotations
@@ -13,9 +14,27 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from leapfit import build_afm_design, cross_validate, fit_afm, from_frame, list_kc_models
+from leapfit import (
+    build_afm_design,
+    cross_validate,
+    fit_afm,
+    from_frame,
+    list_kc_models,
+    load_transactions,
+    rollup_transactions,
+)
 
-from helpers import EPOCH, MINIMAL_COLUMNS, clocked_data, minimal_frame, rollup, synthetic
+from helpers import (
+    EPOCH,
+    MINIMAL_COLUMNS,
+    as_transactions,
+    clocked_data,
+    minimal_frame,
+    rollup,
+    stamp,
+    synthetic,
+    tx_row,
+)
 
 # --------------------------------------------------------------------------
 # Parsing
@@ -243,3 +262,178 @@ def test_an_export_without_a_clock_refuses_rather_than_substituting_one(example)
         stripped.epoch_times()
     with pytest.raises(ValueError, match="no 'Step Duration"):
         stripped.time_on_task()
+
+
+# --------------------------------------------------------------------------
+# Transaction exports, rolled up into student-steps
+# --------------------------------------------------------------------------
+
+
+def test_a_step_rolls_up_to_its_first_attempt():
+    """Attempt 1 is the step's row. What has no attempt number, and every later
+    attempt, leaves no trace on it but the time it took."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "", 0, attempt=""),  # a page view
+        tx_row("s1", "st1", "INCORRECT", 5),
+        tx_row("s1", "st1", "HINT", 9, attempt=2),
+        tx_row("s1", "st1", "CORRECT", 14, attempt=3),
+        tx_row("s1", "st2", "CORRECT", 20),
+    ]))
+    assert steps["Step Name"].tolist() == ["st1", "st2"]
+    assert steps["First Attempt"].tolist() == ["incorrect", "correct"]
+    assert steps["First Transaction Time"].tolist() == [stamp(5), stamp(20)]
+    assert steps["Opportunity (M)"].tolist() == ["1", "2"]
+
+
+def test_outcomes_take_the_student_step_vocabulary():
+    """Where DataShop left a first attempt's outcome blank, its student-step
+    export says 'unknown'."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", f"st{i}", outcome, i)
+        for i, outcome in enumerate(["CORRECT", "HINT", " Incorrect ", ""])]))
+    assert steps["First Attempt"].tolist() == ["correct", "hint", "incorrect", "unknown"]
+    assert from_frame(steps, "M").y.tolist() == [1, 0, 0, 0]
+
+
+def test_each_problem_view_is_an_encounter_of_its_own():
+    """A problem opened again straight away is a second encounter with its steps,
+    not more attempts at the first."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "INCORRECT", 0),
+        tx_row("s1", "st1", "INCORRECT", 5, **{"Problem View": "2"}),
+        tx_row("s1", "st1", "CORRECT", 6, attempt=2, **{"Problem View": "2"}),
+    ]))
+    assert steps["Problem View"].tolist() == ["1", "2"]
+    assert steps["First Attempt"].tolist() == ["incorrect", "incorrect"]
+    assert steps["Opportunity (M)"].tolist() == ["1", "2"]
+
+
+def test_the_hierarchy_tells_apart_problems_that_share_a_name():
+    """The export's Level columns are part of what makes an encounter, and are kept."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "CORRECT", 0, **{"Level (Unit)": "one"}),
+        tx_row("s1", "st1", "INCORRECT", 1, **{"Level (Unit)": "two"}),
+    ]))
+    assert steps["Level (Unit)"].tolist() == ["one", "two"]
+    assert steps["Opportunity (M)"].tolist() == ["1", "2"]
+
+
+def test_a_step_with_several_kcs_counts_each_of_them():
+    """DataShop repeats a model's KC column once per KC, which pandas reads as
+    'KC (M)', 'KC (M).1'. Each label is kept once, in column order, and a cell
+    that is already '~~'-joined is split as well."""
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "CORRECT", 0, kc="A", **{"KC (M).1": "B"}),
+        tx_row("s1", "st2", "INCORRECT", 1, kc="B", **{"KC (M).1": ""}),
+        tx_row("s1", "st3", "CORRECT", 2, kc="A~~C", **{"KC (M).1": "C"}),
+    ]))
+    assert "KC (M).1" not in steps.columns
+    assert steps["KC (M)"].tolist() == ["A~~B", "B", "A~~C"]
+    assert steps["Opportunity (M)"].tolist() == ["1~~1", "2", "2~~1"]
+    data = from_frame(steps, "M")
+    assert data.kcs == [("A", "B"), ("B",), ("A", "C")]
+    assert data.opportunities == [(0, 0), (1,), (1, 0)]
+    assert data.duplicate_kc_rows == 0
+
+
+def test_a_repeated_kc_header_in_the_file_reads_as_one_model(tmp_path):
+    """The export as DataShop writes it: the same header twice."""
+    header = ["Anon Student Id", "Problem Name", "Problem View", "Step Name",
+              "Attempt At Step", "Outcome", "Time", "KC (M)", "KC (M)"]
+    lines = [header,
+             ["s1", "p", "1", "st1", "1", "CORRECT", stamp(0), "A", "B"],
+             ["s1", "p", "1", "st2", "1", "INCORRECT", stamp(1), "B", ""]]
+    path = tmp_path / "tx.txt"
+    path.write_text("".join("\t".join(line) + "\n" for line in lines))
+    assert list_kc_models(str(path)) == ["M"]
+    data = load_transactions(str(path), "M")
+    assert data.kcs == [("A", "B"), ("B",)]
+    assert data.opportunities == [(0, 0), (1,)]
+
+
+def test_opportunities_count_in_practice_order_and_the_rows_come_back_in_it():
+    """By time; within a second by problem start, as DataShop counts the earlier
+    problem view first; then by the export's own order. Returned in that order,
+    the rows give the reader the same practice order, so a recount agrees."""
+    started = {"early": 0, "tie-late": 8, "tie-early": 2, "same-1": 3, "same-2": 3, "late": 0}
+    times = {"early": 1, "tie-late": 10, "tie-early": 10, "same-1": 20, "same-2": 20, "late": 30}
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", step, "INCORRECT" if step == "late" else "CORRECT", times[step],
+               **{"Problem Name": step, "Problem Start Time": stamp(started[step])})
+        for step in ["late", "tie-late", "same-1", "tie-early", "same-2", "early"]]))
+    assert steps["Step Name"].tolist() == ["early", "tie-early", "tie-late", "same-1",
+                                           "same-2", "late"]
+    assert steps["Opportunity (M)"].tolist() == ["1", "2", "3", "4", "5", "6"]
+    assert len(from_frame(steps, "M").opportunity_disagreements()) == 0
+
+
+def test_step_duration_sums_the_encounter_unless_its_first_attempt_has_none():
+    """DataShop sums the step's transaction durations, writes '.' where the
+    first attempt's own is undefined, and leaves a later undefined one out."""
+    def seconds(value):
+        return {"Duration (sec)": value}
+
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "", 0, attempt="", **seconds("2")),
+        tx_row("s1", "st1", "INCORRECT", 1, **seconds("3")),
+        tx_row("s1", "st1", "CORRECT", 2, attempt=2, **seconds("4.25")),
+        tx_row("s1", "st2", "INCORRECT", 3, **seconds(".")),
+        tx_row("s1", "st2", "CORRECT", 4, attempt=2, **seconds("5")),
+        tx_row("s1", "st3", "INCORRECT", 5, **seconds("1.5")),
+        tx_row("s1", "st3", "CORRECT", 6, attempt=2, **seconds(".")),
+        tx_row("s1", "st4", "CORRECT", 7, **seconds("1")),
+    ]))
+    assert steps["Step Duration (sec)"].tolist() == ["9.25", ".", "1.5", "1"]
+    durations = from_frame(steps, "M").durations
+    assert durations[0] == 9.25 and np.isnan(durations[1]) and durations[2] == 1.5
+
+    bare = rollup_transactions(pd.DataFrame([tx_row("s1", "st1", "CORRECT", 0)]))
+    assert "Step Duration (sec)" not in bare.columns
+
+
+def test_a_step_without_a_kc_keeps_empty_cells_and_is_skipped():
+    steps = rollup_transactions(pd.DataFrame([
+        tx_row("s1", "st1", "CORRECT", 0, kc=""),
+        tx_row("s1", "st2", "CORRECT", 1, kc="A"),
+        tx_row("s1", "st3", "INCORRECT", 2, kc="A"),
+    ]))
+    assert steps[["KC (M)", "Opportunity (M)"]].values.tolist() == [
+        ["", ""], ["A", "1"], ["A", "2"]]
+    data = from_frame(steps, "M")
+    assert len(data) == 2 and data.skipped_no_kc == 1
+
+
+@pytest.mark.parametrize("change, error, match", [
+    (lambda tx: tx.assign(**{"Sample Name": ["All Data", "Other"]}), ValueError, "2 samples"),
+    (lambda tx: tx.assign(**{"Step Name": "st1"}), ValueError, "share their encounter"),
+    (lambda tx: tx.assign(**{"Attempt At Step": ""}), ValueError, "No transaction has"),
+    (lambda tx: tx.drop(columns="Problem View"), KeyError, "Problem View"),
+])
+def test_an_export_that_cannot_be_rolled_up_faithfully_is_refused(change, error, match):
+    tx = pd.DataFrame([tx_row("s1", "st1", "CORRECT", 0), tx_row("s1", "st2", "CORRECT", 1)])
+    with pytest.raises(error, match=match):
+        rollup_transactions(change(tx))
+
+
+def test_reading_a_transaction_export_as_student_steps_points_to_the_rollup():
+    with pytest.raises(KeyError, match="transaction export"):
+        from_frame(pd.DataFrame([tx_row("s1", "st1", "CORRECT", 0)]), "M")
+
+
+def test_the_example_comes_back_from_a_transaction_export_of_itself(example):
+    """Every step's first attempt, time, KCs and opportunities come back, so AFM
+    fits the rolled-up table exactly as it fits the student-step export."""
+    source = example.source
+    steps = rollup_transactions(as_transactions(source))
+    both = source.merge(steps, on=["Anon Student Id", "Problem Name", "Step Name"],
+                        suffixes=("", " rolled up"))
+    assert len(both) == len(source) == len(steps)
+    for column in ["First Attempt", "First Transaction Time", "KC (Topics)",
+                   "Opportunity (Topics)", "KC (Skills)", "Opportunity (Skills)"]:
+        assert both[column].tolist() == both[f"{column} rolled up"].tolist(), column
+
+    again = from_frame(steps, "Topics")
+    fit = fit_afm(build_afm_design(example), example.y)
+    refit = fit_afm(build_afm_design(again), again.y)
+    assert refit.ll == pytest.approx(fit.ll, rel=1e-9)
+    assert refit.n_params == fit.n_params

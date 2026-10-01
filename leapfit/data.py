@@ -1,4 +1,9 @@
-"""Reading DataShop student-step rollups into AFM observations.
+"""Reading DataShop exports into AFM observations.
+
+Every model reads a student-step rollup. A transaction export is rolled up into
+one first by :func:`rollup_transactions`, under the rules DataShop's own
+student-step export follows; that function records them, and how closely they
+reproduce DataShop's export of the same data.
 
 The parsing rules in this module are not our own design: they replicate
 LearnSphere's PyAFM component
@@ -73,6 +78,17 @@ ITEM_SEP = "##"
 #: a declared success counts as a failure, but a value outside this vocabulary
 #: means the column is not what we think it is — see the module docstring.
 FIRST_ATTEMPT_VALUES = frozenset({"correct", "incorrect", "hint", "unknown"})
+
+#: The columns :func:`rollup_transactions` requires, all of which a DataShop
+#: transaction export carries. ``Attempt At Step`` and ``Problem View`` are
+#: DataShop's own counts, made when the data was imported.
+TRANSACTION_COLUMNS = ("Anon Student Id", "Problem Name", "Problem View", "Step Name",
+                       "Attempt At Step", "Outcome", "Time")
+
+#: A transaction export's KC column. A transaction with several KCs in one model
+#: repeats the column once per KC, and pandas reads the repeats as
+#: ``KC (<model>).1``, ``KC (<model>).2``, and so on.
+TX_KC_COLUMN = re.compile(r"^KC \((?P<name>.+)\)(?:\.\d+)?$")
 
 
 @dataclass(frozen=True)
@@ -325,7 +341,7 @@ def _sequences(data: StepData, labels: Sequence[tuple[str, ...]]) -> _Sequences:
 
 
 def list_kc_models(path: str) -> list[str]:
-    """Return the KC model names available in a student-step export."""
+    """Return the KC model names available in a student-step or transaction export."""
     header = pd.read_csv(path, sep="\t", nrows=0)
     return sorted(
         m.group("name") for col in header.columns if (m := KC_COLUMN.match(col))
@@ -361,9 +377,11 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
     duration_col = "Step Duration (sec)" if "Step Duration (sec)" in df.columns else None
     if missing := [c for c in required if c not in df.columns]:
         available = sorted(m.group("name") for c in df.columns if (m := KC_COLUMN.match(c)))
-        raise KeyError(
-            f"Missing column(s) {missing}. KC models present: {available or 'none'}"
-        )
+        message = f"Missing column(s) {missing}. KC models present: {available or 'none'}"
+        if "Attempt At Step" in df.columns and "First Attempt" not in df.columns:
+            message += (". This looks like a transaction export: roll it up with "
+                        "rollup_transactions(), or read it with load_transactions()")
+        raise KeyError(message)
 
     cols = {c: df[c].astype(str).to_list() for c in required}
     time_values = df[time_col].astype(str).to_list() if time_col else None
@@ -462,3 +480,154 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
         skipped_no_kc=skipped, duplicate_kc_rows=duplicates,
         source=df, source_rows=source_rows,
     )
+
+
+def load_transactions(path: str, kc_model: str, **kwargs) -> StepData:
+    """Load one KC model out of a DataShop transaction export.
+
+    The export is rolled up by :func:`rollup_transactions`, and the resulting
+    student-step table is what :attr:`StepData.source` holds, so
+    ``annotate`` writes its predictions into that. To read several KC models,
+    roll the export up once and pass the table to :func:`from_frame` for each.
+    ``kwargs`` go to :func:`from_frame`.
+    """
+    tx = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    return from_frame(rollup_transactions(tx), kc_model, **kwargs)
+
+
+def rollup_transactions(tx: pd.DataFrame) -> pd.DataFrame:
+    """Roll a DataShop transaction export up into its student-step table.
+
+    One row per encounter of a student with a step, keyed as DataShop keys one
+    (student, the ``Level (...)`` hierarchy, problem, problem view, step), with
+    the columns :func:`from_frame` reads. Read the export with ``dtype=str,
+    keep_default_na=False``, as :func:`load_transactions` does. The rules,
+    checked against DataShop's own student-step export of the same data:
+
+    1. **The first attempt is the transaction DataShop numbered
+       ``Attempt At Step`` 1.** Later attempts, and anything without an attempt
+       number (untutored actions, page views, saves), count only toward the
+       step's duration. pyAFM's ``roll_up.py`` takes a step's first transaction
+       of any kind instead, which on ds5426 turns 2,666 of those events into
+       first attempts with no outcome.
+    2. **Encounters are the export's own problem views.** pyAFM re-derives them
+       from changes of problem name, and so merges a problem the student opens
+       again straight away into the visit before it (6,881 views on ds5426,
+       where DataShop has 9,452).
+    3. **``First Attempt`` is that transaction's ``Outcome``,** lowercased, and
+       ``unknown`` where DataShop left it blank. ``First Transaction Time`` is
+       its ``Time``.
+    4. **A step's KCs in a model are every label in the model's ``KC (<model>)``
+       columns.** The export repeats the column once per KC. Each label is kept
+       once, in column order, and a cell that is already ``~~``-joined is split
+       as well. They are written ``~~``-joined, as the student-step export
+       writes them, with the opportunity counts in the same order.
+    5. **``Opportunity (<model>)`` numbers each student's encounters with a KC
+       from 1, in practice order:** ``First Transaction Time``, then ``Problem
+       Start Time`` (within one second DataShop counts the earlier problem view
+       first), then the export's own order. The rows are returned in that
+       order, so :meth:`StepData.practice_order` agrees with it and
+       ``recompute_opportunities=True`` changes nothing.
+    6. **``Step Duration (sec)``, where the export has ``Duration (sec)``, is the
+       sum of the encounter's transaction durations,** as DataShop documents
+       it, and ``.`` when the first attempt's own is undefined, as its export
+       has it. A later undefined duration is left out of the sum.
+
+    Checked against DataShop's student-step exports of two datasets. On ds6160
+    (89,110 steps) every row, outcome, time, KC, opportunity and duration
+    agrees, and so does AFM's fit, to every digit printed. On ds5426 (53,050
+    steps) every row, outcome, time and KC does (one model's labels were
+    renamed between the two exports, one for one), and every duration but
+    one. About a quarter of its opportunity counts do not: 76% of its steps
+    share their student's second with another step, and DataShop orders
+    those by something neither of its exports records. Recounting DataShop's
+    own student-step export from its times does not reproduce them either.
+
+    :raises KeyError: when a column of :data:`TRANSACTION_COLUMNS` is missing.
+    :raises ValueError: when the export holds more than one sample, when two
+        transactions are both the first attempt of one encounter, or when none
+        is a first attempt.
+    """
+    names = [str(c) for c in tx.columns]
+    if missing := [c for c in TRANSACTION_COLUMNS if c not in names]:
+        raise KeyError(f"Missing transaction column(s) {missing}")
+
+    def column(i: int) -> pd.Series:
+        # By position, since an export repeats some headers.
+        return tx.iloc[:, i].fillna("").astype(str).reset_index(drop=True)
+
+    def named(name: str) -> pd.Series:
+        return column(names.index(name))
+
+    if "Sample Name" in names and len(samples := sorted(set(named("Sample Name")) - {""})) > 1:
+        raise ValueError(
+            f"The export holds {len(samples)} samples ({', '.join(map(repr, samples))}), and a "
+            "transaction is listed once in each sample that contains it, so rolling them up "
+            "together would count it more than once. Keep one sample first, for example "
+            f"tx[tx['Sample Name'] == {samples[0]!r}]."
+        )
+
+    levels = [i for i, name in enumerate(names) if name.startswith("Level (")]
+    encounter = pd.DataFrame({
+        "student": named("Anon Student Id"),
+        **{f"level {i}": column(i) for i in levels},
+        "problem": named("Problem Name"),
+        "view": named("Problem View"),
+        "step": named("Step Name"),
+    })
+    first = np.flatnonzero(pd.to_numeric(named("Attempt At Step"), errors="coerce") == 1)
+    if not len(first):
+        raise ValueError("No transaction has 'Attempt At Step' 1, so there is no first "
+                         "attempt to roll up.")
+    steps = encounter.iloc[first].reset_index(drop=True)
+    if (twice := steps.duplicated(keep=False)).any():
+        example = steps[twice].iloc[0]
+        raise ValueError(
+            f"{int(twice.sum()):,} transactions are first attempts that share their encounter "
+            f"with another first attempt, for example student {example['student']!r} on step "
+            f"{example['step']!r} of problem {example['problem']!r}, view {example['view']}. "
+            "DataShop numbers one first attempt per step per problem view, so this export "
+            "was assembled from more than one, or edited."
+        )
+
+    out = steps.rename(columns={"student": "Anon Student Id", "problem": "Problem Name",
+                                "view": "Problem View", "step": "Step Name",
+                                **{f"level {i}": names[i] for i in levels}})
+    out["First Transaction Time"] = named("Time").iloc[first].to_numpy()
+    out["First Attempt"] = (named("Outcome").iloc[first].str.strip().str.lower()
+                            .replace("", "unknown").to_numpy())
+    if "Duration (sec)" in names:
+        seconds = pd.to_numeric(named("Duration (sec)"), errors="coerce")
+        total = seconds.groupby([encounter[c] for c in encounter.columns],
+                                sort=False).transform("sum")
+        out["Step Duration (sec)"] = [
+            "." if np.isnan(own) else np.format_float_positional(round(s, 3), trim="-")
+            for s, own in zip(total.iloc[first], seconds.iloc[first])]
+
+    started = (named("Problem Start Time").iloc[first].to_numpy() if "Problem Start Time" in names
+               else np.full(len(first), ""))
+    order = pd.DataFrame({"student": out["Anon Student Id"], "time": out["First Transaction Time"],
+                          "started": started, "row": np.arange(len(first))}
+                         ).sort_values(["student", "time", "started", "row"]).index.to_numpy()
+
+    models: dict[str, list[int]] = {}
+    for i, name in enumerate(names):
+        if m := TX_KC_COLUMN.match(name):
+            models.setdefault(m.group("name"), []).append(i)
+    students = out["Anon Student Id"].to_numpy()
+    for model, positions in models.items():
+        cells = zip(*(column(i).iloc[first] for i in positions))
+        labels = [tuple(dict.fromkeys(kc for cell in row for kc in cell.split(MULTI_SEP) if kc))
+                  for row in cells]
+        seen: dict[tuple[str, str], int] = {}  # encounters so far, per (student, KC)
+        counts = [""] * len(labels)
+        for r in order:
+            numbers = []
+            for kc in labels[r]:
+                n = seen[students[r], kc] = seen.get((students[r], kc), 0) + 1
+                numbers.append(str(n))
+            counts[r] = MULTI_SEP.join(numbers)
+        out[f"KC ({model})"] = [MULTI_SEP.join(row) for row in labels]
+        out[f"Opportunity ({model})"] = counts
+
+    return out.iloc[order].reset_index(drop=True)

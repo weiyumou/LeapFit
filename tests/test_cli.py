@@ -11,7 +11,7 @@ import pytest
 from leapfit.cli import main as cli_main
 from leapfit.cli import main_lfa, main_pfa
 
-from helpers import EXAMPLE, minimal_frame, mixed, rollup, simulate_pfa
+from helpers import EXAMPLE, as_transactions, minimal_frame, mixed, rollup, simulate_pfa
 
 # --------------------------------------------------------------------------
 # leapfit-afm
@@ -36,6 +36,29 @@ def test_cli_predictions_writes_one_column_per_model(tmp_path):
     # Identical KC models must produce identical predictions.
     assert written["Predicted Error Rate (M)"].tolist() == \
         written["Predicted Error Rate (M2)"].tolist()
+
+
+def test_cli_rolls_a_transaction_export_up_before_fitting(tmp_path, capsys):
+    """The same fit as from the student-step export it rolls up to, and
+    --predictions writes that student-step table."""
+    steps = minimal_frame()
+    tx, direct = tmp_path / "tx.txt", tmp_path / "steps.txt"
+    as_transactions(steps).to_csv(tx, sep="\t", index=False, lineterminator="\n")
+    steps.to_csv(direct, sep="\t", index=False, lineterminator="\n")
+
+    from_tx, from_steps = tmp_path / "tx.csv", tmp_path / "steps.csv"
+    predictions = tmp_path / "annotated.txt"
+    assert cli_main([str(tx), "--cv", "none", "--out", str(from_tx),
+                     "--predictions", str(predictions)]) == 0
+    assert f"rolled up into {len(steps)} student-steps" in capsys.readouterr().err
+    assert cli_main([str(direct), "--cv", "none", "--out", str(from_steps)]) == 0
+    a, b = pd.read_csv(from_tx), pd.read_csv(from_steps)
+    assert a["n_obs"].tolist() == b["n_obs"].tolist()
+    np.testing.assert_allclose(a["aic"], b["aic"], rtol=1e-9)
+
+    written = pd.read_csv(predictions, sep="\t", dtype=str, keep_default_na=False)
+    assert len(written) == len(steps)
+    assert {"First Attempt", "Opportunity (M)", "Predicted Error Rate (M)"} <= set(written.columns)
 
 
 def _cli_export(tmp_path, name="export.txt"):

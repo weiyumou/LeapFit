@@ -5,6 +5,28 @@ while the major version is 0, a minor bump may change the public API.
 
 ## Unreleased
 
+### Added
+
+- **Transaction exports.** `load_transactions(path, kc_model)` reads a
+  DataShop transaction export, and `rollup_transactions(df)` rolls one up
+  into its student-step table, so every model can fit one. A step's row is
+  the transaction DataShop numbered `Attempt At Step` 1, in the export's own
+  problem view. A step with several KCs in a model, which the export writes
+  as that model's KC column repeated, gets every one of them, each with its
+  own opportunity count. Opportunities are counted in practice order, and
+  the rows come back in that order, so a recount agrees with them.
+  `Step Duration (sec)` is the sum of the step's transaction durations.
+  Against DataShop's own student-step exports of two datasets, every row,
+  outcome, time and KC agrees on both, apart from one KC model renamed
+  between the two exports of one of them. On one, every opportunity count and
+  every duration agrees too, and so does AFM's fit. On the other, every
+  duration but one does, but about a quarter of the opportunity counts do
+  not, because 76% of its steps share a second with another step of the
+  same student, and DataShop orders those by something neither export
+  records. `leapfit-afm`, `leapfit-pfa` and `leapfit-lfa` roll a transaction
+  export up the same way, and `--predictions` then writes the student-step
+  table.
+
 ### Fixed
 
 - The error for an unrecognized `First Attempt` value listed `correct`

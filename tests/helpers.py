@@ -157,6 +157,59 @@ def co_occurring_kc_data(pair_steps=3, solo_steps=3, n_students=6):
 
 
 # --------------------------------------------------------------------------
+# Transaction exports
+# --------------------------------------------------------------------------
+
+
+def stamp(seconds):
+    """The time ``seconds`` past :data:`EPOCH`, written as DataShop writes it."""
+    return str(EPOCH + pd.Timedelta(seconds=seconds))
+
+
+def tx_row(student, step, outcome, t, attempt=1, kc="A", **extra):
+    """One transaction, at ``t`` seconds past :data:`EPOCH`.
+
+    ``outcome`` is written as DataShop writes it (``CORRECT``, ``HINT``, ...),
+    ``attempt`` is its ``Attempt At Step`` (``""`` for one that is not an
+    attempt), and ``kc`` is its label under KC model ``M``, or ``None`` for no
+    such column. ``extra`` adds or replaces columns.
+    """
+    row = {"Anon Student Id": student, "Problem Name": "p", "Problem View": "1",
+           "Step Name": step, "Attempt At Step": str(attempt), "Outcome": outcome,
+           "Time": stamp(t)}
+    if kc is not None:
+        row["KC (M)"] = kc
+    return row | extra
+
+
+def as_transactions(steps):
+    """A transaction export that rolls up to the student-step table ``steps``.
+
+    Each row becomes its step's first attempt, after a page view that has no
+    attempt number, and an incorrect first attempt is followed by a correct
+    second one. A step the student meets again is met in a new problem view.
+    The KC columns are copied but not the opportunity counts, which the rollup
+    has to make. A table without times gets one step a minute, in row order.
+    """
+    kc_columns = [c for c in steps.columns if c.startswith("KC (")]
+    views: dict[tuple, int] = {}
+    rows = []
+    for i, step in enumerate(steps.to_dict("records")):
+        t = (pd.Timestamp(step["First Transaction Time"]) - EPOCH).total_seconds() \
+            if "First Transaction Time" in step else 60 * i
+        student, name, outcome = step["Anon Student Id"], step["Step Name"], step["First Attempt"]
+        seen = views[student, step["Problem Name"], name] = views.get(
+            (student, step["Problem Name"], name), 0) + 1
+        common = {"Problem View": str(seen), "Problem Name": step["Problem Name"],
+                  **{c: step[c] for c in kc_columns}}
+        rows.append(tx_row(student, name, "", t - 1, attempt="", kc=None, **common))
+        rows.append(tx_row(student, name, outcome.upper(), t, kc=None, **common))
+        if outcome != "correct":
+            rows.append(tx_row(student, name, "CORRECT", t + 5, attempt=2, kc=None, **common))
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
 # Synthetic data from a known model
 # --------------------------------------------------------------------------
 
