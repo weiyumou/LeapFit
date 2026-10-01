@@ -18,6 +18,12 @@ while the major version is 0, a minor bump may change the public API.
   on a parameter (each component's practice sequences, and the clock) once
   per search rather than once per evaluation. Together these take the
   vignette's RPFA search from 10.6 s to 5.0 s.
+- `leapfit-lfa` reads the export once, as `leapfit-afm` does, rather than
+  once per KC model it loads: the factor models, `--root` and each
+  `--compare`. On the E-learning 2022 export, which has 100 KC models,
+  loading 10 of them took 5.6 s and now takes 1.0 s, and the default
+  `--factors` loads all 100. An unknown `--root` is now refused before
+  anything is loaded, like an unknown `--compare`.
 - The unit tests are organised by the module they exercise. `test_data`,
   `test_design`, `test_fit`, `test_crossval` and `test_cli` join the family
   files, which keep only what is specific to their family. The builders the
