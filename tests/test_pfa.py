@@ -126,12 +126,6 @@ def test_invalid_options_raise():
         build_pfa_design(data, counts="lagged")
 
 
-def test_inclusive_counts_warn_at_build_time():
-    data, _ = simulate_pfa(n_students=4, n_reps=4)
-    with pytest.warns(UserWarning, match="inside its own predictor"):
-        build_pfa_design(data, counts="inclusive")
-
-
 def test_a_kc_with_no_prior_successes_has_no_estimable_success_slope():
     """The PFA analogue of AFM's never-practised-twice KC."""
     rows = [step_row(f"s{i}", f"st{r}", 0, "Z", r + 1)

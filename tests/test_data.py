@@ -7,6 +7,7 @@ numbers opportunities, and the clock it keeps for the families that need one.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -112,6 +113,8 @@ def test_practice_order_uses_time_then_row_order():
 
 
 def test_recomputed_opportunities_match_the_file_when_order_agrees():
+    """Without a time column practice_order falls back to row order, which is
+    what DataShop numbers by."""
     data = synthetic(n_students=5, n_kcs=3, n_items=9, seed=40, n_reps=4)
     assert data.times is None, "synthetic rollups carry no time column"
     assert data.recomputed_opportunities() == data.opportunities
@@ -142,14 +145,6 @@ def test_every_declared_column_is_actually_required():
     for column in MINIMAL_COLUMNS:
         with pytest.raises(KeyError, match=re.escape(column)):
             from_frame(df.drop(columns=[column]), "M")
-
-
-def test_opportunities_can_be_recomputed_without_a_time_column():
-    """practice_order falls back to row order, which is what DataShop numbers by."""
-    data = from_frame(minimal_frame(), "M")
-    assert data.times is None
-    assert data.recomputed_opportunities() == data.opportunities
-    assert len(data.opportunity_disagreements()) == 0
 
 
 def test_outcome_labels_are_matched_case_insensitively():
@@ -227,10 +222,7 @@ def test_time_on_task_is_the_lagged_cumulative_duration():
 def test_an_export_without_a_clock_refuses_rather_than_substituting_one(example):
     """Every value that could stand in for a missing time — the row number, a
     constant — is a different model, so there is no default to fall back to."""
-    stripped = type(example)(
-        y=example.y, students=example.students, items=example.items,
-        kcs=example.kcs, opportunities=example.opportunities, kc_model=example.kc_model,
-    )
+    stripped = replace(example, times=None, durations=None)
     with pytest.raises(ValueError, match="no 'First Transaction Time' column"):
         stripped.epoch_times()
     with pytest.raises(ValueError, match="no 'Step Duration"):

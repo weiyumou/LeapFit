@@ -262,14 +262,6 @@ def test_a_duplicate_kc_reports_no_estimate_rather_than_its_twins():
     assert np.isnan(values.loc["B", "Slope"])
 
 
-def test_compat_preserves_the_learnsphere_parameter_count():
-    data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=37, n_reps=5)
-    compat = build_afm_design(data, learnsphere_compat=True)
-    assert compat.n_params == 6 + 2 * 3
-    assert len(compat.aliased) == 0
-    assert np.all(compat.l2[compat.slices()["student"]] == 1.0)
-
-
 # --------------------------------------------------------------------------
 # Separation: coefficients with no finite MLE
 # --------------------------------------------------------------------------

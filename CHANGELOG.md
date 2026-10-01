@@ -14,6 +14,14 @@ while the major version is 0, a minor bump may change the public API.
   `tests/helpers.py`; each family file used to define its own copy. The
   example export is loaded once per session, by a fixture in
   `tests/conftest.py`.
+- 17 test cases that repeated what another test already checks are removed
+  or folded into that test, and parametrized tests replace near-identical
+  ones. Expensive results are now computed once per module: the LFA search
+  and validation on the example, the LKT vignette's chunk fits and parameter
+  search, and the LearnSphere export, which was read 33 times. The suite
+  without data runs 314 tests in about 18 s, down from 330 in 28 s; with every
+  fixture it takes 83 s, down from 137 s. The console-script check now covers
+  `leapfit-pfa` too.
 
 ### Fixed
 

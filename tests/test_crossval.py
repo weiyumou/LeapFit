@@ -77,8 +77,7 @@ def test_the_two_conventions_give_different_numbers():
     assert abs(per_fold.rmse - pooled.rmse) < 0.05, "same quantity, different estimator"
 
 
-@pytest.mark.parametrize("convention", ["per_fold", "pooled"])
-def test_worker_count_does_not_move_a_single_digit(convention):
+def test_worker_count_does_not_move_a_single_digit():
     """``n_jobs`` is a wall-clock knob, not a modelling one.
 
     Partitions are drawn in the parent before any fit starts and results are
@@ -86,10 +85,14 @@ def test_worker_count_does_not_move_a_single_digit(convention):
     change is how long the answer takes. Asserting on the repr rather than
     ``approx`` is deliberate: 'close enough' is the failure mode this guards
     against, since KC-model comparisons are decided in the fourth decimal.
+
+    One convention covers both. With a seed the partitions do not depend on
+    it, and the per-fold scores the other convention averages are compared
+    here too, inside each ``CVResult``.
     """
     data = synthetic(n_students=14, n_kcs=4, n_items=20, seed=44, n_reps=5)
     design = build_afm_design(data)
-    kw = {"scheme": "item_blocked", "n_folds": 3, "convention": convention,
+    kw = {"scheme": "item_blocked", "n_folds": 3, "convention": "pooled",
           "method": "L-BFGS-B"}
 
     one = cross_validate(design, data, seed=7, n_jobs=1, **kw)

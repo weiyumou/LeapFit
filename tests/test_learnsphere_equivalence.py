@@ -1,6 +1,6 @@
 """Equivalence against LearnSphere's own output, on LearnSphere's own input.
 
-Everything in ``test_afm.py`` runs without data. This file is the other half:
+The unit tests run without data. This file is the other half:
 it fits the real E-learning 2022 export that DataShop workflow ``wf3990``
 processed, and checks our numbers against the ``model_values.xml`` that same
 workflow produced. Skipped when the artifacts are absent, so a bare clone still
@@ -22,6 +22,7 @@ global optimum, so nothing can beat it.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -29,7 +30,7 @@ from itertools import pairwise
 
 import pytest
 
-from leapfit import build_afm_design, fit_afm, load_student_step
+from leapfit import build_afm_design, fit_afm, from_frame, load_student_step
 
 WF3990_DIR = os.environ.get(
     "AFM_WF3990_DIR", "results/wf3990_results_2024_1206-10-runs")
@@ -63,29 +64,52 @@ def reference() -> dict[str, dict[str, float]]:
     return learnsphere_values()
 
 
-def test_the_export_is_elearning_22(reference):
-    data = load_student_step(EXPORT, kc_model="LOs-new-MCQ")
+@pytest.fixture(scope="module")
+def load():
+    """Each KC model's ``StepData``, made at most once, and every one of them
+    parsed from a single read of the 41 MB export."""
+    frame = load_student_step(EXPORT, kc_model="LOs-new-MCQ").source
+    return functools.cache(lambda name: from_frame(frame, name))
+
+
+@pytest.fixture(scope="module")
+def identified(load):
+    """Each KC model's identified design, made at most once: on the finest
+    models the rank check alone takes over a second."""
+    return functools.cache(lambda name: build_afm_design(load(name)))
+
+
+@pytest.fixture(scope="module")
+def analysis(load, identified):
+    """Each KC model's fit under its identified design, made at most once."""
+    return functools.cache(lambda name: fit_afm(
+        identified(name), load(name).y, method="TNC", max_fun=MAX_FUN,
+        warn_not_converged=False))
+
+
+def test_the_export_is_elearning_22(reference, load):
+    data = load("LOs-new-MCQ")
     assert len(data) == 42_176
     assert len(data.student_names) == 39
     assert len(set(data.items)) == 1_865
     assert len(reference) == 10
 
 
-def test_compat_reproduces_the_learnsphere_parameter_count(reference):
+def test_compat_reproduces_the_learnsphere_parameter_count(reference, load):
     """nPars recovered from their own output as (AIC + 2*ll)/2."""
     for name, ref in reference.items():
-        data = load_student_step(EXPORT, kc_model=name)
+        data = load(name)
         implied = (ref["AIC"] + 2 * ref["log_likelihood"]) / 2
         ours = build_afm_design(data, learnsphere_compat=True).n_params
         assert ours == pytest.approx(implied, abs=1e-6), name
         assert ours == len(data.student_names) + 2 * len(data.kc_names), name
 
 
-def test_compat_reproduces_the_learnsphere_fit(reference):
+def test_compat_reproduces_the_learnsphere_fit(reference, load):
     """Match within tolerance, or beat them from a certified optimum."""
     beaten = []
     for name, ref in reference.items():
-        data = load_student_step(EXPORT, kc_model=name)
+        data = load(name)
         design = build_afm_design(data, learnsphere_compat=True)
         fit = fit_afm(design, data.y, method="TNC", max_fun=MAX_FUN,
                       warn_not_converged=False)
@@ -109,24 +133,22 @@ def test_compat_reproduces_the_learnsphere_fit(reference):
     assert {n for n, _ in beaten} <= {"concept", "Unique-step-MCQ"}, beaten
 
 
-def test_identification_only_removes_phantom_parameters(reference):
+def test_identification_only_removes_phantom_parameters(load, identified, analysis):
     """Analysis mode drops columns that cannot be estimated, and nothing else.
 
     The likelihood is unchanged (up to the ridge that compat also carries), and
     the parameter count falls by exactly the measured rank deficiency.
     """
     for name in ("LOs-new-MCQ", "pmi", "concept", "Unique-step-MCQ"):
-        data = load_student_step(EXPORT, kc_model=name)
-        full = build_afm_design(data, identify=False, student_l2=0.0)
-        ident = build_afm_design(data)
+        full = build_afm_design(load(name), identify=False, student_l2=0.0)
+        ident = identified(name)
 
         assert ident.n_params == full.rank(), name
         assert full.n_params - ident.n_params == len(ident.aliased), name
 
-        a = fit_afm(full, data.y, method="TNC", max_fun=MAX_FUN,
+        a = fit_afm(full, load(name).y, method="TNC", max_fun=MAX_FUN,
                     warn_not_converged=False)
-        b = fit_afm(ident, data.y, method="TNC", max_fun=MAX_FUN,
-                    warn_not_converged=False)
+        b = analysis(name)
         assert b.ll_unpenalized == pytest.approx(a.ll_unpenalized, abs=0.5), (
             f"{name}: dropping aliased columns changed the likelihood, so they "
             "were not aliased after all."
@@ -134,13 +156,11 @@ def test_identification_only_removes_phantom_parameters(reference):
         assert b.is_optimal, name
 
 
-def test_phantom_parameters_scale_with_granularity(reference):
+def test_phantom_parameters_scale_with_granularity(load, identified):
     """The overcount is not uniform — it tracks how fine the KC model is."""
     counts = {}
     for name in ("Single-KC-MCQ", "LOs-new-MCQ", "pmi", "concept", "Unique-step-MCQ"):
-        data = load_student_step(EXPORT, kc_model=name)
-        counts[name] = (len(data.kc_names),
-                        len(build_afm_design(data).aliased))
+        counts[name] = (len(load(name).kc_names), len(identified(name).aliased))
     assert counts["Unique-step-MCQ"][1] == 959
     assert counts["concept"][1] == 14
     assert counts["Single-KC-MCQ"][1] == 1
@@ -149,16 +169,14 @@ def test_phantom_parameters_scale_with_granularity(reference):
     assert fine_to_coarse == sorted(fine_to_coarse, reverse=True)
 
 
-def test_never_repeated_kcs_report_undefined_slopes(reference):
-    data = load_student_step(EXPORT, kc_model="Unique-step-MCQ")
-    fit = fit_afm(build_afm_design(data), data.y, method="TNC", max_fun=MAX_FUN,
-                  warn_not_converged=False)
-    values = fit.kc_values(data)
+def test_never_repeated_kcs_report_undefined_slopes(load, analysis):
+    data = load("Unique-step-MCQ")
+    values = analysis("Unique-step-MCQ").kc_values(data)
     assert len(values) == len(data.kc_names) == 1_865
     assert int(values["Slope"].isna().sum()) == 958
 
 
-def test_file_and_recomputed_opportunities_agree_almost_everywhere():
+def test_file_and_recomputed_opportunities_agree_almost_everywhere(load):
     """DataShop's Opportunity column follows *row* order, and row order is not
     sorted by time.
 
@@ -168,7 +186,7 @@ def test_file_and_recomputed_opportunities_agree_almost_everywhere():
     wrong opportunity number. Every disagreement traces to one of those
     inversions; none is a same-second tie.
     """
-    data = load_student_step(EXPORT, kc_model="LOs-new-MCQ")
+    data = load("LOs-new-MCQ")
     disagree = set(data.opportunity_disagreements().tolist())
     assert 0 < len(disagree) / len(data) < 0.001
 
@@ -190,16 +208,15 @@ def test_file_and_recomputed_opportunities_agree_almost_everywhere():
         )
 
 
-def test_recomputed_opportunities_barely_move_the_fit():
+def test_recomputed_opportunities_barely_move_the_fit(load, analysis):
     """The column is wrong on 0.07% of rows, and it does not matter numerically.
 
     Worth pinning: it licenses keeping DataShop's column as the default (so the
     published baseline stays reproducible) while offering the corrected
     ordering for new work.
     """
-    data = load_student_step(EXPORT, kc_model="LOs-new-MCQ")
-    a = fit_afm(build_afm_design(data), data.y, method="TNC",
-                max_fun=MAX_FUN, warn_not_converged=False)
+    data = load("LOs-new-MCQ")
+    a = analysis("LOs-new-MCQ")
     b = fit_afm(build_afm_design(data, recompute_opportunities=True), data.y,
                 method="TNC", max_fun=MAX_FUN, warn_not_converged=False)
     assert a.n_params == b.n_params

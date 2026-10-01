@@ -59,6 +59,8 @@ def test_identify_drops_a_reference_student():
     assert len(ident.aliased) == 1
     assert ident.aliased.columns[0].startswith("student:")
     assert ident.n_params == ident.rank(), "identified design must be full rank"
+    # A regression guard: one component, so no component bookkeeping in the reason.
+    assert ident.aliased.reasons == ("reference level (student/KC sum redundancy)",)
 
 
 def test_identify_drops_slope_columns_for_never_repeated_kcs():
@@ -95,15 +97,24 @@ def test_aliased_columns_carry_no_information():
                                fit.predict_proba(ident), rtol=0, atol=1e-12)
 
 
-def test_identification_does_not_change_the_maximised_likelihood():
-    """Same optimum as the unidentified design, just without the phantom column."""
-    data = synthetic(n_students=8, n_kcs=4, n_items=16, seed=33, n_reps=6)
-    full = fit_afm(build_afm_design(data, identify=False, student_l2=0.0), data.y,
-                   method="L-BFGS-B", max_fun=200_000, warn_not_converged=False)
-    ident = fit_afm(build_afm_design(data), data.y,
-                    method="L-BFGS-B", max_fun=200_000, warn_not_converged=False)
+@pytest.mark.parametrize("make_data,n_aliased", [
+    pytest.param(lambda: synthetic(n_students=8, n_kcs=4, n_items=16, seed=33, n_reps=6),
+                 1, id="reference-student"),
+    pytest.param(co_occurring_kc_data, 3, id="duplicate-kcs"),
+])
+def test_identification_does_not_change_the_maximised_likelihood(make_data, n_aliased):
+    """Same optimum as the unidentified design, just without the columns that
+    carry nothing: the phantom reference student, or a KC that tags exactly the
+    steps another does (with its slope, and then a reference student). That
+    equivalence is what licenses the drop."""
+    data = make_data()
+    kwargs = {"method": "L-BFGS-B", "max_fun": 200_000,
+              "warn_not_converged": False, "warn_separated": False}
+    full = fit_afm(build_afm_design(data, identify=False, student_l2=0.0),
+                   data.y, **kwargs)
+    ident = fit_afm(build_afm_design(data), data.y, **kwargs)
     assert ident.ll_unpenalized == pytest.approx(full.ll_unpenalized, abs=1e-4)
-    assert ident.n_params == full.n_params - 1
+    assert ident.n_params == full.n_params - n_aliased
 
 
 def test_sum_redundancy_is_detected_for_any_constant_kcs_per_row():
@@ -180,18 +191,6 @@ def test_identify_drops_kcs_that_tag_identical_steps():
     assert full.rank() == full.n_params - len(ident.aliased)
 
 
-def test_dropping_duplicate_kcs_leaves_the_likelihood_unchanged():
-    """The equivalence that licenses the drop: same optimum, fewer columns."""
-    data = co_occurring_kc_data()
-    kwargs = {"method": "L-BFGS-B", "max_fun": 200_000,
-              "warn_not_converged": False, "warn_separated": False}
-    full = fit_afm(build_afm_design(data, identify=False, student_l2=0.0),
-                   data.y, **kwargs)
-    ident = fit_afm(build_afm_design(data), data.y, **kwargs)
-    assert ident.ll_unpenalized == pytest.approx(full.ll_unpenalized, abs=1e-4)
-    assert ident.n_params < full.n_params
-
-
 def test_duplicate_removal_can_create_the_sum_redundancy_and_it_is_still_broken():
     """Every row here carries the pair, so dedup turns 2 KCs per row into 1.
 
@@ -236,7 +235,10 @@ def test_a_third_partitioning_block_carries_a_second_redundancy():
 
     The third block here is crossed with both students and KCs — every
     combination occurs — so the all-ones relation is the *only* thing relating
-    it to them, which is exactly what the pass models.
+    it to them, which is exactly what the pass models. The KC block still keeps
+    every level: the reason for dropping a student rather than a KC does not
+    weaken when a third factor joins, since the KC intercepts are still the
+    reported output.
     """
     data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=11, n_reps=6)
     third = _one_hot([f"g{i % 4}" for i in range(len(data))], "cohort")
@@ -250,16 +252,6 @@ def test_a_third_partitioning_block_carries_a_second_redundancy():
     assert len(identified.aliased) == 2
     blocks = {c.split(":")[0] for c in identified.aliased.columns}
     assert blocks == {"student", "cohort"}, "prefer_drop first, then latest-declared"
-
-
-def test_the_kc_block_keeps_every_level_however_many_blocks_partition():
-    """The reason for dropping a student rather than a KC does not weaken when
-    a third factor joins: the KC intercepts are still the reported output."""
-    data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=12, n_reps=6)
-    design = build_afm_design(data, identify=False).with_blocks(
-        _one_hot([f"g{i % 4}" for i in range(len(data))], "cohort")).identify()
-    kc = next(b for b in design.blocks if b.name == "kc_intercept")
-    assert sorted(kc.columns) == sorted(data.kc_names)
 
 
 def test_partitioning_is_detected_from_the_row_sums_not_from_a_block_name():
@@ -322,13 +314,6 @@ def test_a_cohort_of_one_student_gives_up_its_only_student():
     assert ident.n_params == ident.rank()
     assert len(ident.aliased.by_block()["student"]) == 2
     assert next(b for b in ident.blocks if b.name == "student").matrix.shape[1] == 0
-
-
-def test_a_single_component_keeps_the_plain_reference_level_reason():
-    """Regression: the ordinary export must not grow component bookkeeping."""
-    data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=38, n_reps=5)
-    ident = build_afm_design(data, identify=False).identify()
-    assert ident.aliased.reasons == ("reference level (student/KC sum redundancy)",)
 
 
 def test_a_component_without_the_sum_redundancy_keeps_every_student():

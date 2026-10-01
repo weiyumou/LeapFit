@@ -16,6 +16,7 @@ when a spec asks for something the shared identification pass cannot break.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -176,8 +177,8 @@ def test_history_counts_checks_that_the_labels_match_the_data(example):
 # --------------------------------------------------------------------------
 
 
-def _single_kc_column(data, feature, **kwargs):
-    design = build_lkt_design(data, [Term("kc", feature, per_level=True, **kwargs)],
+def _column(data, feature, pars=()):
+    design = build_lkt_design(data, [Term("kc", feature, per_level=True, pars=pars)],
                               identify=False)
     return _dense(design)[:, 0]
 
@@ -198,26 +199,10 @@ def streak():
     ("logafm", [math.log1p(t) for t in (0, 1, 2, 3)]),
     ("logsuc", [math.log1p(s) for s in (0, 1, 1, 2)]),
     ("logfail", [math.log1p(f) for f in (0, 0, 1, 1)]),
-    ("prop", [0.5, 1.0, 0.5, 2 / 3]),
+    ("prop", [0.5, 1.0, 0.5, 2 / 3]),  # the reference guards 0/0 with .5, not a dropped row
 ])
 def test_static_feature_values_match_their_definitions(streak, feature, expected):
-    np.testing.assert_allclose(_single_kc_column(streak, feature), expected)
-
-
-def test_prop_seeds_an_unpractised_level_at_a_half(streak):
-    """The reference guards 0/0 with .5 rather than dropping the row."""
-    assert _single_kc_column(streak, "prop")[0] == 0.5
-
-
-def test_powafm_raises_the_count_to_its_fixed_exponent(streak):
-    np.testing.assert_allclose(_single_kc_column(streak, "powafm", pars=0.5),
-                               [0.0, 1.0, 2 ** 0.5, 3 ** 0.5])
-
-
-def test_logafm_is_log1p_of_lineafm(example):
-    line = _dense(build_lkt_design(example, [Term("kc", "lineafm")], identify=False))
-    log = _dense(build_lkt_design(example, [Term("kc", "logafm")], identify=False))
-    np.testing.assert_allclose(log[:, 0], np.log1p(line[:, 0]))
+    np.testing.assert_allclose(_column(streak, feature), expected)
 
 
 # --------------------------------------------------------------------------
@@ -260,11 +245,7 @@ def test_an_unknown_component_names_the_columns_that_exist(example):
 
 
 def test_a_source_component_needs_the_source_table(example):
-    stripped = type(example)(
-        y=example.y, students=example.students, items=example.items,
-        kcs=example.kcs, opportunities=example.opportunities,
-        kc_model=example.kc_model,
-    )
+    stripped = replace(example, source=None, source_rows=None)
     with pytest.raises(ValueError, match="no source table"):
         component_labels(stripped, "Problem Name")
 
@@ -399,22 +380,15 @@ def test_a_nested_component_gets_one_reference_level_per_component(example):
     """Every item here belongs to exactly one KC, so the KC/item graph falls
     apart into one component per KC and each carries its own redundancy. Four
     KCs, four reference levels — which is the whole point of doing this per
-    component rather than once."""
+    component rather than once. ``prefer_drop`` leads, then latest-declared
+    first, so the KCs named before the items nested in them keep every level
+    and the items give way."""
     design = build_lkt_design(example, [Term("kc", "intercept"),
                                         Term("item", "intercept")])
     assert design.n_params == design.rank()
     assert len(design.aliased) == len(example.kc_names) == 4
     assert all(c.startswith("intercept[item]:") for c in design.aliased.columns)
     assert all("component" in reason for reason in design.aliased.reasons)
-
-
-def test_the_earliest_component_in_the_spec_keeps_every_level(example):
-    """``prefer_drop`` leads, then latest-declared first, so the KCs named
-    before the items nested in them keep every level and the items give way."""
-    design = build_lkt_design(example, [Term("kc", "intercept"),
-                                        Term("item", "intercept")])
-    assert all(c.startswith("intercept[item]:") for c in design.aliased.columns)
-    assert "kc_intercept" not in design.aliased.by_block()
 
 
 def test_a_coarser_component_named_after_the_one_nested_in_it_is_refused(example):
@@ -550,14 +524,6 @@ def test_a_single_intercept_on_any_component_is_fine(example):
         assert design.n_params == design.rank()
 
 
-def test_identify_false_leaves_the_parameter_count_to_the_caller(example):
-    """The escape hatch still exists, and still overstates the model — that is
-    what it is for."""
-    design = build_lkt_design(example, [Term("student", "intercept"),
-                                        Term("item", "intercept")], identify=False)
-    assert design.n_params > design.rank()
-
-
 def test_a_level_with_no_second_opportunity_reports_nan_not_zero():
     """AFM's never-practised-twice rule, at the level of any component: the
     slope was not estimated, and printing 0.0 would invite it into a
@@ -586,6 +552,9 @@ def test_cost_is_the_reference_ridge_on_every_column(example):
 
     fit = fit_lkt(design, example.y)
     assert fit.penalty > 0.0
+    # The reference reports the *unpenalized* likelihood of a penalized fit —
+    # the opposite convention to LearnSphere's AFM, which reports the penalized
+    # objective as if it were a likelihood. Both are available here.
     assert fit.ll == pytest.approx(fit.ll_unpenalized - fit.penalty)
 
 
@@ -679,14 +648,6 @@ def test_cross_validation_runs_over_an_lkt_design(example):
     assert 0.0 < result.rmse < 1.0
 
 
-def test_an_lkt_design_takes_row_subsets_like_any_other(example):
-    design = build_lkt_design(example, lkt_terms(*PFA_SPEC))
-    rows = np.arange(0, len(example), 2)
-    subset = design.take(rows)
-    assert subset.n_obs == len(rows)
-    assert subset.columns == design.columns
-
-
 # --------------------------------------------------------------------------
 # A term that needs a clock the export does not keep
 # --------------------------------------------------------------------------
@@ -750,15 +711,11 @@ def clocked():
         np.array(outcomes, dtype=float), np.cumsum(np.asarray(gaps, dtype=float))
 
 
-def _column(data, feature, pars=()):
-    design = build_lkt_design(data, [Term("kc", feature, per_level=True, pars=pars)],
-                              identify=False)
-    return _dense(design)[:, 0]
-
-
 def test_the_decay_features_lag_their_own_trial(clocked):
     """Every one of these is shifted by a position: the reference's slide
-    functions return ``c(seed, v[1:n-1])``, so nothing regresses on itself."""
+    functions return ``c(seed, v[1:n-1])``, so nothing regresses on itself.
+    The ghost trials are what make position 0 defined instead of 0/0, which the
+    oracles start at a half for ``propdec`` and at zero for ``logitdec``."""
     data, y, _ = clocked
     d = 0.85
     np.testing.assert_allclose(_column(data, "expdecafm", d), _slide_expdec(np.ones(7), d))
@@ -766,13 +723,6 @@ def test_the_decay_features_lag_their_own_trial(clocked):
     np.testing.assert_allclose(_column(data, "expdecfail", d), _slide_expdec(1 - y, d))
     np.testing.assert_allclose(_column(data, "propdec", d), _slide_propdec(y, d))
     np.testing.assert_allclose(_column(data, "logitdec", d), _slide_logitdec(y, d))
-
-
-def test_propdec_starts_at_a_half_and_logitdec_at_zero(clocked):
-    """The ghost trials are what make position 0 defined instead of 0/0."""
-    data, _, _ = clocked
-    assert _column(data, "propdec", 0.85)[0] == 0.5
-    assert _column(data, "logitdec", 0.85)[0] == 0.0
 
 
 def test_logitdec_truncates_at_the_references_sixty_trial_window():
@@ -977,14 +927,13 @@ def test_the_fitted_parameters_are_counted_as_parameters(example, profile):
     assert "feature parameter(s) fitted too" in profile.fit.summary()
 
 
-def test_identification_is_decided_at_the_seed_and_held(example):
+def test_identification_is_decided_at_the_seed_and_held(example, profile):
     """A parameter value that made one more column identically zero would
     change the parameter count mid-search, and the AIC of one evaluation would
     stop being comparable with the next."""
     seed = build_lkt_design(example, _profile_terms())
-    result = fit_lkt_pars(example, _profile_terms())
-    assert result.fit.design.n_params == seed.n_params
-    assert len(result.fit.design.aliased) == len(seed.aliased)
+    assert profile.fit.design.n_params == seed.n_params
+    assert len(profile.fit.design.aliased) == len(seed.aliased)
 
 
 def _twins(n_students=8, n_steps=16, seed=3):
@@ -1071,7 +1020,7 @@ def test_max_gain_bounds_what_any_single_parameter_step_actually_buys(example, p
     assert profile.max_gain <= PARAMETER_TOLERANCE
 
 
-def test_the_optimizers_own_flag_is_not_the_certificate(example):
+def test_the_optimizers_own_flag_is_not_the_certificate(example, profile):
     """They answer different questions, so both are reported. Capped at one
     outer iteration the optimizer says it stopped early — and on this data it
     had already reached a corner from which no step improves, which is what
@@ -1081,9 +1030,8 @@ def test_the_optimizers_own_flag_is_not_the_certificate(example):
     assert "ITERATIONS" in stopped.message.upper()
     assert stopped.is_stationary
 
-    settled = fit_lkt_pars(example, _profile_terms())
-    assert settled.converged
-    assert settled.fit.ll == pytest.approx(stopped.fit.ll, abs=1e-9)
+    assert profile.converged
+    assert profile.fit.ll == pytest.approx(stopped.fit.ll, abs=1e-9)
 
 
 def test_free_holds_the_parameters_it_does_not_select(example):
@@ -1107,12 +1055,11 @@ def test_a_parameter_resting_on_a_bound_is_reported_as_such(example):
     assert np.all(frame["estimate"] <= 0.81 + 1e-12)
 
 
-def test_restarts_measure_the_non_convexity_instead_of_assuming_it_away(example):
+def test_restarts_measure_the_non_convexity_instead_of_assuming_it_away(example, profile):
     """One start says nothing about other basins; the summary says so, and
     several starts turn that into a measurement."""
-    one = fit_lkt_pars(example, _profile_terms())
-    assert len(one.restarts) == 1
-    assert "says nothing about other basins" in one.summary()
+    assert len(profile.restarts) == 1
+    assert "says nothing about other basins" in profile.summary()
 
     several = fit_lkt_pars(example, _profile_terms(),
                            starts=[(0.9, 0.5), (0.2, 0.2), (0.99, 0.99)])
@@ -1121,13 +1068,12 @@ def test_restarts_measure_the_non_convexity_instead_of_assuming_it_away(example)
     assert "restarts       3 start(s)" in several.summary()
 
 
-def test_the_two_objectives_coincide_when_nothing_is_penalized(example):
+def test_the_two_objectives_coincide_when_nothing_is_penalized(example, profile):
     """``penalized`` profiles what the inner solver maximizes and
     ``likelihood`` profiles what the reference reports; with no ridge there is
-    only one function."""
-    penalized = fit_lkt_pars(example, _profile_terms(), objective="penalized")
+    only one function. (The ``profile`` fixture is the ``penalized`` one.)"""
     likelihood = fit_lkt_pars(example, _profile_terms(), objective="likelihood")
-    np.testing.assert_allclose(penalized.pars, likelihood.pars, atol=1e-9)
+    np.testing.assert_allclose(profile.pars, likelihood.pars, atol=1e-9)
 
 
 def test_a_ridge_separates_the_two_objectives(example):
@@ -1142,13 +1088,13 @@ def test_a_ridge_separates_the_two_objectives(example):
     assert likelihood.fit.ll_unpenalized >= penalized.fit.ll_unpenalized - 1e-9
 
 
-def test_warm_starting_does_not_change_where_the_search_lands(example):
+def test_warm_starting_does_not_change_where_the_search_lands(example, profile):
     """Safe to do aggressively because the inner problem is convex and every
-    inner fit certifies itself independently of where it started."""
-    warm = fit_lkt_pars(example, _profile_terms(), warm_start=True)
+    inner fit certifies itself independently of where it started. (The
+    ``profile`` fixture is warm-started.)"""
     cold = fit_lkt_pars(example, _profile_terms(), warm_start=False)
-    np.testing.assert_allclose(warm.pars, cold.pars, atol=1e-6)
-    assert warm.fit.ll == pytest.approx(cold.fit.ll, abs=1e-6)
+    np.testing.assert_allclose(profile.pars, cold.pars, atol=1e-6)
+    assert profile.fit.ll == pytest.approx(cold.fit.ll, abs=1e-6)
 
 
 def test_the_trajectory_records_every_evaluation(example, profile):

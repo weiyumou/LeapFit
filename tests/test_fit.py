@@ -8,13 +8,15 @@ export the fit came from.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
 from scipy import sparse
 from scipy.optimize import minimize
 
-from leapfit import StepData, build_afm_design, fit_afm, from_frame, load_student_step
+from leapfit import build_afm_design, fit_afm, from_frame, load_student_step
 from leapfit.fit import _expit, _gradient, _objective
 
 from helpers import MINIMAL_COLUMNS, minimal_frame, multi_kc_data, separated_frame, synthetic
@@ -66,11 +68,8 @@ def test_references_iteration_cap_is_inert_for_tnc():
     assert any(issubclass(w.category, OptimizeWarning)
                and "maxiter" in str(w.message) for w in caught)
 
-    # ...whereas the option TNC actually reads does bite.
-    short = fit_afm(design, data.y, method="TNC", max_fun=3, warn_not_converged=False)
-    full = fit_afm(design, data.y, method="TNC", max_fun=200_000,
-                   warn_not_converged=False)
-    assert short.ll < full.ll
+    # ...whereas the option it does read, maxfun, bites: see
+    # test_optimality_certificate_detects_a_starved_solver.
 
 
 def test_gradient_matches_finite_differences():
@@ -141,17 +140,12 @@ def test_fitting_a_separated_design_warns():
 def test_optimality_certificate_detects_a_starved_solver():
     data = synthetic(n_students=20, n_kcs=6, n_items=24, seed=38, n_reps=8)
     design = build_afm_design(data)
-    starved = fit_afm(design, data.y, method="TNC", max_fun=2, warn_not_converged=False)
+    with pytest.warns(RuntimeWarning, match="not at a stationary point"):
+        starved = fit_afm(design, data.y, method="TNC", max_fun=2)
     solved = fit_afm(design, data.y, method="TNC", max_fun=200_000,
                      warn_not_converged=False)
     assert not starved.is_optimal and solved.is_optimal
     assert solved.ll > starved.ll
-
-
-def test_fit_warns_when_not_at_the_optimum():
-    data = synthetic(n_students=20, n_kcs=6, n_items=24, seed=39, n_reps=8)
-    with pytest.warns(RuntimeWarning, match="not at a stationary point"):
-        fit_afm(build_afm_design(data), data.y, method="TNC", max_fun=2)
 
 
 # --------------------------------------------------------------------------
@@ -269,9 +263,7 @@ def test_annotate_accumulates_one_column_per_kc_model():
 
 def test_annotate_requires_the_source_table():
     data, fit = _fitted(minimal_frame())
-    bare = StepData(y=data.y, students=data.students, items=data.items,
-                    kcs=data.kcs, opportunities=data.opportunities,
-                    kc_model=data.kc_model)
+    bare = replace(data, source=None, source_rows=None)
     with pytest.raises(ValueError, match="source table"):
         fit.annotate(bare)
 

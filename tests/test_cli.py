@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from leapfit.cli import main as cli_main
 from leapfit.cli import main_lfa, main_pfa
@@ -281,14 +282,13 @@ def test_cli_lfa_lists_the_models_and_exits(capsys):
     assert capsys.readouterr().out.split() == ["Skills", "Topics"]
 
 
-def test_the_cli_offers_the_merge_operators(tmp_path):
+@pytest.mark.parametrize("options", [
+    pytest.param(("--merges", "both"), id="merge-operators"),
+    pytest.param(("--root", "Skills", "--merges", "pairwise"), id="authored-root"),
+])
+def test_cli_lfa_offers_the_merge_operators_and_an_authored_root(tmp_path, options):
     out = tmp_path / "f.csv"
-    assert _lfa_cli("--merges", "both", "--out", str(out)) == 0
+    assert _lfa_cli(*options, "--out", str(out)) == 0
     assert len(pd.read_csv(out)) > 1
 
 
-def test_the_cli_can_start_from_an_authored_kc_model(tmp_path):
-    out = tmp_path / "f.csv"
-    assert _lfa_cli("--root", "Skills", "--merges", "pairwise",
-                    "--out", str(out)) == 0
-    assert len(pd.read_csv(out)) > 1

@@ -32,6 +32,7 @@ so that "half a nat" cannot quietly become something else.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import tarfile
 import tempfile
@@ -139,10 +140,19 @@ def data():
 
 
 @pytest.fixture(scope="module")
-def fit(data):
+def chunk_fit(data):
+    """Each vignette chunk's design and certified fit, made at most once."""
+    @functools.cache
+    def build(name):
+        design = build_lkt_design(data, CHUNKS[name].terms(), cost=REFERENCE_COST)
+        return design, fit_lkt(design, data.y, **TIGHT)
+    return build
+
+
+@pytest.fixture(scope="module")
+def fit(chunk_fit):
     """The AFM chunk, which the decomposition tests below take apart."""
-    design = build_lkt_design(data, CHUNKS["AFM"].terms(), cost=REFERENCE_COST)
-    return design, fit_lkt(design, data.y, **TIGHT)
+    return chunk_fit("AFM")
 
 
 def _null_ll(y) -> float:
@@ -172,7 +182,7 @@ def test_the_specification_reproduces_the_references_parameterization(data, fit)
 
 
 @pytest.mark.parametrize("name", list(CHUNKS))
-def test_the_published_log_likelihood_is_reproduced(data, name):
+def test_the_published_log_likelihood_is_reproduced(data, chunk_fit, name):
     """Every vignette chunk whose parameters are all fixed, in one pass.
 
     Between them these exercise the whole implemented surface: prior counts
@@ -182,11 +192,10 @@ def test_the_published_log_likelihood_is_reproduced(data, name):
     (``base4``) additionally reads time on task.
     """
     chunk = CHUNKS[name]
-    design = build_lkt_design(data, chunk.terms(), cost=REFERENCE_COST)
+    design, fitted = chunk_fit(name)
     assert design.n_params == chunk.n_params
     assert design.n_params == design.rank()
 
-    fitted = fit_lkt(design, data.y, **TIGHT)
     gap = fitted.ll_unpenalized - chunk.log_likelihood
     assert fitted.is_optimal, "our own fit must be certified before we judge theirs"
     assert gap > -NAT_TOLERANCE, (
@@ -201,18 +210,15 @@ def test_the_published_log_likelihood_is_reproduced(data, name):
     assert mcfadden == pytest.approx(chunk.mcfadden, abs=5e-5)
 
 
-def test_every_chunk_lands_on_the_better_side_of_its_published_value(data):
+def test_every_chunk_lands_on_the_better_side_of_its_published_value(chunk_fit):
     """Not one comparison but the shape of all four.
 
     A sign that flipped between chunks would say the agreement is noise around
     a wrong design. All four sitting *above* their published value, by a
     fraction of a nat, is the signature of one optimizer stopping early.
     """
-    gaps = {}
-    for name, chunk in CHUNKS.items():
-        design = build_lkt_design(data, chunk.terms(), cost=REFERENCE_COST)
-        fitted = fit_lkt(design, data.y, **TIGHT)
-        gaps[name] = fitted.ll_unpenalized - chunk.log_likelihood
+    gaps = {name: chunk_fit(name)[1].ll_unpenalized - chunk.log_likelihood
+            for name, chunk in CHUNKS.items()}
     assert all(g > 0 for g in gaps.values()), gaps
     assert max(gaps.values()) < NAT_TOLERANCE, gaps
 
@@ -263,17 +269,6 @@ def test_prediction_clipping_does_not_explain_the_gap(data, fit):
     assert abs(fitted.ll_unpenalized - ll_clipped) < 1e-4
 
 
-def test_the_cost_parameter_is_the_references_ridge(data, fit):
-    design, fitted = fit
-    np.testing.assert_allclose(design.l2, 1.0 / REFERENCE_COST)
-    assert fitted.penalty > 0.0
-    # The reference reports the *unpenalized* likelihood of a penalized fit —
-    # the opposite convention to LearnSphere's AFM, which reports the penalized
-    # objective as if it were a likelihood. Both are available here.
-    assert fitted.ll == pytest.approx(fitted.ll_unpenalized - fitted.penalty)
-    assert fitted.ll_unpenalized > fitted.ll
-
-
 # --------------------------------------------------------------------------
 # The one vignette chunk that searches: RPFA seeds propdec2 and fits it
 # --------------------------------------------------------------------------
@@ -301,8 +296,25 @@ RPFA_TRACE = {
 RPFA_OPTIMUM = 0.3736667
 
 
+@pytest.fixture(scope="module")
+def rpfa_fit(data):
+    """The RPFA spec with ``propdec2`` held at a value, fitted at most once per value."""
+    @functools.cache
+    def build(parameter):
+        terms = lkt_terms(*RPFA_SPEC, (None, None, parameter, None))
+        return fit_lkt(build_lkt_design(data, terms, cost=REFERENCE_COST), data.y, **TIGHT)
+    return build
+
+
+@pytest.fixture(scope="module")
+def profile(data):
+    """The search the vignette ran, from the reference's own seed."""
+    terms = lkt_terms(*RPFA_SPEC, (None, None, RPFA_SEED, None))
+    return fit_lkt_pars(data, terms, cost=REFERENCE_COST, objective="likelihood", **TIGHT)
+
+
 @pytest.mark.parametrize("parameter", list(RPFA_TRACE))
-def test_the_references_search_path_is_reproduced_point_by_point(data, parameter):
+def test_the_references_search_path_is_reproduced_point_by_point(rpfa_fit, parameter):
     """Four points along the reference's own printed trajectory.
 
     Cheap, exact, and it validates ``propdec2`` at four settings rather than
@@ -310,8 +322,7 @@ def test_the_references_search_path_is_reproduced_point_by_point(data, parameter
     nats, because the spec has no time features and nothing depends on how the
     export's timestamps were derived.
     """
-    terms = lkt_terms(*RPFA_SPEC, (None, None, parameter, None))
-    fitted = fit_lkt(build_lkt_design(data, terms, cost=REFERENCE_COST), data.y, **TIGHT)
+    fitted = rpfa_fit(parameter)
     gap = fitted.ll_unpenalized - RPFA_TRACE[parameter]
     assert fitted.is_optimal
     assert 0.0 < gap < 0.5, (
@@ -320,17 +331,13 @@ def test_the_references_search_path_is_reproduced_point_by_point(data, parameter
     )
 
 
-def test_the_parameter_search_reaches_the_references_optimum(data):
+def test_the_parameter_search_reaches_the_references_optimum(profile):
     """The whole Stage 3 loop against the only chunk that exercises it.
 
     ``objective="likelihood"`` because that is the surface the reference
     profiles — the plain log-likelihood of a ridged fit — and the two surfaces
     part company as soon as ``cost`` is finite.
     """
-    terms = lkt_terms(*RPFA_SPEC, (None, None, RPFA_SEED, None))
-    profile = fit_lkt_pars(data, terms, cost=REFERENCE_COST, objective="likelihood",
-                           **TIGHT)
-
     assert profile.n_free == 1
     assert profile.is_stationary, profile.summary()
     assert profile.converged
@@ -347,18 +354,15 @@ def test_the_parameter_search_reaches_the_references_optimum(data):
     )
 
 
-def test_the_searched_model_is_charged_for_the_parameter_it_searched(data):
+def test_the_searched_model_is_charged_for_the_parameter_it_searched(data, rpfa_fit,
+                                                                     profile):
     """The reference reports no parameter count, so nothing there charges for
     the search. Here the fitted decay rate is one more parameter in AIC and
     BIC than the same design fitted at a value the caller chose."""
-    terms = lkt_terms(*RPFA_SPEC, (None, None, RPFA_SEED, None))
-    held = fit_lkt(build_lkt_design(data, terms, cost=REFERENCE_COST), data.y, **TIGHT)
-    searched = fit_lkt_pars(data, terms, cost=REFERENCE_COST, objective="likelihood",
-                            **TIGHT)
-
-    assert searched.fit.design.n_params == held.n_params
-    assert searched.fit.n_params == held.n_params + 1
-    assert searched.fit.bic > -2 * searched.fit.ll + held.n_params * np.log(len(data))
+    held = rpfa_fit(RPFA_SEED)
+    assert profile.fit.design.n_params == held.n_params
+    assert profile.fit.n_params == held.n_params + 1
+    assert profile.fit.bic > -2 * profile.fit.ll + held.n_params * np.log(len(data))
 
 
 # --------------------------------------------------------------------------
