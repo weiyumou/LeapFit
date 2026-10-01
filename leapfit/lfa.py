@@ -608,12 +608,9 @@ def screen(data: StepData, design: Design | None, touched: tuple[str, ...], *,
 
     if design is None:
         return "not identifiable"
-    if separation:
-        by_block = design.separated(data.y).by_block()
-        wanted = set(touched)
-        if any(name in wanted for block in ("kc_intercept", "kc_slope")
-               for name in by_block.get(block, ())):
-            return "separated"
+    if separation and not set(touched).isdisjoint(
+            design.separated(data.y).in_blocks("kc_intercept", "kc_slope")):
+        return "separated"
     return None
 
 
@@ -680,13 +677,11 @@ def _evaluate(data: StepData, steps: tuple[str, ...], labels: tuple[str, ...],
     fit = fit_afm(design, scored.y, method=method, max_fun=max_fun,
                   w0=_seed(design, parent),
                   warn_not_converged=False, warn_separated=False)
-    by_block = fit.separated.by_block()
     state = LFAState(
         labels=labels, history=history, ll=fit.ll, aic=fit.aic, bic=fit.bic,
         n_kcs=len(scored.kc_names), n_params=fit.n_params,
         is_optimal=fit.is_optimal, n_separated=len(fit.separated),
-        n_separated_kc=(len(by_block.get("kc_intercept", ()))
-                        + len(by_block.get("kc_slope", ()))),
+        n_separated_kc=len(fit.separated.in_blocks("kc_intercept", "kc_slope")),
         iteration=iteration, weights=fit.weights,
         columns=tuple(design.columns),
     )

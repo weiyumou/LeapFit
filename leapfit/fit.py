@@ -114,6 +114,15 @@ def _expit(z: np.ndarray) -> np.ndarray:
     return out
 
 
+def _steps_per_kc(data: StepData) -> list[int]:
+    """How many distinct steps each KC tags, in ``data.kc_names`` order."""
+    steps: dict[str, set[str]] = {}
+    for labels, item in zip(data.kcs, data.items):
+        for label in labels:
+            steps.setdefault(label, set()).add(item)
+    return [len(steps.get(n, ())) for n in data.kc_names]
+
+
 @dataclass
 class LogisticFit:
     """A fitted logistic model: coefficients, fit statistics, and diagnostics.
@@ -270,6 +279,16 @@ class LogisticFit:
 
     def block(self, name: str) -> np.ndarray:
         return self.weights[self.design.slices()[name]]
+
+    def _kc_intercepts(self, data: StepData, centre: bool) -> np.ndarray:
+        """Each KC's intercept in ``data.kc_names`` order, ``NaN`` where its
+        column was aliased away, and for the average student when ``centre``
+        and the design allows it (see :meth:`centred_students`)."""
+        shift = 0.0
+        if centre and self.design.recentring_is_valid():
+            _, shift = self.centred_students(data)
+        intercepts = self._block_values("kc_intercept")
+        return np.array([intercepts.get(n, np.nan) + shift for n in data.kc_names])
 
     def _block_values(self, name: str) -> dict[str, float]:
         """Fitted value per column label for one block, aliased columns absent."""

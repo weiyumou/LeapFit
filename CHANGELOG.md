@@ -48,6 +48,11 @@ while the major version is 0, a minor bump may change the public API.
   per level, from each row's labels and, optionally, the value each label
   carries. The AFM and PFA builders construct every block through it, where
   each built its own sparse triplets, and give the same matrices.
+- `Aliased.in_blocks(*blocks)` and `Separated.in_blocks(*blocks)`: the
+  columns in the named blocks, by their names within the block. The KC and
+  component tables and the LFA screens read separation through it, where
+  each combined `by_block()` entries by hand; the two records now share
+  their column handling instead of each defining it.
 - `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
   `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
   the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them

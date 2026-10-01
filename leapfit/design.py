@@ -139,20 +139,10 @@ class Block:
 
 
 @dataclass(frozen=True)
-class Aliased:
-    """Columns removed from a design because they are not estimable.
-
-    ``columns`` are fully-qualified (``"kc_slope:KC-17"``) and ``reasons``
-    parallel them. A dropped column carries no information: it is either
-    identically zero or an exact linear combination of the columns kept, so
-    removing it leaves every fitted value unchanged while making the
-    parameter count honest. This is what R's ``glm`` does when it reports
-    coefficients as ``NA`` "because of singularities" and uses the rank for
-    its degrees of freedom.
-    """
+class _Columns:
+    """Fully-qualified column names (``"kc_slope:KC-17"``), read block by block."""
 
     columns: tuple[str, ...] = ()
-    reasons: tuple[str, ...] = ()
 
     def __len__(self) -> int:
         return len(self.columns)
@@ -164,16 +154,39 @@ class Aliased:
             out.setdefault(block, []).append(col)
         return out
 
-    def summary(self) -> str:
-        if not self.columns:
-            return "no aliased columns"
-        counts = {b: len(v) for b, v in self.by_block().items()}
-        detail = ", ".join(f"{n} from {b}" for b, n in sorted(counts.items()))
-        return f"{len(self)} aliased column(s) dropped ({detail})"
+    def in_blocks(self, *blocks: str) -> list[str]:
+        """The columns in any of ``blocks``, named as within their block."""
+        by_block = self.by_block()
+        return [col for block in blocks for col in by_block.get(block, ())]
+
+    def _per_block(self) -> str:
+        """How many columns each block has here, blocks in name order."""
+        return ", ".join(f"{len(v)} from {b}" for b, v in sorted(self.by_block().items()))
 
 
 @dataclass(frozen=True)
-class Separated:
+class Aliased(_Columns):
+    """Columns removed from a design because they are not estimable.
+
+    ``columns`` are fully-qualified (``"kc_slope:KC-17"``) and ``reasons``
+    parallel them. A dropped column carries no information: it is either
+    identically zero or an exact linear combination of the columns kept, so
+    removing it leaves every fitted value unchanged while making the
+    parameter count honest. This is what R's ``glm`` does when it reports
+    coefficients as ``NA`` "because of singularities" and uses the rank for
+    its degrees of freedom.
+    """
+
+    reasons: tuple[str, ...] = ()
+
+    def summary(self) -> str:
+        if not self.columns:
+            return "no aliased columns"
+        return f"{len(self)} aliased column(s) dropped ({self._per_block()})"
+
+
+@dataclass(frozen=True)
+class Separated(_Columns):
     """Columns whose maximum-likelihood estimate runs off to infinity.
 
     Distinct from :class:`Aliased`, and the difference matters. An aliased
@@ -188,27 +201,13 @@ class Separated:
     ``+inf``, ``-1`` to ``-inf``.
     """
 
-    columns: tuple[str, ...] = ()
     directions: tuple[int, ...] = ()
-
-    def __len__(self) -> int:
-        return len(self.columns)
-
-    def by_block(self) -> dict[str, list[str]]:
-        out: dict[str, list[str]] = {}
-        for full in self.columns:
-            block, _, col = full.partition(":")
-            out.setdefault(block, []).append(col)
-        return out
 
     def summary(self) -> str:
         if not self.columns:
             return "no separated columns"
-        counts = {b: len(v) for b, v in self.by_block().items()}
-        detail = ", ".join(f"{n} from {b}" for n, b in
-                           ((n, b) for b, n in sorted(counts.items())))
         up = sum(d > 0 for d in self.directions)
-        return (f"{len(self)} column(s) with no finite MLE ({detail}); "
+        return (f"{len(self)} column(s) with no finite MLE ({self._per_block()}); "
                 f"{up} diverge to +inf, {len(self) - up} to -inf")
 
 

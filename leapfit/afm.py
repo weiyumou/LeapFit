@@ -26,7 +26,7 @@ import pandas as pd
 
 from leapfit.data import StepData
 from leapfit.design import Block, Design
-from leapfit.fit import DEFAULT_METHOD, LogisticFit, _expit, fit_logistic
+from leapfit.fit import DEFAULT_METHOD, LogisticFit, _expit, _steps_per_kc, fit_logistic
 
 STUDENT_L2 = 1.0  # LearnSphere's ridge on student intercepts (PyAFM: l2 = 1.0)
 
@@ -123,29 +123,16 @@ class AFMFit(LogisticFit):
             identification. Silently skipped on multi-KC designs, where the
             recentring identity does not hold.
         """
-        intercepts = self._block_values("kc_intercept")
-        slopes = self._block_values("kc_slope")
-
-        shift = 0.0
-        if centre and self.design.recentring_is_valid():
-            _, shift = self.centred_students(data)
-
-        steps: dict[str, set[str]] = {}
-        for labels, item in zip(data.kcs, data.items):
-            for label in labels:
-                steps.setdefault(label, set()).add(item)
-
-        by_block = self.separated.by_block()
-        diverging = set(by_block.get("kc_intercept", ())) | set(by_block.get("kc_slope", ()))
-
         names = data.kc_names
-        beta = np.array([intercepts.get(n, np.nan) + shift for n in names])
+        beta = self._kc_intercepts(data, centre)
+        slopes = self._block_values("kc_slope")
+        diverging = set(self.separated.in_blocks("kc_intercept", "kc_slope"))
         return pd.DataFrame({
             "KC Name": names,
             "Intercept (logit)": beta,
-            "Intercept (probability) at Opportunity 1": _expit(np.nan_to_num(beta)) * np.where(np.isnan(beta), np.nan, 1.0),
+            "Intercept (probability) at Opportunity 1": _expit(beta),
             "Slope": [slopes.get(n, np.nan) for n in names],
-            "Number of Unique Steps": [len(steps.get(n, ())) for n in names],
+            "Number of Unique Steps": _steps_per_kc(data),
             # Kept as a flag rather than blanked: unlike a never-repeated KC,
             # a separated one *is* informative — every attempt went the same
             # way — but its estimate is wherever the optimizer stopped.

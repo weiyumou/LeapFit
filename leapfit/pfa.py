@@ -53,7 +53,7 @@ import pandas as pd
 
 from leapfit.data import StepData
 from leapfit.design import Block, Design
-from leapfit.fit import DEFAULT_METHOD, LogisticFit, _expit, fit_logistic
+from leapfit.fit import DEFAULT_METHOD, LogisticFit, _expit, _steps_per_kc, fit_logistic
 
 COUNT_MODES = ("prior", "inclusive")
 
@@ -161,44 +161,23 @@ class PFAFit(LogisticFit):
             intercepts for the average student (sum-to-zero) rather than the
             reference student. A no-op for canonical student-free PFA.
         """
-        intercepts = self._block_values("kc_intercept")
-        s_per = self._block_values("kc_success")
-        f_per = self._block_values("kc_failure")
-        pooled_s = self._block_values("success")
-        pooled_f = self._block_values("failure")
-
-        shift = 0.0
-        has_students = any(b.name == "student" for b in self.design.blocks)
-        if centre and has_students and self.design.recentring_is_valid():
-            _, shift = self.centred_students(data)
-
-        steps: dict[str, set[str]] = {}
-        for labels, item in zip(data.kcs, data.items):
-            for label in labels:
-                steps.setdefault(label, set()).add(item)
-
-        by_block = self.separated.by_block()
-        diverging = (set(by_block.get("kc_intercept", ()))
-                     | set(by_block.get("kc_success", ()))
-                     | set(by_block.get("kc_failure", ())))
-
         names = data.kc_names
-        beta = np.array([intercepts.get(n, np.nan) + shift for n in names])
+        beta = self._kc_intercepts(data, centre)
+        diverging = set(self.separated.in_blocks("kc_intercept", "kc_success", "kc_failure"))
 
-        def slope(per: dict[str, float], pooled: dict[str, float]) -> list[float]:
-            if pooled:  # one shared coefficient, broadcast
-                value = next(iter(pooled.values()))
-                return [value] * len(names)
+        def slope(per_kc: str, pooled: str) -> list[float]:
+            if shared := self._block_values(pooled):  # one coefficient, broadcast
+                return [next(iter(shared.values()))] * len(names)
+            per = self._block_values(per_kc)
             return [per.get(n, np.nan) for n in names]
 
         return pd.DataFrame({
             "KC Name": names,
             "Intercept (logit)": beta,
-            "Intercept (probability) at first attempt":
-                _expit(np.nan_to_num(beta)) * np.where(np.isnan(beta), np.nan, 1.0),
-            "Success Slope": slope(s_per, pooled_s),
-            "Failure Slope": slope(f_per, pooled_f),
-            "Number of Unique Steps": [len(steps.get(n, ())) for n in names],
+            "Intercept (probability) at first attempt": _expit(beta),
+            "Success Slope": slope("kc_success", "success"),
+            "Failure Slope": slope("kc_failure", "failure"),
+            "Number of Unique Steps": _steps_per_kc(data),
             "Separated": [n in diverging for n in names],
         }).sort_values("KC Name", ignore_index=True)
 

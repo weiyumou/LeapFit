@@ -943,7 +943,6 @@ class LKTFit(LogisticFit):
 
         levels = sorted({label for row in component_labels(data, component)
                          for label in row})
-        by_block = self.separated.by_block()
         frame: dict[str, object] = {"Level": levels}
         diverging: set[str] = set()
 
@@ -952,7 +951,7 @@ class LKTFit(LogisticFit):
             header = term.notation() + term._pars_suffix()
             if term.per_level:
                 frame[header] = [values.get(level, np.nan) for level in levels]
-                diverging |= set(by_block.get(term.block_name, ()))
+                diverging.update(self.separated.in_blocks(term.block_name))
             else:
                 frame[header] = [next(iter(values.values()), np.nan)] * len(levels)
 
