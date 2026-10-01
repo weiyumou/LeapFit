@@ -340,18 +340,19 @@ def load_student_step(path: str, kc_model: str, **kwargs) -> StepData:
 
 def from_frame(df: pd.DataFrame, kc_model: str, *,
                success_values: tuple[str, ...] = (CORRECT,),
-               failure_values: tuple[str, ...] = tuple(FIRST_ATTEMPT_VALUES),
+               failure_values: tuple[str, ...] = tuple(sorted(FIRST_ATTEMPT_VALUES - {CORRECT})),
                ) -> StepData:
     """Build :class:`StepData` from an already-loaded student-step table.
 
     :param success_values: ``First Attempt`` values that count as a success,
         matched after folding case and stripping whitespace.
-    :param failure_values: values that count as a failure. Anything in neither
-        list raises rather than being silently scored as a failure, so a column
-        that is not the one we think it is fails loudly. A file with its own
-        vocabulary needs both lists — ``success_values=("1",),
-        failure_values=("0",)`` — which keeps the guard meaningful instead of
-        disabling it whenever the default is overridden.
+    :param failure_values: values that count as a failure, by default DataShop's
+        other three. Anything in neither list raises rather than being silently
+        scored as a failure, so a column that is not the one we think it is
+        fails loudly. A file with its own vocabulary needs both lists —
+        ``success_values=("1",), failure_values=("0",)`` — which keeps the guard
+        meaningful instead of disabling it whenever the default is overridden.
+        A value in both lists is a success.
     """
     kc_col, opp_col = f"KC ({kc_model})", f"Opportunity ({kc_model})"
     required = ["Anon Student Id", "Problem Name", "Step Name", "First Attempt",
@@ -373,7 +374,8 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
                  if duration_col else None)
 
     successes = {v.strip().lower() for v in success_values}
-    failures = {v.strip().lower() for v in failure_values}
+    # A value declared both ways is scored as a success, so it is not a failure.
+    failures = {v.strip().lower() for v in failure_values} - successes
     y, students, items, kcs, opps, times, src = [], [], [], [], [], [], []
     outcomes: dict[str, int] = {}
     skipped = duplicates = 0

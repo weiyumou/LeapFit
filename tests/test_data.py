@@ -176,6 +176,22 @@ def test_unknown_outcome_vocabulary_raises_instead_of_scoring_zero():
     assert 0 < data.y.mean() < 1
 
 
+def test_the_vocabulary_error_names_each_label_on_one_side_only():
+    """Regression: the failures it listed included 'correct'."""
+    df = minimal_frame()
+    df["First Attempt"] = np.where(df["First Attempt"] == "correct", "1", "0")
+    with pytest.raises(ValueError, match=re.escape("failures are ['hint', 'incorrect', 'unknown']")):
+        from_frame(df, "M")
+    # Declared as both, a label is scored as a success, so that is where it is listed.
+    with pytest.raises(ValueError, match=re.escape("failures are ['incorrect', 'unknown']")):
+        from_frame(df, "M", success_values=("correct", "hint"))
+    # Nor is 'correct' a failure beside a success vocabulary of the file's own,
+    # which the old default let through as one.
+    df["First Attempt"] = np.where(df["First Attempt"] == "1", "1", "correct")
+    with pytest.raises(ValueError, match=re.escape("value(s): 'correct'")):
+        from_frame(df, "M", success_values=("1",))
+
+
 def test_documented_datashop_failure_labels_are_accepted_silently():
     df = minimal_frame()
     df.loc[df.index % 5 == 0, "First Attempt"] = "hint"

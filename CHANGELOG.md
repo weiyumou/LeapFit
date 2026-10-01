@@ -3,6 +3,17 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## Unreleased
+
+### Fixed
+
+- The error for an unrecognized `First Attempt` value listed `correct`
+  among the failures. `from_frame`'s default `failure_values` included it,
+  so with `success_values=("1",)` and the default failures, a `correct` was
+  scored as a failure without complaint. It is now refused like any other
+  unrecognized value. A label declared both ways is scored as a success,
+  and is now listed only as one.
+
 ## 0.7.0 — 2026-10-01
 
 ### Changed
