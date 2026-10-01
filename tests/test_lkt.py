@@ -40,7 +40,6 @@ from leapfit import (
     fit_pfa,
     history_counts,
     lkt_terms,
-    success_failure_counts,
 )
 from leapfit.lkt import PARAMETER_STEP, _central_differences
 
@@ -123,20 +122,6 @@ def test_the_afm_identity_is_against_recomputed_opportunities():
 # --------------------------------------------------------------------------
 
 
-def test_history_counts_on_kcs_is_the_pfa_count_function(example):
-    """The generalization has to agree with what it generalizes."""
-    assert history_counts(example, example.kcs) == success_failure_counts(example)
-
-
-def test_history_counts_are_strictly_prior():
-    """correct, incorrect, correct -> s = (0,1,1), f = (0,0,1)."""
-    data = step_data([step_row("s1", f"st{i}", y, "A", i + 1)
-                      for i, y in enumerate([1, 0, 1])])
-    s, f = history_counts(data, data.kcs)
-    assert s == [(0,), (1,), (1,)]
-    assert f == [(0,), (0,), (1,)]
-
-
 def test_counts_on_the_student_component_span_that_students_whole_history():
     """A feature on the student counts everything that student did before,
     whatever KC it was on — the reference's index is (level, student), and for
@@ -147,12 +132,6 @@ def test_counts_on_the_student_component_span_that_students_whole_history():
     s, f = history_counts(data, component_labels(data, "student"))
     assert [row[0] for row in s] == [0, 1, 1, 0]
     assert [row[0] for row in f] == [0, 0, 1, 0]
-
-
-def test_successes_and_failures_sum_to_the_recomputed_opportunities(example):
-    s, f = history_counts(example, example.kcs)
-    total = [tuple(a + b for a, b in zip(sr, fr)) for sr, fr in zip(s, f)]
-    assert total == example.recomputed_opportunities()
 
 
 def test_counts_on_an_item_never_repeated_stay_zero(example):

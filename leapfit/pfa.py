@@ -14,9 +14,10 @@ student term (that is its point: usable for adaptive scheduling without an
 ability estimate); ``student_intercepts=True`` adds one.
 
 PFA relates to AFM by splitting practice by outcome: ``s_ik + f_ik = T_ik``
-identically, so AFM is the restriction ``gamma_k = rho_k``. That identity is
-pinned by a test, and it is what makes AIC/BIC/LRT comparisons between the two
-families meaningful on one dataset.
+identically, so AFM is the restriction ``gamma_k = rho_k``. That identity holds
+by construction, since the recomputed ``T`` is the two counts' sum from the
+same pass over the practice order, and it is what makes AIC/BIC/LRT
+comparisons between the two families meaningful on one dataset.
 
 **Provenance, and where we deliberately differ.** LearnSphere ships two PFA
 components, and neither fits the canonical model:
@@ -64,10 +65,11 @@ def success_failure_counts(
     """Per-observation success/failure counts for each of its KCs.
 
     Shaped exactly like ``data.opportunities``: element ``n`` holds one count
-    per KC of observation ``n``, aligned by position. Accumulated over
+    per KC of observation ``n``, aligned by position. These are
+    :meth:`~leapfit.data.StepData.prior_counts`, accumulated over
     :meth:`~leapfit.data.StepData.practice_order`, so "before" means the same
-    thing it means for AFM's ``T`` — and ``s + f`` equals the recomputed
-    opportunity count identically (a pinned invariant).
+    thing it means for AFM's ``T``: ``s + f`` is the recomputed opportunity
+    count, which is computed from the same pass.
 
     :param inclusive: include the current attempt's own outcome in its own
         counts, replicating ``AnalysisPfaStepBased``'s ``cumsum``
@@ -75,24 +77,11 @@ def success_failure_counts(
         ``f = f_prior + (1 - y)`` hold row by row — the label-leak identity.
         Exists so the defect is reproducible; never use it for analysis.
     """
-    s_out: list[tuple[int, ...]] = [()] * len(data)
-    f_out: list[tuple[int, ...]] = [()] * len(data)
-    for rows in data.practice_order().values():
-        s_seen: dict[str, int] = {}
-        f_seen: dict[str, int] = {}
-        for i in rows:
-            correct = int(data.y[i])
-            s_row, f_row = [], []
-            for kc in data.kcs[i]:
-                s, f = s_seen.get(kc, 0), f_seen.get(kc, 0)
-                if inclusive:
-                    s, f = s + correct, f + (1 - correct)
-                s_row.append(s)
-                f_row.append(f)
-                s_seen[kc] = s_seen.get(kc, 0) + correct
-                f_seen[kc] = f_seen.get(kc, 0) + (1 - correct)
-            s_out[i], f_out[i] = tuple(s_row), tuple(f_row)
-    return s_out, f_out
+    s, f = data.prior_counts()
+    if not inclusive:
+        return s, f
+    return ([tuple(c + int(y) for c in row) for row, y in zip(s, data.y)],
+            [tuple(c + 1 - int(y) for c in row) for row, y in zip(f, data.y)])
 
 
 def build_pfa_design(data: StepData, *, slopes: str = "per_kc",

@@ -36,6 +36,14 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Added
 
+- `StepData.prior_counts(labels=None)`: each observation's prior successes
+  and failures per label, strictly before the attempt and over
+  `practice_order`. It is now the one implementation behind
+  `StepData.recomputed_opportunities`, `pfa.success_failure_counts` and
+  `lkt.history_counts`, which each had their own copy of the loop; what
+  they return is unchanged. LKT builds its features over the same grouping
+  of each student's practice, so the tests that only checked the copies
+  agree with each other are gone.
 - `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
   `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
   the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them

@@ -54,17 +54,6 @@ def test_the_inclusive_mode_reproduces_the_reference_leak_identity():
         assert all(a == b + (1 - y) for a, b in zip(f_incl[i], f_prior[i]))
 
 
-def test_successes_plus_failures_equal_the_opportunity_count():
-    """s + f = T identically: PFA splits AFM's practice count by outcome.
-
-    Both sides accumulate over ``practice_order``, so this ties the two
-    families to one definition of "prior practice"."""
-    data, _ = simulate_pfa(n_students=10, n_reps=8)
-    s, f = success_failure_counts(data)
-    assert [tuple(a + b for a, b in zip(si, fi)) for si, fi in zip(s, f)] \
-        == data.recomputed_opportunities()
-
-
 def test_multi_kc_steps_feed_every_kc_on_the_row():
     df = rollup([
         step_row("s1", "st1", 1, "A~~B", "1~~1"),

@@ -110,7 +110,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.optimize import minimize
 
-from leapfit.data import StepData
+from leapfit.data import StepData, _Sequences, _sequences
 from leapfit.design import Aliased, Block, Design
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
 
@@ -718,71 +718,6 @@ def _source_column(data: StepData, component: str) -> np.ndarray:
     return data.source[component].to_numpy()[data.source_rows]
 
 
-@dataclass(frozen=True)
-class _Layout:
-    """Every (observation, component level) pair, grouped into practice sequences.
-
-    The pairs are stored flat and ordered so that each (student, level) history
-    is one contiguous run — ``starts[k]:starts[k+1]``, in practice order. That
-    is the shape both kinds of feature want: a count feature reads
-    :attr:`prior_s` and :attr:`prior_f` straight across, and a decay or
-    forgetting feature walks one run at a time.
-
-    ``slots`` records which of an observation's own labels a pair came from, so
-    a per-observation view can be rebuilt in the row's label order — the order
-    everything outside this module aligns to.
-    """
-
-    n_obs: int
-    rows: np.ndarray          # (m,) observation index
-    columns: np.ndarray       # (m,) level index into `levels`
-    slots: np.ndarray         # (m,) label position within that observation
-    starts: np.ndarray        # (n_sequences + 1,)
-    levels: list[str]
-    y: np.ndarray             # (m,) outcome at each pair
-    prior_s: np.ndarray       # (m,) prior successes within its own sequence
-    prior_f: np.ndarray       # (m,)
-
-
-def _layout(data: StepData, labels: Sequence[tuple[str, ...]]) -> _Layout:
-    """Group every (observation, level) pair by (student, level), in practice order.
-
-    The reference forms the same grouping by pasting the level onto the student
-    id and grouping on the concatenated string (``LKTfunctions.R:296``), which
-    is why two (student, level) pairs whose names differ only in where the
-    boundary falls collide there and not here.
-    """
-    levels = sorted({label for row in labels for label in row})
-    index = {label: j for j, label in enumerate(levels)}
-
-    sequences: dict[tuple[str, str], list[tuple[int, int]]] = {}
-    for student, rows in data.practice_order().items():
-        for i in rows:
-            for slot, label in enumerate(labels[i]):
-                sequences.setdefault((student, label), []).append((i, slot))
-
-    pairs = [pair for run in sequences.values() for pair in run]
-    rows_flat = np.fromiter((i for i, _ in pairs), dtype=int, count=len(pairs))
-    slots = np.fromiter((s for _, s in pairs), dtype=int, count=len(pairs))
-    columns = np.fromiter(
-        (index[label] for (_, label), run in sequences.items() for _ in run),
-        dtype=int, count=len(pairs))
-    starts = np.concatenate(
-        [[0], np.cumsum([len(run) for run in sequences.values()], dtype=int)]).astype(int)
-
-    y = np.asarray(data.y, dtype=float)[rows_flat]
-
-    # Prior counts: an exclusive cumulative sum that restarts at every sequence.
-    totals = np.concatenate([[0.0], np.cumsum(y)])
-    at_start = np.repeat(starts[:-1], np.diff(starts))
-    prior_s = totals[:-1] - totals[at_start]
-    prior_f = (np.arange(len(y)) - at_start) - prior_s
-
-    return _Layout(n_obs=len(data), rows=rows_flat, columns=columns, slots=slots,
-                   starts=starts, levels=levels, y=y,
-                   prior_s=prior_s, prior_f=prior_f)
-
-
 def history_counts(data: StepData, labels: Sequence[tuple[str, ...]],
                    ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]]]:
     """Prior successes and failures per observation, per level of a component.
@@ -795,22 +730,15 @@ def history_counts(data: StepData, labels: Sequence[tuple[str, ...]],
     :meth:`~leapfit.data.StepData.practice_order`, the one ordering everything
     in this package agrees on.
 
-    Passing ``data.kcs`` reproduces
-    :func:`~leapfit.pfa.success_failure_counts` exactly; passing the student's
-    own labels gives that student's whole prior history, which is what a
-    feature on the student component means. Element ``n`` is aligned with
-    ``labels[n]`` by position, as :attr:`~leapfit.data.StepData.opportunities`
-    is aligned with :attr:`~leapfit.data.StepData.kcs`.
+    The count itself is :meth:`~leapfit.data.StepData.prior_counts`, which
+    :func:`~leapfit.pfa.success_failure_counts` reads as well, so passing
+    ``data.kcs`` gives PFA's counts; passing the student's own labels gives
+    that student's whole prior history, which is what a feature on the student
+    component means. Element ``n`` is aligned with ``labels[n]`` by position,
+    as :attr:`~leapfit.data.StepData.opportunities` is aligned with
+    :attr:`~leapfit.data.StepData.kcs`.
     """
-    if len(labels) != len(data):
-        raise ValueError(f"{len(data)} observations but {len(labels)} label rows")
-    layout = _layout(data, labels)
-    s_out: list[list[int]] = [[0] * len(row) for row in labels]
-    f_out: list[list[int]] = [[0] * len(row) for row in labels]
-    for i, slot, s, f in zip(layout.rows, layout.slots, layout.prior_s, layout.prior_f):
-        s_out[i][slot] = int(s)
-        f_out[i][slot] = int(f)
-    return [tuple(v) for v in s_out], [tuple(v) for v in f_out]
+    return data.prior_counts(labels)
 
 
 # --------------------------------------------------------------------------
@@ -836,7 +764,7 @@ class _Clock:
         return self._cache[what]
 
 
-def _term_values(term: Term, data: StepData, layout: _Layout, clock: _Clock) -> np.ndarray:
+def _term_values(term: Term, data: StepData, layout: _Sequences, clock: _Clock) -> np.ndarray:
     """One value per (observation, level) pair, in ``layout`` order."""
     if term.feature == NUMERIC_FEATURE:
         column = pd.to_numeric(pd.Series(_source_column(data, term.component)),
@@ -864,7 +792,7 @@ def _term_values(term: Term, data: StepData, layout: _Layout, clock: _Clock) -> 
     return out
 
 
-def _term_block(term: Term, layout: _Layout, values: np.ndarray, l2: float) -> Block:
+def _term_block(term: Term, layout: _Sequences, values: np.ndarray, l2: float) -> Block:
     if not np.isfinite(values).all():
         bad = int((~np.isfinite(values)).sum())
         raise ValueError(
@@ -929,7 +857,7 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
 
 
 def _assemble(data: StepData, terms: Iterable[Term], *, l2: float, cost: float | None,
-              layouts: dict[str, _Layout], clock: _Clock) -> Design:
+              layouts: dict[str, _Sequences], clock: _Clock) -> Design:
     """:func:`build_lkt_design` short of identification, reading and filling
     ``layouts`` and ``clock``. Neither depends on a parameter, only on the data
     and the components, so :func:`fit_lkt_pars` builds them once for every
@@ -951,7 +879,11 @@ def _assemble(data: StepData, terms: Iterable[Term], *, l2: float, cost: float |
     for term in terms:
         layout = layouts.get(term.component)
         if layout is None:
-            layout = layouts[term.component] = _layout(
+            # Grouped by the (student, level) pair. The reference pastes the
+            # level onto the student id and groups on the string
+            # (LKTfunctions.R:296), so two pairs whose names differ only in
+            # where the boundary falls collide there and not here.
+            layout = layouts[term.component] = _sequences(
                 data, component_labels(data, term.component))
         blocks.append(_term_block(term, layout,
                                   _term_values(term, data, layout, clock), l2))
@@ -1333,7 +1265,7 @@ def fit_lkt_pars(data: StepData, terms: Iterable[Term], *,
     inner = {"method": method, "max_fun": max_fun, "tol": tol,
              "warn_not_converged": False, "warn_separated": False}
 
-    layouts: dict[str, _Layout] = {}
+    layouts: dict[str, _Sequences] = {}
     clock = _Clock(data)
 
     def assemble(values) -> Design:

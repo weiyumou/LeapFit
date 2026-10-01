@@ -56,7 +56,9 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from itertools import chain
 
 import numpy as np
 import pandas as pd
@@ -199,24 +201,39 @@ class StepData:
             out[rows] = np.concatenate([[0.0], np.cumsum(spent)[:-1]])
         return out
 
+    def prior_counts(self, labels: Sequence[tuple[str, ...]] | None = None,
+                     ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]]]:
+        """Successes and failures before each observation, per label.
+
+        A count is the student's own history with that label and nothing
+        else: strictly prior, so the current attempt is not inside its own
+        predictor, and accumulated over :meth:`practice_order`, the one
+        ordering everything in this package agrees on. Shaped like
+        :attr:`opportunities`: element ``n`` holds one count per label of
+        ``labels[n]``, aligned by position.
+
+        :param labels: what to count, by default :attr:`kcs`. Any labelling of
+            the observations works; a student's own id gives that student's
+            whole prior history.
+        """
+        labels = self.kcs if labels is None else labels
+        if len(labels) != len(self):
+            raise ValueError(f"{len(self)} observations but {len(labels)} label rows")
+        sequences = _sequences(self, labels)
+        return (sequences.per_row(sequences.prior_s, labels),
+                sequences.per_row(sequences.prior_f, labels))
+
     def recomputed_opportunities(self) -> list[tuple[int, ...]]:
-        """Opportunity counts derived from :meth:`practice_order`.
+        """Opportunity counts derived from :meth:`practice_order`: the prior
+        successes plus the prior failures on each KC.
 
         DataShop ships its own ``Opportunity`` columns and we use them by
         default, but ``AnalysisFastAfmAndCv`` ignores them and recomputes
         exactly this way. Use :meth:`opportunity_disagreements` to see whether
         the two differ on your export before it matters.
         """
-        out: list[list[int]] = [[] for _ in range(len(self))]
-        for rows in self.practice_order().values():
-            seen: dict[str, int] = {}
-            for i in rows:
-                counts = []
-                for kc in self.kcs[i]:
-                    counts.append(seen.get(kc, 0))
-                    seen[kc] = seen.get(kc, 0) + 1
-                out[i] = counts
-        return [tuple(v) for v in out]
+        sequences = _sequences(self, self.kcs)
+        return sequences.per_row(sequences.prior_s + sequences.prior_f, self.kcs)
 
     def opportunity_disagreements(self) -> np.ndarray:
         """Row indices where the file's counts differ from the recomputed ones."""
@@ -231,6 +248,80 @@ class StepData:
             f"{self.y.mean():.2%} correct | model '{self.kc_model}'"
             + (f" | {self.skipped_no_kc:,} rows skipped (no KC)" if self.skipped_no_kc else "")
         )
+
+
+@dataclass(frozen=True)
+class _Sequences:
+    """Every (observation, label) pair, grouped into practice sequences.
+
+    The pairs are stored flat and ordered so that each (student, label) history
+    is one contiguous run, ``starts[k]:starts[k+1]``, in practice order, and the
+    runs come in the order each student first met each label. Prior counts are
+    an exclusive cumulative sum that restarts at every run, and the same shape
+    is what :mod:`leapfit.lkt` builds its features over: a count feature reads
+    :attr:`prior_s` and :attr:`prior_f` straight across, and a decay or
+    forgetting feature walks one run at a time.
+
+    ``slots`` records which of an observation's own labels a pair came from, so
+    :meth:`per_row` can put values back in the row's label order, the order
+    everything outside this module aligns to.
+    """
+
+    n_obs: int
+    rows: np.ndarray          # (m,) observation index
+    slots: np.ndarray         # (m,) label position within that observation
+    columns: np.ndarray       # (m,) index into `levels`
+    starts: np.ndarray        # (n_sequences + 1,)
+    levels: list[str]         # every label, sorted
+    y: np.ndarray             # (m,) outcome at each pair
+    prior_s: np.ndarray       # (m,) successes earlier in its own run
+    prior_f: np.ndarray       # (m,) failures earlier in its own run
+
+    def per_row(self, values: np.ndarray,
+                labels: Sequence[tuple[str, ...]]) -> list[tuple[int, ...]]:
+        """Integer ``values``, one per pair, back in the shape of ``labels``."""
+        lengths = np.fromiter(map(len, labels), dtype=np.intp, count=len(labels))
+        ends = np.cumsum(lengths)
+        flat = np.zeros(int(ends[-1]) if len(ends) else 0, dtype=np.int64)
+        flat[ends[self.rows] - lengths[self.rows] + self.slots] = values
+        out = flat.tolist()
+        return [tuple(out[end - n:end]) for end, n in zip(ends.tolist(), lengths.tolist())]
+
+
+def _sequences(data: StepData, labels: Sequence[tuple[str, ...]]) -> _Sequences:
+    """Group every (observation, label) pair by (student, label), in practice order."""
+    flat = list(chain.from_iterable(labels))
+    levels = sorted(set(flat))
+    row_lengths = np.fromiter(map(len, labels), dtype=np.intp, count=len(labels))
+    row_starts = np.cumsum(row_lengths) - row_lengths
+    # Each pair's level, in the row-major order `flat` lists them.
+    level_of = pd.Index(levels).get_indexer(flat).astype(int)
+
+    order = data.practice_order()  # students in order of first appearance
+    practised = (np.concatenate(list(order.values())) if order
+                 else np.zeros(0, dtype=int))
+    student = np.repeat(np.arange(len(order)), [len(v) for v in order.values()])
+    lengths = row_lengths[practised]
+    rows = np.repeat(practised, lengths)
+    slots = np.arange(len(rows)) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+    columns = level_of[row_starts[rows] + slots]
+
+    # A run per (student, label), numbered in the order the student first met
+    # the label; a stable sort by that number keeps each run in practice order.
+    run = pd.factorize(np.repeat(student, lengths) * max(len(levels), 1) + columns)[0]
+    by_run = np.argsort(run, kind="stable")
+    rows, slots, columns = rows[by_run], slots[by_run], columns[by_run]
+    starts = np.concatenate([[0], np.cumsum(np.bincount(run), dtype=int)]).astype(int)
+
+    y = np.asarray(data.y, dtype=float)[rows]
+    totals = np.concatenate([[0.0], np.cumsum(y)])
+    at_start = np.repeat(starts[:-1], np.diff(starts))
+    prior_s = totals[:-1] - totals[at_start]
+    prior_f = (np.arange(len(y)) - at_start) - prior_s
+
+    return _Sequences(n_obs=len(data), rows=rows, slots=slots, columns=columns,
+                      starts=starts, levels=levels, y=y,
+                      prior_s=prior_s, prior_f=prior_f)
 
 
 def list_kc_models(path: str) -> list[str]:
