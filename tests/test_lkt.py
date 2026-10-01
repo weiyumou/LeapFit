@@ -37,15 +37,13 @@ from leapfit import (
     fit_lkt,
     fit_lkt_pars,
     fit_pfa,
-    from_frame,
     history_counts,
     lkt_terms,
-    load_student_step,
     success_failure_counts,
 )
 from leapfit.lkt import PARAMETER_STEP, _central_differences
 
-EXAMPLE = "examples/student-step.txt"
+from helpers import EPOCH, clocked_data, step_data, step_row
 
 AFM_SPEC = (("student", "kc", "kc"), ("intercept", "intercept", "lineafm$"))
 PFA_SPEC = (("kc", "kc", "kc"), ("intercept", "linesuc$", "linefail$"))
@@ -54,48 +52,6 @@ PFA_SPEC = (("kc", "kc", "kc"), ("intercept", "linesuc$", "linefail$"))
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
-
-
-def _rollup(rows, kc_model="M"):
-    return pd.DataFrame(rows).rename(
-        columns={"kc": f"KC ({kc_model})", "opp": f"Opportunity ({kc_model})"})
-
-
-def _row(student, step, y, kc, opp, time=None, **extra):
-    out = {
-        "Anon Student Id": student, "Problem Name": "p", "Step Name": step,
-        "First Attempt": "correct" if y else "incorrect", "kc": kc, "opp": str(opp),
-    }
-    if time is not None:
-        out["First Transaction Time"] = time
-    return out | extra
-
-
-EPOCH = pd.Timestamp("2024-01-01 00:00:00")
-
-
-def _clocked(outcomes, gaps, durations=None, student="s1", kc="A"):
-    """One student, one level: a practice sequence with a clock on it.
-
-    ``gaps`` are the seconds between consecutive attempts, the first ignored,
-    so the sequence starts at :data:`EPOCH`.
-    """
-    times = np.cumsum(np.asarray(gaps, dtype=float))
-    rows = []
-    for i, (y, t) in enumerate(zip(outcomes, times)):
-        extra = {} if durations is None else {"Step Duration (sec)": durations[i]}
-        rows.append(_row(student, f"st{i}", y, kc, i + 1,
-                         time=str(EPOCH + pd.Timedelta(seconds=int(t))), **extra))
-    return _data(rows)
-
-
-def _data(rows, kc_model="M"):
-    return from_frame(_rollup(rows, kc_model), kc_model)
-
-
-@pytest.fixture(scope="module")
-def example():
-    return load_student_step(EXAMPLE, kc_model="Topics")
 
 
 def _dense(design):
@@ -147,9 +103,9 @@ def test_the_afm_identity_is_against_recomputed_opportunities():
     timestamps, which is the case this fixture builds: two attempts whose
     ``Opportunity`` values follow row order while the times run the other way.
     """
-    rows = [_row("s1", "st1", 1, "A", 1, time="2024-01-01 00:00:02"),
-            _row("s1", "st2", 0, "A", 2, time="2024-01-01 00:00:01")]
-    data = _data(rows)
+    rows = [step_row("s1", "st1", 1, "A", 1, time="2024-01-01 00:00:02"),
+            step_row("s1", "st2", 0, "A", 2, time="2024-01-01 00:00:01")]
+    data = step_data(rows)
     assert data.opportunity_disagreements().size == 2
 
     lkt = build_lkt_design(data, lkt_terms(("kc",), ("lineafm$",)), identify=False)
@@ -173,8 +129,8 @@ def test_history_counts_on_kcs_is_the_pfa_count_function(example):
 
 def test_history_counts_are_strictly_prior():
     """correct, incorrect, correct -> s = (0,1,1), f = (0,0,1)."""
-    data = _data([_row("s1", f"st{i}", y, "A", i + 1)
-                  for i, y in enumerate([1, 0, 1])])
+    data = step_data([step_row("s1", f"st{i}", y, "A", i + 1)
+                      for i, y in enumerate([1, 0, 1])])
     s, f = history_counts(data, data.kcs)
     assert s == [(0,), (1,), (1,)]
     assert f == [(0,), (0,), (1,)]
@@ -184,9 +140,9 @@ def test_counts_on_the_student_component_span_that_students_whole_history():
     """A feature on the student counts everything that student did before,
     whatever KC it was on — the reference's index is (level, student), and for
     the student component the level *is* the student."""
-    rows = [_row("s1", "st1", 1, "A", 1), _row("s1", "st2", 0, "B", 1),
-            _row("s1", "st3", 1, "A", 2), _row("s2", "st4", 0, "A", 1)]
-    data = _data(rows)
+    rows = [step_row("s1", "st1", 1, "A", 1), step_row("s1", "st2", 0, "B", 1),
+            step_row("s1", "st3", 1, "A", 2), step_row("s2", "st4", 0, "A", 1)]
+    data = step_data(rows)
     s, f = history_counts(data, component_labels(data, "student"))
     assert [row[0] for row in s] == [0, 1, 1, 0]
     assert [row[0] for row in f] == [0, 0, 1, 0]
@@ -229,8 +185,8 @@ def _single_kc_column(data, feature, **kwargs):
 @pytest.fixture
 def streak():
     """One student, one KC, outcomes correct, incorrect, correct, correct."""
-    return _data([_row("s1", f"st{i}", y, "A", i + 1)
-                  for i, y in enumerate([1, 0, 1, 1])])
+    return step_data([step_row("s1", f"st{i}", y, "A", i + 1)
+                      for i, y in enumerate([1, 0, 1, 1])])
 
 
 @pytest.mark.parametrize("feature,expected", [
@@ -279,8 +235,8 @@ def test_components_resolve_from_the_parse_and_from_the_source_table(example):
 
 
 def test_kc_is_the_only_component_that_can_put_two_levels_on_one_row():
-    data = _data([_row("s1", "st1", 1, "A~~B", "1~~1"),
-                  _row("s1", "st2", 0, "A", 2)])
+    data = step_data([step_row("s1", "st1", 1, "A~~B", "1~~1"),
+                      step_row("s1", "st2", 0, "A", 2)])
     assert component_labels(data, "kc") == [("A", "B"), ("A",)]
     assert component_labels(data, "student") == [("s1",), ("s1",)]
 
@@ -288,9 +244,9 @@ def test_kc_is_the_only_component_that_can_put_two_levels_on_one_row():
 def test_a_shared_coefficient_sums_a_rows_levels():
     """Two KCs on one step contribute additively, as they do in AFM — so the
     pooled column is the row total, matching PFA's pooled construction."""
-    rows = [_row("s1", "st1", 1, "A~~B", "1~~1"),
-            _row("s1", "st2", 0, "A~~B", "2~~2")]
-    data = _data(rows)
+    rows = [step_row("s1", "st1", 1, "A~~B", "1~~1"),
+            step_row("s1", "st2", 0, "A~~B", "2~~2")]
+    data = step_data(rows)
     pooled = _dense(build_lkt_design(data, [Term("kc", "lineafm")], identify=False))
     per_level = _dense(build_lkt_design(data, [Term("kc", "lineafm", per_level=True)],
                                         identify=False))
@@ -532,9 +488,9 @@ def _cohorts(tags, conditions=None, n_students=3, n_steps=30, seed=0):
                 kc = str(rng.choice(kcs))
                 n = seen[(c, s, kc)] = seen.get((c, s, kc), 0) + 1
                 extra = {} if conditions is None else {"Condition": str(rng.choice(conditions[c]))}
-                rows.append(_row(f"c{c}s{s}", f"st{j}", int(rng.random() < 0.6), kc,
-                                 "~~".join([str(n)] * len(kc.split("~~"))), **extra))
-    return _data(rows)
+                rows.append(step_row(f"c{c}s{s}", f"st{j}", int(rng.random() < 0.6), kc,
+                                     "~~".join([str(n)] * len(kc.split("~~"))), **extra))
+    return step_data(rows)
 
 
 def test_a_feature_that_touches_every_row_does_not_merge_cohorts():
@@ -606,9 +562,9 @@ def test_a_level_with_no_second_opportunity_reports_nan_not_zero():
     """AFM's never-practised-twice rule, at the level of any component: the
     slope was not estimated, and printing 0.0 would invite it into a
     low-slope screen that reads zero as "students did not learn"."""
-    rows = [_row("s1", "st1", 1, "A", 1), _row("s1", "st2", 0, "A", 2),
-            _row("s1", "st3", 1, "B", 1)]
-    data = _data(rows)
+    rows = [step_row("s1", "st1", 1, "A", 1), step_row("s1", "st2", 0, "A", 2),
+            step_row("s1", "st3", 1, "B", 1)]
+    data = step_data(rows)
     design = build_lkt_design(data, lkt_terms(("kc", "kc"), ("intercept", "lineafm$")))
     assert "lineafm$[kc]:B" in design.aliased.columns
 
@@ -638,9 +594,9 @@ def test_the_reference_ridge_hides_a_separation_the_default_reports():
     supplies the curvature the likelihood is missing. So the same spec on the
     same data reports a separated student without ``cost`` and none with it —
     which is what the reference's always-on penalty is doing."""
-    rows = ([_row("s1", f"st{i}", 1, "A", i + 1) for i in range(4)]
-            + [_row("s2", f"st{i}", i % 2, "A", i + 1) for i in range(4)])
-    data = _data(rows)
+    rows = ([step_row("s1", f"st{i}", 1, "A", i + 1) for i in range(4)]
+            + [step_row("s2", f"st{i}", i % 2, "A", i + 1) for i in range(4)])
+    data = step_data(rows)
     terms = [Term("student", "intercept")]
 
     unpenalized = build_lkt_design(data, terms)
@@ -694,9 +650,9 @@ def test_the_reported_statistics_are_the_shared_ones(example):
 
 
 def test_numer_reads_its_component_as_a_number():
-    rows = [_row("s1", f"st{i}", i % 2, "A", i + 1, **{"Prior Score": str(i * 2)})
+    rows = [step_row("s1", f"st{i}", i % 2, "A", i + 1, **{"Prior Score": str(i * 2)})
             for i in range(3)]
-    data = _data(rows)
+    data = step_data(rows)
     design = build_lkt_design(data, [Term("Prior Score", "numer")], identify=False)
     np.testing.assert_allclose(_dense(design)[:, 0], [0.0, 2.0, 4.0])
 
@@ -732,41 +688,13 @@ def test_an_lkt_design_takes_row_subsets_like_any_other(example):
 
 
 # --------------------------------------------------------------------------
-# The clock, which lives on StepData because it is not LKT's alone
+# A term that needs a clock the export does not keep
 # --------------------------------------------------------------------------
 
 
-def test_epoch_times_are_seconds_and_not_the_parsers_own_unit():
-    """A regression with teeth: ``to_datetime``'s backing unit is a pandas
-    version detail, and reading it as nanoseconds when it is microseconds
-    scales every interval by a thousand — silently, and only the *spacing*
-    features would notice."""
-    data = _clocked([1, 0], [0, 102])
-    times = data.epoch_times()
-    assert times[0] == int(EPOCH.timestamp())
-    assert times[1] - times[0] == 102
-
-
-def test_time_on_task_is_the_lagged_cumulative_duration():
-    data = _clocked([1, 0, 1], [0, 60, 60], durations=[5.0, 7.0, 9.0])
-    np.testing.assert_allclose(data.time_on_task(), [0.0, 5.0, 12.0])
-
-
-def test_an_export_without_a_clock_refuses_rather_than_substituting_one(example):
-    """Every value that could stand in for a missing time — the row number, a
-    constant — is a different model, so there is no default to fall back to."""
-    stripped = type(example)(
-        y=example.y, students=example.students, items=example.items,
-        kcs=example.kcs, opportunities=example.opportunities, kc_model=example.kc_model,
-    )
-    with pytest.raises(ValueError, match="no 'First Transaction Time' column"):
-        stripped.epoch_times()
-    with pytest.raises(ValueError, match="no 'Step Duration"):
-        stripped.time_on_task()
-
-
 def test_a_term_that_needs_a_clock_names_itself_when_the_export_has_none(example):
-    """``example`` has times but no durations, so this is the second half."""
+    """``example`` has times but no durations, and ``base2`` needs the time on
+    task that durations give."""
     with pytest.raises(ValueError, match=r"Term kc:base2\$\(0.3,0.5\) cannot be computed"):
         build_lkt_design(example, [Term("kc", "base2", per_level=True, pars=(0.3, 0.5))])
 
@@ -818,7 +746,7 @@ def clocked():
     """Seven attempts, one of the gaps a whole day, one of them five seconds."""
     outcomes = [1, 0, 1, 1, 0, 1, 0]
     gaps = [0, 10, 20, 70, 300, 86400, 5]
-    return _clocked(outcomes, gaps, durations=[5, 7, 9, 4, 6, 8, 3]), \
+    return clocked_data(outcomes, gaps, durations=[5, 7, 9, 4, 6, 8, 3]), \
         np.array(outcomes, dtype=float), np.cumsum(np.asarray(gaps, dtype=float))
 
 
@@ -853,7 +781,7 @@ def test_logitdec_truncates_at_the_references_sixty_trial_window():
     quietly used the whole history would not reproduce the reference."""
     rng = np.random.default_rng(0)
     outcomes = rng.integers(0, 2, 200).tolist()
-    data = _clocked(outcomes, [0] + [60] * 199)
+    data = clocked_data(outcomes, [0] + [60] * 199)
     d = 0.97
     windowed = _slide_logitdec(np.asarray(outcomes, dtype=float), d)
     whole = _slide_logitdec(np.asarray(outcomes, dtype=float), d, window=10_000)
@@ -942,7 +870,7 @@ def test_a_feature_that_divides_by_a_zero_interval_is_refused_not_infinite():
     """Two attempts on one level at the same timestamp make an age of zero,
     and the reference raises it to a negative power and hands ``Inf`` to its
     solver."""
-    data = _clocked([1, 0, 1], [0, 0, 60])
+    data = clocked_data([1, 0, 1], [0, 0, 60])
     with pytest.raises(ValueError, match="non-finite"):
         build_lkt_design(data, [Term("kc", "base", per_level=True, pars=0.3)],
                          identify=False)
@@ -1002,12 +930,12 @@ def test_time_on_task_refuses_a_duration_it_cannot_accumulate_past():
     """DataShop writes "." where it could not compute a step duration.
     Accumulating past it would make every later step of that student NaN, and
     the feature reading it would then fail complaining about timestamps."""
-    rows = [_row("s1", f"st{i}", i % 2, "A", i + 1,
-                 time=str(EPOCH + pd.Timedelta(seconds=60 * i)),
-                 **{"Step Duration (sec)": "." if i == 1 else 5})
+    rows = [step_row("s1", f"st{i}", i % 2, "A", i + 1,
+                     time=str(EPOCH + pd.Timedelta(seconds=60 * i)),
+                     **{"Step Duration (sec)": "." if i == 1 else 5})
             for i in range(3)]
     with pytest.raises(ValueError, match="1 of 3 rows have no 'Step Duration"):
-        _data(rows).time_on_task()
+        step_data(rows).time_on_task()
 
 
 # --------------------------------------------------------------------------
@@ -1072,8 +1000,8 @@ def _twins(n_students=8, n_steps=16, seed=3):
             kc = "A~~B" if i % 2 == 0 else "C"
             seen[kc] += 1
             opp = "~~".join([str(seen[kc])] * len(kc.split("~~")))
-            rows.append(_row(f"s{s}", f"st{i}", int(rng.random() < 0.6), kc, opp))
-    return _data(rows)
+            rows.append(step_row(f"s{s}", f"st{i}", int(rng.random() < 0.6), kc, opp))
+    return step_data(rows)
 
 
 def test_a_profiles_design_reports_the_seeds_aliasing_in_its_own_names():

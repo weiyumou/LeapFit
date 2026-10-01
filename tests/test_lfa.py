@@ -23,7 +23,6 @@ from __future__ import annotations
 import os
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from leapfit import build_afm_design, fit_afm, from_frame, load_student_step
@@ -43,30 +42,11 @@ from leapfit.lfa import (
 )
 from leapfit.lfa import _partition as partition
 
-EXAMPLE = "examples/student-step.txt"
-
+from helpers import EXAMPLE, attempts, mixed, rollup, step_data
 
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
-
-
-def _frame(rows, kc_model="F"):
-    return pd.DataFrame(rows).rename(
-        columns={"kc": f"KC ({kc_model})", "opp": f"Opportunity ({kc_model})"})
-
-
-def _attempts(student, step, kc, outcomes):
-    """One student's repeated attempts at one step, in practice order."""
-    return [{"Anon Student Id": student, "Problem Name": "p", "Step Name": step,
-             "First Attempt": outcome, "kc": kc, "opp": str(i + 1)}
-            for i, outcome in enumerate(outcomes)]
-
-
-def _mixed(student, step, kc, n):
-    """``n`` attempts alternating correct/incorrect — never separated."""
-    return _attempts(student, step, kc,
-                     ["correct" if i % 2 else "incorrect" for i in range(n)])
 
 
 def _screen_data():
@@ -80,12 +60,12 @@ def _screen_data():
     """
     rows = []
     for student in ("s1", "s2", "s3"):
-        rows += _attempts(student, "dead", "dead", ["correct"])
-        rows += _mixed(student, "thin", "thin", 2)
-        rows += _attempts(student, "uniform", "uniform", ["incorrect"] * 4)
+        rows += attempts(student, "dead", "dead", ["correct"])
+        rows += mixed(student, "thin", "thin", 2)
+        rows += attempts(student, "uniform", "uniform", ["incorrect"] * 4)
         for k in range(4):
-            rows += _mixed(student, f"m{k}", f"m{k}", 6)
-    return from_frame(_frame(rows), "F")
+            rows += mixed(student, f"m{k}", f"m{k}", 6)
+    return step_data(rows, "F")
 
 
 def _constant_student_data():
@@ -93,9 +73,9 @@ def _constant_student_data():
     rows = []
     for student in ("s1", "s2"):
         for k in range(3):
-            rows += _mixed(student, f"m{k}", f"m{k}", 6)
-    rows += _attempts("always", "m0", "m0", ["correct", "correct"])
-    return from_frame(_frame(rows), "F")
+            rows += mixed(student, f"m{k}", f"m{k}", 6)
+    rows += attempts("always", "m0", "m0", ["correct", "correct"])
+    return step_data(rows, "F")
 
 
 def _example_factors():
@@ -109,9 +89,9 @@ def _example_factors():
 
 
 def test_factor_matrix_drops_a_column_identical_to_one_already_taken():
-    rows = _mixed("s1", "a", "X", 2) + _mixed("s1", "b", "Y", 2)
-    coarse = from_frame(_frame(rows, "coarse"), "coarse")
-    same = from_frame(_frame(rows, "coarse").rename(
+    rows = mixed("s1", "a", "X", 2) + mixed("s1", "b", "Y", 2)
+    coarse = step_data(rows, "coarse")
+    same = from_frame(rollup(rows, "coarse").rename(
         columns={"KC (coarse)": "KC (twin)",
                  "Opportunity (coarse)": "Opportunity (twin)"}), "twin")
     P = build_factor_matrix({"coarse": coarse, "twin": same})
@@ -122,29 +102,27 @@ def test_factor_matrix_drops_a_column_identical_to_one_already_taken():
 
 
 def test_a_skill_name_present_in_two_models_is_prefixed_with_its_model():
-    a = from_frame(_frame(_mixed("s1", "a", "S", 2) + _mixed("s1", "b", "T", 2),
-                          "one"), "one")
-    b = from_frame(_frame(_mixed("s1", "a", "S", 2) + _mixed("s1", "b", "S", 2),
-                          "two"), "two")
+    a = step_data(mixed("s1", "a", "S", 2) + mixed("s1", "b", "T", 2), "one")
+    b = step_data(mixed("s1", "a", "S", 2) + mixed("s1", "b", "S", 2), "two")
     P = build_factor_matrix({"one": a, "two": b})
     assert "S" in P.factors, "the first model keeps the bare name"
     assert "two-S" in P.factors, "the collision is prefixed, not silently merged"
 
 
 def test_a_multi_kc_model_cannot_serve_as_a_difficulty_factor():
-    df = _frame([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
-                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}])
+    df = rollup([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
+                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}], "F")
     with pytest.raises(ValueError, match="more than one"):
         build_factor_matrix({"wide": from_frame(df, "F")})
 
 
 def test_models_covering_different_row_sets_cannot_be_combined():
-    full = _mixed("s1", "a", "X", 2) + _mixed("s1", "b", "Y", 2)
-    short = _frame(full, "short")
+    full = mixed("s1", "a", "X", 2) + mixed("s1", "b", "Y", 2)
+    short = rollup(full, "short")
     short.loc[0, "KC (short)"] = ""          # drops that observation entirely
     short.loc[0, "Opportunity (short)"] = ""
     with pytest.raises(ValueError, match="different numbers of observations"):
-        build_factor_matrix({"full": from_frame(_frame(full, "full"), "full"),
+        build_factor_matrix({"full": step_data(full, "full"),
                              "short": from_frame(short, "short")})
 
 
@@ -261,8 +239,8 @@ def test_a_searched_kc_model_recomputes_its_own_opportunity_counts():
     file was written, so reading the column would carry the *old* model's
     practice counts into the new one.
     """
-    rows = _mixed("s1", "a", "X", 2) + _mixed("s1", "b", "X", 2)
-    data = from_frame(_frame(rows), "F")
+    rows = mixed("s1", "a", "X", 2) + mixed("s1", "b", "X", 2)
+    data = step_data(rows, "F")
     assert [o[0] for o in data.opportunities] == [0, 1, 0, 1], "as exported, one KC"
     got = relabel(data, ("p##a", "p##b"), ("split_a", "split_b"))
     assert [o[0] for o in got.opportunities] == [0, 1, 0, 1]
@@ -270,9 +248,9 @@ def test_a_searched_kc_model_recomputes_its_own_opportunity_counts():
 
 
 def test_relabelling_two_steps_apart_restarts_each_kcs_practice_count():
-    rows = _attempts("s1", "a", "X", ["correct", "correct"]) + \
-        _attempts("s1", "b", "X", ["correct", "correct"])
-    data = from_frame(_frame(rows), "F")
+    rows = attempts("s1", "a", "X", ["correct", "correct"]) + \
+        attempts("s1", "b", "X", ["correct", "correct"])
+    data = step_data(rows, "F")
     merged = relabel(data, ("p##a", "p##b"), ("one", "one"))
     assert [o[0] for o in merged.opportunities] == [0, 1, 2, 3], (
         "one KC over both steps accumulates across them")
@@ -451,9 +429,9 @@ def test_the_search_stops_on_a_no_improvement_streak():
 
 def test_the_frontier_can_be_exhausted():
     P = FactorMatrix(("p##a", "p##b"), ("only",), (frozenset({"p##a"}),))
-    rows = _mixed("s1", "a", "X", 4) + _mixed("s1", "b", "X", 4) + \
-        _mixed("s2", "a", "X", 4) + _mixed("s2", "b", "X", 4)
-    data = from_frame(_frame(rows), "F")
+    rows = mixed("s1", "a", "X", 4) + mixed("s1", "b", "X", 4) + \
+        mixed("s2", "a", "X", 4) + mixed("s2", "b", "X", 4)
+    data = step_data(rows, "F")
     res = lfa_search(data, P, max_iterations=20, patience=0,
                      min_opportunities=1)
     assert res.stopped == "exhausted", "one factor affords exactly one split"
@@ -695,91 +673,6 @@ def test_rank_correlation_needs_three_candidates():
 
 
 # --------------------------------------------------------------------------
-# The leapfit-lfa console script
-# --------------------------------------------------------------------------
-
-
-def _lfa_cli(*extra, export=EXAMPLE):
-    from leapfit.cli import main_lfa
-    return main_lfa([export, "--max-iterations", "2", "--validate", "0", *extra])
-
-
-def test_cli_lfa_writes_the_frontier_and_the_refusals(tmp_path):
-    frontier, refusals = tmp_path / "f.csv", tmp_path / "r.csv"
-    assert _lfa_cli("--out", str(frontier), "--refusals", str(refusals)) == 0
-    table = pd.read_csv(frontier)
-    assert {"rank", "n_kcs", "n_params", "bic", "is_optimal", "history"} <= set(table.columns)
-    assert table["rank"].tolist() == list(range(1, len(table) + 1))
-    # Written even when nothing was refused: an empty file is a result, a
-    # missing one cannot be told from a run that never asked.
-    assert set(pd.read_csv(refusals).columns) == {"move", "reason"}
-
-
-def test_cli_lfa_writes_a_kc_model_ready_to_join(tmp_path):
-    out = tmp_path / "q.txt"
-    assert _lfa_cli("--qmatrix", str(out), "--kc-model-name", "Discovered") == 0
-    table = pd.read_csv(out, sep="\t", dtype=str)
-    assert list(table.columns) == ["Problem Name", "Step Name", "KC (Discovered)"]
-    assert len(table) == 40, "one row per step, not per observation"
-    assert table["KC (Discovered)"].nunique() >= 2, "the search split something"
-
-
-def test_cli_lfa_annotates_the_export_under_the_discovered_model(tmp_path):
-    out = tmp_path / "annotated.txt"
-    assert _lfa_cli("--predictions", str(out), "--kc-model-name", "Found") == 0
-    written = pd.read_csv(out, sep="\t", dtype=str, keep_default_na=False)
-    assert "Predicted Error Rate (Found)" in written.columns
-    assert (written["Predicted Error Rate (Found)"] != "").all()
-    assert "KC (Topics)" in written.columns, "the export round-trips verbatim"
-
-
-def test_cli_lfa_validates_the_shortlist_and_writes_it(tmp_path):
-    from leapfit.cli import main_lfa
-    out = tmp_path / "v.csv"
-    assert main_lfa([EXAMPLE, "--max-iterations", "2", "--validate", "2",
-                     "--compare", "Topics", "--validation", str(out)]) == 0
-    table = pd.read_csv(out)
-    assert {"cv_rmse", "search_rank", "cv_rank"} <= set(table.columns)
-    assert "Topics" in set(table["model"]), "--compare joins the comparison"
-    assert "root" in set(table["model"])
-
-
-def test_cli_lfa_says_so_rather_than_writing_an_empty_validation(tmp_path, capsys):
-    out = tmp_path / "v.csv"
-    assert _lfa_cli("--validation", str(out)) == 0
-    assert not out.exists()
-    assert "--validate 0 skipped it" in capsys.readouterr().err
-
-
-def test_cli_lfa_excludes_a_multi_kc_model_from_the_factors(tmp_path, capsys):
-    """The reference aborts; this reports and proceeds with what is eligible."""
-    rows = _mixed("s1", "a", "X", 4) + _mixed("s1", "b", "Y", 4) + \
-        _mixed("s2", "a", "X", 4) + _mixed("s2", "b", "Y", 4)
-    df = _frame(rows, "clean")
-    df["KC (wide)"] = "P~~Q"
-    df["Opportunity (wide)"] = df["Opportunity (clean)"] + "~~1"
-    export = tmp_path / "export.txt"
-    df.to_csv(export, sep="\t", index=False, lineterminator="\n")
-
-    assert _lfa_cli("--min-opportunities", "1", export=str(export)) == 0
-    err = capsys.readouterr().err
-    assert "excluding 'wide'" in err and "more than one KC" in err
-
-
-def test_cli_lfa_refuses_an_unknown_model_name(tmp_path, capsys):
-    assert _lfa_cli("--factors", "Nope") == 1
-    assert "Unknown KC model" in capsys.readouterr().err
-    assert _lfa_cli("--compare", "Nope") == 1
-    assert "is not a KC model" in capsys.readouterr().err
-
-
-def test_cli_lfa_lists_the_models_and_exits(capsys):
-    from leapfit.cli import main_lfa
-    assert main_lfa([EXAMPLE, "--list-models"]) == 0
-    assert capsys.readouterr().out.split() == ["Skills", "Topics"]
-
-
-# --------------------------------------------------------------------------
 # What the pairwise merge buys
 # --------------------------------------------------------------------------
 
@@ -788,8 +681,8 @@ def _three_step_data():
     rows = []
     for student in ("s1", "s2", "s3"):
         for step in ("a", "b", "c"):
-            rows += _mixed(student, step, step, 6)
-    return from_frame(_frame(rows), "F")
+            rows += mixed(student, step, step, 6)
+    return step_data(rows, "F")
 
 
 def _two_factor_matrix(data):
@@ -859,12 +752,6 @@ def test_merges_must_be_a_known_mode():
         lfa_search(models["Topics"], P, merges="pairwise-ish")
 
 
-def test_the_cli_offers_the_merge_operators(tmp_path):
-    out = tmp_path / "f.csv"
-    assert _lfa_cli("--merges", "both", "--out", str(out)) == 0
-    assert len(pd.read_csv(out)) > 1
-
-
 def test_merging_pays_off_from_a_fine_grained_model_not_from_the_root():
     """Why the operator's value is coupled to where the search starts.
 
@@ -924,8 +811,8 @@ def test_a_root_must_label_every_step():
 
 def test_a_multi_kc_model_cannot_be_a_root():
     _, P = _example_factors()
-    df = _frame([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
-                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}])
+    df = rollup([{"Anon Student Id": "s1", "Problem Name": "p", "Step Name": "a",
+                  "First Attempt": "correct", "kc": "A~~B", "opp": "1~~1"}], "F")
     with pytest.raises(ValueError, match="more than one"):
         root_labels(P, from_frame(df, "F"))
 
@@ -979,10 +866,3 @@ def test_a_separation_already_in_the_root_does_not_refuse_every_move():
     assert result.n_evaluated > 1, (
         "and moves are still scored rather than blanket-refused")
     assert "came in with the root" in result.summary()
-
-
-def test_the_cli_can_start_from_an_authored_kc_model(tmp_path):
-    out = tmp_path / "f.csv"
-    assert _lfa_cli("--root", "Skills", "--merges", "pairwise",
-                    "--out", str(out)) == 0
-    assert len(pd.read_csv(out)) > 1

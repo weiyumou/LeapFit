@@ -5,6 +5,16 @@ while the major version is 0, a minor bump may change the public API.
 
 ## Unreleased
 
+### Changed
+
+- The unit tests are organised by the module they exercise. `test_data`,
+  `test_design`, `test_fit`, `test_crossval` and `test_cli` join the family
+  files, which keep only what is specific to their family. The builders the
+  files share (`rollup`, `step_data`, `synthetic` and the rest) live in
+  `tests/helpers.py`; each family file used to define its own copy. The
+  example export is loaded once per session, by a fixture in
+  `tests/conftest.py`.
+
 ### Fixed
 
 - The source distribution ships `examples/README.md`. The repository's

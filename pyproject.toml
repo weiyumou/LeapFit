@@ -96,3 +96,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E741"]
+
+[tool.ruff.lint.isort]
+# tests/helpers.py is imported as a top-level module (pytest puts tests/ on
+# sys.path), so without this it would sort among the third-party imports.
+known-local-folder = ["helpers"]
