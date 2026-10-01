@@ -4,6 +4,8 @@ shared across models so that their scores can be compared pairwise.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,7 +19,7 @@ from leapfit import (
     paired_scores,
     repeated_cross_validate,
 )
-from leapfit.crossval import CONVENTIONS
+from leapfit.crossval import CONVENTIONS, _worker_count
 
 from helpers import synthetic
 
@@ -113,6 +115,18 @@ def test_worker_count_does_not_move_a_single_digit():
         paired_cross_validate(models, data, seeds=seeds, n_jobs=2, **kw),
         check_exact=True,
     )
+
+
+def test_n_jobs_follows_joblibs_convention():
+    """The worker count lfa_search uses too."""
+    cores = os.cpu_count() or 1
+    assert _worker_count(1, 100) == 1
+    assert _worker_count(None, 100) == 1, "None is serial"
+    assert _worker_count(0, 100) == 1
+    assert _worker_count(3, 100) == 3
+    assert _worker_count(3, 2) == 2, "never more workers than tasks"
+    assert _worker_count(-1, 100) == cores, "-1 is every core"
+    assert _worker_count(-2, 100) == max(1, cores - 1), "-2 is all but one"
 
 
 def test_item_blocked_cv_reports_unseen_columns():

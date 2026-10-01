@@ -83,7 +83,7 @@ import numpy as np
 import pandas as pd
 
 from leapfit.afm import build_afm_design, fit_afm
-from leapfit.crossval import paired_contrasts, paired_cross_validate, paired_scores
+from leapfit.crossval import _worker_count, paired_contrasts, paired_cross_validate, paired_scores
 from leapfit.data import StepData
 from leapfit.design import Design
 from leapfit.fit import DEFAULT_METHOD
@@ -718,15 +718,6 @@ def _score_candidate(job: tuple) -> tuple:
         touched=touched, min_opportunities=_WORKER["min_opportunities"],
         separation=_WORKER["separation"], learnsphere_compat=_WORKER["compat"],
         method=_WORKER["method"], max_fun=_WORKER["max_fun"])
-
-
-def _worker_count(n_jobs: int | None, n_tasks: int) -> int:
-    """joblib's convention: ``-1`` is every core, ``-2`` all but one."""
-    if n_jobs is None or n_jobs == 0:
-        return 1
-    if n_jobs < 0:
-        n_jobs = (os.cpu_count() or 1) + 1 + n_jobs
-    return max(1, min(n_jobs, n_tasks))
 
 
 def _open_pool(initargs: tuple, n_jobs: int | None):

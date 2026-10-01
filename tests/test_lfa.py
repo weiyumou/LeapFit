@@ -20,8 +20,6 @@ instead would have passed all three.
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pytest
 
@@ -513,17 +511,6 @@ def test_the_worker_count_does_not_move_a_single_digit():
     assert one.n_evaluated == two.n_evaluated
     assert one.stopped == two.stopped
     assert one.frame().equals(two.frame())
-
-
-def test_n_jobs_follows_joblibs_convention():
-    from leapfit.lfa import _worker_count
-    cores = os.cpu_count() or 1
-    assert _worker_count(1, 100) == 1
-    assert _worker_count(None, 100) == 1, "None is serial, as in crossval"
-    assert _worker_count(0, 100) == 1
-    assert _worker_count(3, 100) == 3
-    assert _worker_count(-1, 100) == cores, "-1 is every core"
-    assert _worker_count(-2, 100) == max(1, cores - 1), "-2 is all but one"
 
 
 def test_a_serial_search_leaves_no_observations_pinned_in_the_caller():
