@@ -43,6 +43,10 @@ import pandas as pd
 from scipy import sparse
 from scipy.sparse import csgraph
 
+#: The block identification takes a reference level from first. A student, not
+#: a KC, because the KC intercepts are the reported output; see Design.identify.
+_PREFER_DROP = "student"
+
 
 @dataclass(frozen=True)
 class Block:
@@ -307,7 +311,7 @@ class Design:
         """
         return Design(self.blocks + tuple(extra), self.aliased)
 
-    def rank(self, tol: float | None = None) -> int:
+    def rank(self) -> int:
         """Numerical rank of the design, via the column-scaled Gram matrix.
 
         Scaling to unit column norm first is not optional. An opportunity
@@ -326,8 +330,7 @@ class Design:
         D = sparse.diags(1.0 / norms)
         gram = ((X @ D).T @ (X @ D)).toarray()
         ev = np.linalg.eigvalsh(gram)
-        if tol is None:
-            tol = max(self.n_obs, gram.shape[0]) * np.finfo(float).eps * max(ev.max(), 0.0)
+        tol = max(self.n_obs, gram.shape[0]) * np.finfo(float).eps * max(ev.max(), 0.0)
         return int((ev > tol).sum())
 
     def separated(self, y) -> Separated:
@@ -381,7 +384,7 @@ class Design:
             tuple(1 if rises[j] else -1 for j in idx),
         )
 
-    def identify(self, *, prefer_drop: str = "student", check: bool = True) -> Design:
+    def identify(self) -> Design:
         """Drop columns that are not estimable, so ``n_params == rank(X)``.
 
         Three sources of aliasing are removed, all exactly rather than
@@ -405,8 +408,8 @@ class Design:
            Deliberately *within* a block only. A whole block that duplicates
            another — an accumulator or hierarchical-parent term collinear with
            what is already there, or one factor entered twice under two names —
-           is a modelling error, not a property of the data, and still raises
-           under ``check``. A factor *nested* in another, items within KCs, is
+           is a modelling error, not a property of the data, and still
+           raises. A factor *nested* in another, items within KCs, is
            a property of the data, and is identified under point 3 — provided
            the coarser factor is declared first. Declared after the levels it
            groups, it is the hierarchical parent just described: the finer
@@ -436,13 +439,13 @@ class Design:
            With three or more blocks the pairwise dependencies overlap —
            three crossed blocks carry two, not three — so the columns to drop
            are chosen by exact elimination over them rather than one per
-           dependency: ``prefer_drop`` first, then the latest-declared blocks,
-           each from its last level back, so that the earliest block in the
-           design keeps every level. Exactly as many columns go as the
+           dependency: the student block first, then the latest-declared
+           blocks, each from its last level back, so that the earliest block
+           in the design keeps every level. Exactly as many columns go as the
            dependencies span, and with two blocks this is one per component.
-           A block other than ``prefer_drop`` that this would take whole is
+           A block other than the student block that this would take whole is
            the collinear block of point 2, and is refused rather than
-           dropped. ``prefer_drop`` alone may go whole: a cohort of one
+           dropped. The student block alone may go whole: a cohort of one
            student gives up its only student, as it always has.
 
         A student is dropped rather than a KC because the KC intercepts are
@@ -456,10 +459,9 @@ class Design:
         levels stay comparable only within a component — nothing in the data
         relates two cohorts that never met the same material.
 
-        :param check: verify numerically that the result is full rank, and
-            raise if it is not, or if it would drop a whole block. Leave this
-            on: it is the guard that catches aliasing introduced by blocks
-            added later.
+        Finally the result is checked numerically: a design that is still not
+        full rank raises. That is the guard that catches aliasing introduced
+        by blocks added later.
         """
         dead = [(b.name, j, "column is identically zero (not estimable)")
                 for b in self.blocks
@@ -467,32 +469,31 @@ class Design:
         repeated = [(b.name, j, f"duplicate of {b.name}:{b.columns[first]}")
                     for b in self.blocks for j, first in b.duplicate_columns()]
         reduced = self._without(dead + repeated)
-        identified = reduced._drop_reference_levels(prefer_drop, check=check)
+        identified = reduced._drop_reference_levels()
 
-        if check:
-            r = identified.rank()
-            if r != identified.n_params:
-                if repeated := reduced._coinciding_pairs():
-                    named = "; ".join(f"{a} and {b}" for a, b in repeated)
-                    raise ValueError(
-                        f"Design still rank-deficient after identification: "
-                        f"{identified.n_params} columns, rank {r}. {named} partition "
-                        f"the rows identically — one factor under two names — and a "
-                        f"repeated factor is refused rather than one copy of it "
-                        f"silently dropped. Keep one of them."
-                    )
+        r = identified.rank()
+        if r != identified.n_params:
+            if repeated := reduced._coinciding_pairs():
+                named = "; ".join(f"{a} and {b}" for a, b in repeated)
                 raise ValueError(
                     f"Design still rank-deficient after identification: "
-                    f"{identified.n_params} columns, rank {r}. Either a block added to "
-                    f"this design is collinear with the others, or the KC model "
-                    f"carries a dependency this pass does not model exactly — a KC "
-                    f"that tags every row of its component, say. Drop or "
-                    f"reparameterize the offending columns before fitting, or "
-                    f"AIC/BIC will count parameters that do not exist."
+                    f"{identified.n_params} columns, rank {r}. {named} partition "
+                    f"the rows identically — one factor under two names — and a "
+                    f"repeated factor is refused rather than one copy of it "
+                    f"silently dropped. Keep one of them."
                 )
+            raise ValueError(
+                f"Design still rank-deficient after identification: "
+                f"{identified.n_params} columns, rank {r}. Either a block added to "
+                f"this design is collinear with the others, or the KC model "
+                f"carries a dependency this pass does not model exactly — a KC "
+                f"that tags every row of its component, say. Drop or "
+                f"reparameterize the offending columns before fitting, or "
+                f"AIC/BIC will count parameters that do not exist."
+            )
         return identified
 
-    def _drop_reference_levels(self, prefer_drop: str, *, check: bool = True) -> Design:
+    def _drop_reference_levels(self) -> Design:
         """Break every sum redundancy, on the columns that survive.
 
         Deliberately decided *after* dead and duplicate columns are gone: a row
@@ -510,8 +511,8 @@ class Design:
         smallest redundancy it takes part in, the one it most specifically
         stands for.
 
-        Under ``check``, a block other than ``prefer_drop`` that would lose
-        every column raises instead, naming the blocks those drops are
+        A block other than the student block that would lose every column
+        raises instead, naming the blocks those drops are
         reported against: they span it, so it is not a factor with a reference
         level but a block that adds nothing — a parent declared after the
         levels it groups.
@@ -534,7 +535,7 @@ class Design:
         basis: dict[int, dict[int, Fraction]] = {}
         seen: set[frozenset] = set()
         drops = []
-        for name in self._drop_order(involved, prefer_drop):
+        for name in self._drop_order(involved):
             for j in range(self.get(name).matrix.shape[1] - 1, -1, -1):
                 vector = vectors.get((name, j))
                 if not vector or (key := frozenset(vector.items())) in seen:
@@ -545,16 +546,15 @@ class Design:
                     basis[pivot] = {k: v / residual[pivot] for k, v in residual.items()}
                     drops.append((min(vector, key=lambda k: (support[k], k)), name, j))
 
-        if check:
-            spanned_by: dict[str, set[str]] = {}
-            for k, name, _ in drops:
-                spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
-            for name, blocks in spanned_by.items():
-                taken = sum(drop[1] == name for drop in drops)
-                if name != prefer_drop and taken == self.get(name).matrix.shape[1]:
-                    raise ValueError(_whole_block_refusal(
-                        name, [b.name for b in self.blocks
-                               if b.name in blocks and b.name != name]))
+        spanned_by: dict[str, set[str]] = {}
+        for k, name, _ in drops:
+            spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
+        for name, blocks in spanned_by.items():
+            taken = sum(drop[1] == name for drop in drops)
+            if name != _PREFER_DROP and taken == self.get(name).matrix.shape[1]:
+                raise ValueError(_whole_block_refusal(
+                    name, [b.name for b in self.blocks
+                           if b.name in blocks and b.name != name]))
 
         return self._without([
             (name, j, _reference_reason(list(redundancies[k].blocks), redundancies[k].label,
@@ -575,17 +575,17 @@ class Design:
         )
 
     @staticmethod
-    def _drop_order(names: list[str], prefer_drop: str) -> list[str]:
+    def _drop_order(names: list[str]) -> list[str]:
         """Which blocks give up a level first.
 
-        ``prefer_drop`` leads where it applies, and the rest follow
+        The student block leads where it applies, and the rest follow
         latest-declared first, so the block a specification names earliest is
         the one left whole. For an AFM design that is exactly the old rule —
         drop a student, keep every KC — and it generalizes the reason for it
         rather than the two block names it was written in.
         """
-        ordered = [n for n in names if n == prefer_drop]
-        return ordered + [n for n in reversed(names) if n != prefer_drop]
+        ordered = [n for n in names if n == _PREFER_DROP]
+        return ordered + [n for n in reversed(names) if n != _PREFER_DROP]
 
     def _row_sums(self, name: str) -> np.ndarray | None:
         b = self.get(name)
@@ -846,11 +846,3 @@ def accumulator_block(data: Sized, values: np.ndarray, *,
                          else [f"{name}_{i}" for i in range(acc.shape[1])])
     return Block.build(name, acc, labels, l2=l2)
 
-
-def coefficient_frame(design: Design, weights: np.ndarray) -> pd.DataFrame:
-    """Fitted weights as a tidy table of (block, column, estimate)."""
-    return pd.DataFrame({
-        "block": [b.name for b in design.blocks for _ in b.columns],
-        "column": [c for b in design.blocks for c in b.columns],
-        "estimate": weights,
-    })

@@ -84,8 +84,7 @@ def success_failure_counts(
 
 
 def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
-                     student_intercepts: bool = False, student_l2: float = 0.0,
-                     counts: str = "prior",
+                     student_intercepts: bool = False, counts: str = "prior",
                      identify: bool = True) -> Design:
     """Assemble the PFA design from parsed student-step data.
 
@@ -97,7 +96,6 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
         it; both LearnSphere components include a (random) one. With one KC
         per row this recreates the student/KC sum redundancy, which
         ``identify`` resolves exactly as for AFM.
-    :param student_l2: ridge on the student block when present.
     :param counts: ``"prior"`` or ``"inclusive"`` — see
         :func:`success_failure_counts`. Inclusive warns: it exists to
         reproduce a defect, and every statistic of such a fit describes a
@@ -125,8 +123,7 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
 
     blocks: list[Block] = []
     if student_intercepts:
-        blocks.append(Block.from_levels("student", [(s,) for s in data.students],
-                                        l2=student_l2))
+        blocks.append(Block.from_levels("student", [(s,) for s in data.students]))
     blocks.append(Block.from_levels("kc_intercept", data.kcs))
     if slopes == "per_kc":
         blocks.append(Block.from_levels("kc_success", data.kcs, values=s_counts))

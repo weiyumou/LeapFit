@@ -70,6 +70,21 @@ while the major version is 0, a minor bump may change the public API.
   the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them
   back and forth on every fit.
 
+### Removed
+
+- Public API that nothing in the package, its tests or its examples
+  called: `LogisticFit.coefficients()` and the `coefficient_frame` it
+  wrapped, `LogisticFit.rmse()` and `LogisticFit.brier()`, and
+  `LogisticFit.aic_unpenalized` and `bic_unpenalized`. A fit's `weights`
+  beside `design.columns` are the coefficients, `predict_proba` gives the
+  scores, and `ll_unpenalized` with `n_params` gives the unpenalized
+  criteria.
+- Options no caller passed: `Design.identify`'s `prefer_drop` and `check`
+  (identification always takes reference levels from the student block
+  first, and always checks that the result is full rank), `Design.rank`'s
+  `tol`, and `build_pfa_design`'s `student_l2` (PFA's optional student
+  block is unpenalized, as it was by default).
+
 ### Fixed
 
 - The source distribution ships `examples/README.md`. The repository's

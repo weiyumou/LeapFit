@@ -69,7 +69,6 @@ from leapfit.design import (
     Design,
     Separated,
     accumulator_block,
-    coefficient_frame,
 )
 from leapfit.fit import DEFAULT_METHOD, LogisticFit, fit_logistic
 from leapfit.lfa import (
@@ -151,7 +150,6 @@ __all__ = [
     "build_factor_matrix",
     "build_lkt_design",
     "build_pfa_design",
-    "coefficient_frame",
     "component_labels",
     "cross_validate",
     "design_terms",

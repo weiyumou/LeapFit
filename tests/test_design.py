@@ -256,7 +256,7 @@ def test_a_third_partitioning_block_carries_a_second_redundancy():
     assert identified.n_params == identified.rank()
     assert len(identified.aliased) == 2
     blocks = {c.split(":")[0] for c in identified.aliased.columns}
-    assert blocks == {"student", "cohort"}, "prefer_drop first, then latest-declared"
+    assert blocks == {"student", "cohort"}, "the student block first, then latest-declared"
 
 
 def test_partitioning_is_detected_from_the_row_sums_not_from_a_block_name():
@@ -311,7 +311,7 @@ def test_identify_drops_one_reference_student_per_component():
 
 
 def test_a_cohort_of_one_student_gives_up_its_only_student():
-    """``prefer_drop`` is the one block allowed to go whole. One student per
+    """The student block is the one block allowed to go whole. One student per
     cohort is still one reference level per component, as it always was;
     refusing it would refuse every single-student export."""
     data = _two_cohort_data(n_per_cohort=1, n_steps=6)

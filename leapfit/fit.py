@@ -61,7 +61,7 @@ from scipy import sparse
 from scipy.optimize import Bounds, minimize
 
 from leapfit.data import StepData
-from leapfit.design import Design, Separated, coefficient_frame
+from leapfit.design import Design, Separated
 
 DEFAULT_METHOD = "TNC"  # PyAFM's choice
 GRADIENT_TOL_SCALE = 3e-3  # see AFMFit.gradient_tolerance
@@ -181,14 +181,6 @@ class LogisticFit:
     def bic(self) -> float:
         return -2.0 * self.ll + self.n_params * np.log(self.n_obs)
 
-    @property
-    def aic_unpenalized(self) -> float:
-        return -2.0 * self.ll_unpenalized + 2.0 * self.n_params
-
-    @property
-    def bic_unpenalized(self) -> float:
-        return -2.0 * self.ll_unpenalized + self.n_params * np.log(self.n_obs)
-
     def predict_proba(self, design: Design | sparse.spmatrix) -> np.ndarray:
         X = design.matrix if isinstance(design, Design) else sparse.csr_matrix(design)
         if X.shape[1] != len(self.weights):
@@ -265,17 +257,6 @@ class LogisticFit:
         values[data.source_rows] = 1.0 - self.predict_proba(self.design)
         out[f"Predicted Error Rate ({data.kc_model})"] = values
         return out
-
-    def brier(self, design, y) -> float:
-        """Mean squared error on the probability scale (PyAFM's score)."""
-        resid = np.asarray(y, dtype=float) - self.predict_proba(design)
-        return float(np.mean(resid ** 2))
-
-    def rmse(self, design, y) -> float:
-        return float(np.sqrt(self.brier(design, y)))
-
-    def coefficients(self) -> pd.DataFrame:
-        return coefficient_frame(self.design, self.weights)
 
     def block(self, name: str) -> np.ndarray:
         return self.weights[self.design.slices()[name]]

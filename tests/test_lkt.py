@@ -359,7 +359,7 @@ def test_a_nested_component_gets_one_reference_level_per_component(example):
     """Every item here belongs to exactly one KC, so the KC/item graph falls
     apart into one component per KC and each carries its own redundancy. Four
     KCs, four reference levels — which is the whole point of doing this per
-    component rather than once. ``prefer_drop`` leads, then latest-declared
+    component rather than once. The student block leads, then latest-declared
     first, so the KCs named before the items nested in them keep every level
     and the items give way."""
     design = build_lkt_design(example, [Term("kc", "intercept"),
