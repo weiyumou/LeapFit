@@ -638,7 +638,7 @@ def _seed(design: Design, parent: tuple | None) -> np.ndarray | None:
         return None
     columns, weights = parent
     at = dict(zip(columns, weights))
-    out = np.zeros(design.matrix.shape[1])
+    out = np.zeros(design.n_params)
     for j, column in enumerate(design.columns):
         if column in at:
             out[j] = at[column]

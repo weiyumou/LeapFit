@@ -924,6 +924,16 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         entered twice under two names, a coarser component named after the one
         nested in it, or terms collinear in some other way.
     """
+    design = _assemble(data, terms, l2=l2, cost=cost, layouts={}, clock=_Clock(data))
+    return design.identify() if identify else design
+
+
+def _assemble(data: StepData, terms: Iterable[Term], *, l2: float, cost: float | None,
+              layouts: dict[str, _Layout], clock: _Clock) -> Design:
+    """:func:`build_lkt_design` short of identification, reading and filling
+    ``layouts`` and ``clock``. Neither depends on a parameter, only on the data
+    and the components, so :func:`fit_lkt_pars` builds them once for every
+    evaluation rather than once per evaluation."""
     terms = tuple(terms)
     if not terms:
         raise ValueError("An LKT model needs at least one term")
@@ -937,8 +947,6 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
         if (first := seen.get(term.block_name)) is not None:
             raise ValueError(f"Term {term} is specified twice (first as {first})")
         seen[term.block_name] = term
-    clock = _Clock(data)
-    layouts: dict[str, _Layout] = {}
     blocks = []
     for term in terms:
         layout = layouts.get(term.component)
@@ -947,9 +955,7 @@ def build_lkt_design(data: StepData, terms: Iterable[Term], *,
                 data, component_labels(data, term.component))
         blocks.append(_term_block(term, layout,
                                   _term_values(term, data, layout, clock), l2))
-
-    design = Design(tuple(blocks))
-    return design.identify() if identify else design
+    return Design(tuple(blocks))
 
 
 @dataclass
@@ -1327,17 +1333,23 @@ def fit_lkt_pars(data: StepData, terms: Iterable[Term], *,
     inner = {"method": method, "max_fun": max_fun, "tol": tol,
              "warn_not_converged": False, "warn_separated": False}
 
+    layouts: dict[str, _Layout] = {}
+    clock = _Clock(data)
+
+    def assemble(values) -> Design:
+        return _assemble(data, _with_parameters(terms, fitted_slots, values),
+                         l2=l2, cost=cost, layouts=layouts, clock=clock)
+
     # Identification is decided here, once, and held for every evaluation.
-    template = build_lkt_design(data, _with_parameters(terms, fitted_slots, seeds),
-                                l2=l2, cost=cost, identify=identify)
+    template = assemble(seeds)
+    if identify:
+        template = template.identify()
 
     history: list[dict] = []
     state = {"w": None, "not_optimal": 0}
 
     def evaluate(values: np.ndarray) -> tuple[float, LKTFit, Design]:
-        at = _with_parameters(terms, fitted_slots, values)
-        design = _conform(build_lkt_design(data, at, l2=l2, cost=cost, identify=False),
-                          template)
+        design = _conform(assemble(values), template)
         fit = fit_lkt(design, y, w0=state["w"] if warm_start else None, **inner)
         if warm_start:
             state["w"] = fit.weights

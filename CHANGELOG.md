@@ -7,6 +7,17 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Changed
 
+- **Fits are about 1.6-1.9x faster, with the same results.** The objective
+  and its gradient are evaluated together, from one product with the design
+  and one exponential per row, where they used to be computed separately.
+  On the E-learning 2022 export a TNC fit of `LOs-new-MCQ` takes 0.24 s
+  instead of 0.39 s, and of `Unique-step-MCQ` 0.46 s instead of 0.86 s, with
+  the same number of evaluations and the same optimum to the last bit on the
+  machine measured. Every cross-validation fold, LFA candidate and LKT
+  evaluation inherits it. `fit_lkt_pars` also builds what does not depend
+  on a parameter (each component's practice sequences, and the clock) once
+  per search rather than once per evaluation. Together these take the
+  vignette's RPFA search from 10.6 s to 5.0 s.
 - The unit tests are organised by the module they exercise. `test_data`,
   `test_design`, `test_fit`, `test_crossval` and `test_cli` join the family
   files, which keep only what is specific to their family. The builders the
@@ -22,6 +33,13 @@ while the major version is 0, a minor bump may change the public API.
   without data runs 314 tests in about 18 s, down from 330 in 28 s; with every
   fixture it takes 83 s, down from 137 s. The console-script check now covers
   `leapfit-pfa` too.
+
+### Added
+
+- `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
+  `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
+  the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them
+  back and forth on every fit.
 
 ### Fixed
 

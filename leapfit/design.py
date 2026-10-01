@@ -226,11 +226,21 @@ class Design:
         return np.concatenate([b.l2 for b in self.blocks])
 
     @property
+    def lower(self) -> np.ndarray:
+        """Each coefficient's lower bound, ``-inf`` where it has none."""
+        return np.concatenate([b.lower for b in self.blocks])
+
+    @property
+    def upper(self) -> np.ndarray:
+        """Each coefficient's upper bound, ``inf`` where it has none."""
+        return np.concatenate([b.upper for b in self.blocks])
+
+    @property
     def bounds(self) -> list[tuple[float | None, float | None]]:
-        lo = np.concatenate([b.lower for b in self.blocks])
-        hi = np.concatenate([b.upper for b in self.blocks])
+        """:attr:`lower` and :attr:`upper` as ``(min, max)`` pairs, ``None``
+        where unbounded."""
         return [(None if np.isneginf(a) else a, None if np.isposinf(b) else b)
-                for a, b in zip(lo, hi)]
+                for a, b in zip(self.lower, self.upper)]
 
     @property
     def columns(self) -> list[str]:
