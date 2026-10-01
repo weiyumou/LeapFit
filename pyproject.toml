@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "leapfit"
-version = "0.6.0"
+version = "0.7.0"
 description = "Student models over DataShop student-step data, validated against LearnSphere and CRAN LKT"
 readme = "README.md"
 requires-python = ">=3.11"
