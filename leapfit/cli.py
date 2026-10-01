@@ -90,7 +90,6 @@ from leapfit import (
     build_afm_design,
     build_factor_matrix,
     build_pfa_design,
-    cross_validate,
     fit_afm,
     fit_pfa,
     from_frame,
@@ -99,7 +98,6 @@ from leapfit import (
     paired_contrasts,
     paired_cross_validate,
     paired_scores,
-    repeated_cross_validate,
     validate_top,
 )
 from leapfit.lfa import BEAM, MAX_ITERATIONS, MIN_OPPORTUNITIES, PATIENCE, _state_design
@@ -183,10 +181,9 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
                         "against the baseline, paired by fold) to this CSV")
     p.add_argument("--cv-folds", metavar="FILE",
                    help="write the cross-validation detail behind the means to "
-                        "this CSV — one row per KC model, scheme, seed and fold "
-                        "for paired CV (per seed for independent repeated CV; "
-                        "per fold for a single run), so a reported mean can be "
-                        "traced to the runs behind it")
+                        "this CSV — one row per KC model, scheme, seed and fold, "
+                        "paired or not — so a reported mean can be traced to the "
+                        "runs behind it")
     p.add_argument("--identification", metavar="FILE",
                    help="write every aliased column and the reason it was dropped "
                         "to this CSV: what the parameter count excludes, and why")
@@ -261,97 +258,61 @@ class _Fitted:
             name, data, design, fit, row
 
 
-def _independent_cv(args, fitted: list, schemes: list[str], seeds, suffix,
-                    fold_rows: list) -> None:
-    """The pre-paired protocol: each model scored on its own folds."""
-    print("\n=== cross-validation: independent folds per model ===", file=sys.stderr)
-    for entry in fitted:
-        for scheme in schemes:
-            cv_kwargs = {"scheme": scheme, "n_folds": args.folds,
-                         "convention": args.convention, "method": args.method,
-                         "max_fun": args.max_fun, "n_jobs": args.jobs}
-            s = suffix(scheme)
-            if seeds:
-                table = repeated_cross_validate(entry.design, entry.data,
-                                                seeds=seeds, **cv_kwargs)
-                entry.row |= {
-                    f"cv_rmse{s}": table["rmse"].mean(),
-                    f"cv_rmse_sd{s}": table["rmse"].std(ddof=1),
-                    f"cv_runs{s}": len(table),
-                    f"cv_unseen_fraction{s}": table["unseen_column_fraction"].mean(),
-                    f"cv_all_converged{s}": bool(table["all_converged"].all()),
-                }
-                detail = table
-                print(f"  {entry.name}: {scheme} / {args.convention} over "
-                      f"{len(table)} seeds: RMSE = {entry.row[f'cv_rmse{s}']:.4f} "
-                      f"({entry.row[f'cv_rmse_sd{s}']:.4f})", file=sys.stderr)
-            else:
-                result = cross_validate(entry.design, entry.data, seed=None,
-                                        **cv_kwargs)
-                entry.row |= {
-                    f"cv_rmse{s}": result.rmse,
-                    f"cv_rmse_sd{s}": np.nan,
-                    f"cv_runs{s}": 1,
-                    f"cv_unseen_fraction{s}": float(np.mean(
-                        [f.unseen_column_fraction for f in result.folds])),
-                    f"cv_all_converged{s}": all(f.converged for f in result.folds),
-                }
-                detail = result.frame
-                print(f"  {entry.name}: {result.summary()}", file=sys.stderr)
-
-            if args.cv_folds:
-                detail = detail.copy()
-                if "scheme" not in detail:
-                    detail.insert(0, "scheme", scheme)
-                detail.insert(0, "kc_model", entry.name)
-                fold_rows.append(detail)
+def _cv_columns(scores: pd.DataFrame, s: str) -> dict:
+    """The table's held-out columns, from one model's per-seed scores."""
+    return {
+        f"cv_rmse{s}": float(scores["rmse"].mean()),
+        f"cv_rmse_sd{s}": float(scores["rmse"].std(ddof=1)),
+        f"cv_runs{s}": len(scores),
+        f"cv_unseen_fraction{s}": float(scores["unseen_column_fraction"].mean()),
+        f"cv_all_converged{s}": bool(scores["all_converged"].all()),
+    }
 
 
-def _paired_cv(args, fitted: list, schemes: list[str], seeds, suffix,
-               fold_rows: list, contrast_rows: list) -> None:
-    """Shared folds across all models; scores and contrasts from one set of fits."""
-    seeds = seeds or [0]
-    models = {entry.name: entry.design for entry in fitted}
-    data = fitted[0].data
-    print(f"\n=== cross-validation: paired, folds shared by all {len(models)} "
-          f"models ({len(seeds)} seed(s); --no-paired for the independent "
-          "protocol) ===", file=sys.stderr)
+def _cross_validate(args, fitted: list, schemes: list[str], seeds, suffix, paired: bool,
+                    fold_rows: list, contrast_rows: list) -> None:
+    """Score every model under each scheme, on folds shared by all of them when
+    ``paired`` and on each model's own otherwise; contrasts need shared folds."""
+    if paired:
+        seeds = seeds or [0]  # shared folds must be seeded
+        groups = [fitted]
+        print(f"\n=== cross-validation: paired, folds shared by all {len(fitted)} "
+              f"models ({len(seeds)} seed(s); --no-paired for the independent "
+              "protocol) ===", file=sys.stderr)
+    else:
+        seeds = seeds or [None]
+        groups = [[entry] for entry in fitted]
+        print("\n=== cross-validation: independent folds per model ===", file=sys.stderr)
 
     for scheme in schemes:
-        folds = paired_cross_validate(
-            models, data, scheme=scheme, n_folds=args.folds, seeds=tuple(seeds),
-            convention=args.convention, method=args.method,
-            max_fun=args.max_fun, n_jobs=args.jobs)
-        scores = paired_scores(folds, args.convention)
         s = suffix(scheme)
-
         print(f"  {scheme} / {args.convention} / {args.folds} folds:", file=sys.stderr)
-        for entry in fitted:
-            sc = scores[scores["model"] == entry.name]
-            entry.row |= {
-                f"cv_rmse{s}": float(sc["rmse"].mean()),
-                f"cv_rmse_sd{s}": float(sc["rmse"].std(ddof=1)),
-                f"cv_runs{s}": len(sc),
-                f"cv_unseen_fraction{s}": float(sc["unseen_column_fraction"].mean()),
-                f"cv_all_converged{s}": bool(sc["all_converged"].all()),
-            }
-            print(f"    {entry.name}: RMSE = {entry.row[f'cv_rmse{s}']:.4f}"
-                  f" | {entry.row[f'cv_unseen_fraction{s}']:.1%} of held-out "
-                  "rows hit an unseen column", file=sys.stderr)
+        for group in groups:
+            folds = paired_cross_validate(
+                {entry.name: entry.design for entry in group}, group[0].data,
+                scheme=scheme, n_folds=args.folds, seeds=tuple(seeds),
+                convention=args.convention, method=args.method,
+                max_fun=args.max_fun, n_jobs=args.jobs)
+            scores = paired_scores(folds, args.convention)
+            for entry in group:
+                entry.row |= _cv_columns(scores[scores["model"] == entry.name], s)
+                print(f"    {entry.name}: RMSE = {entry.row[f'cv_rmse{s}']:.4f}"
+                      f" | {entry.row[f'cv_unseen_fraction{s}']:.1%} of held-out "
+                      "rows hit an unseen column", file=sys.stderr)
+            if args.cv_folds:
+                fold_rows.append(
+                    folds.rename(columns={"model": "kc_model"}).assign(scheme=scheme)[
+                        ["kc_model", "scheme", "seed", "fold", "n_test", "rmse", "sse",
+                         "unseen_column_fraction", "converged", "is_optimal"]])
 
-        baseline = args.baseline or scores.groupby("model")["rmse"].mean().idxmin()
-        contrasts = paired_contrasts(folds, baseline=baseline)
-        contrasts.insert(0, "scheme", scheme)
-        contrast_rows.append(contrasts)
-        for c in contrasts.itertuples():
-            print(f"    {c.model} vs {baseline}: {c.mean_diff:+.6f} "
-                  f"(better in {c.folds_better}/{c.n_folds} folds)", file=sys.stderr)
-
-        if args.cv_folds:
-            fold_rows.append(
-                folds.rename(columns={"model": "kc_model"}).assign(scheme=scheme)[
-                    ["kc_model", "scheme", "seed", "fold", "n_test", "rmse", "sse",
-                     "unseen_column_fraction", "converged", "is_optimal"]])
+        if paired:
+            baseline = args.baseline or scores.groupby("model")["rmse"].mean().idxmin()
+            contrasts = paired_contrasts(folds, baseline=baseline)
+            contrasts.insert(0, "scheme", scheme)
+            contrast_rows.append(contrasts)
+            for c in contrasts.itertuples():
+                print(f"    {c.model} vs {baseline}: {c.mean_diff:+.6f} "
+                      f"(better in {c.folds_better}/{c.n_folds} folds)", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
@@ -429,11 +390,8 @@ def main(argv: list[str] | None = None, *, family: str = "afm") -> int:
                   f"no KC label is dropped for that model): {coverage}. Shared "
                   "folds are impossible, so falling back to independent "
                   "per-model CV; no paired contrasts.", file=sys.stderr)
-        if paired:
-            _paired_cv(args, fitted, cv_schemes, seeds, suffix,
-                       fold_rows, contrast_rows)
-        else:
-            _independent_cv(args, fitted, cv_schemes, seeds, suffix, fold_rows)
+        _cross_validate(args, fitted, cv_schemes, seeds, suffix, paired,
+                        fold_rows, contrast_rows)
 
     table = pd.DataFrame([entry.row for entry in fitted])
     print()

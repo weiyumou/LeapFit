@@ -19,7 +19,7 @@ from leapfit import (
     paired_scores,
     repeated_cross_validate,
 )
-from leapfit.crossval import CONVENTIONS, _worker_count
+from leapfit.crossval import _worker_count
 
 from helpers import synthetic
 
@@ -190,30 +190,19 @@ def test_paired_cv_rejects_designs_over_different_rows():
                               a, n_folds=2)
 
 
-@pytest.mark.parametrize("convention", CONVENTIONS)
-def test_paired_scores_reconstruct_repeated_cv(convention):
-    """One paired run carries both conventions' per-seed scores exactly.
-
-    With seeded folds the partitions are the same either way, so aggregating
-    the paired table must reproduce what :func:`repeated_cross_validate`
-    reports — the claim that lets the CLI source its ``cv_rmse`` columns and
-    the contrasts from a single set of fits.
-    """
+def test_an_unseeded_paired_run_is_scored_and_contrasted():
+    """Regression: a seed of None, LabelKFold's deterministic partition, is a
+    run like any other. Grouping on it used to drop every row, so the scores
+    came back empty and the contrasts could not find their baseline."""
     data = synthetic(n_students=14, n_kcs=4, n_items=20, seed=45, n_reps=5)
-    design = build_afm_design(data)
-    seeds = (0, 1, 2)
-    kw = {"scheme": "item_blocked", "n_folds": 3, "convention": convention,
-          "method": "L-BFGS-B"}
-
-    scores = paired_scores(
-        paired_cross_validate({"m": design}, data, seeds=seeds, **kw), convention)
-    repeated = repeated_cross_validate(design, data, seeds=seeds, **kw)
-
-    assert scores["seed"].tolist() == repeated["seed"].tolist()
-    np.testing.assert_allclose(scores["rmse"], repeated["rmse"], rtol=1e-12)
-    np.testing.assert_allclose(scores["unseen_column_fraction"],
-                               repeated["unseen_column_fraction"], rtol=1e-12)
-    assert scores["all_converged"].tolist() == repeated["all_converged"].tolist()
+    models = {"afm": build_afm_design(data),
+              "compat": build_afm_design(data, learnsphere_compat=True)}
+    folds = paired_cross_validate(models, data, n_folds=3, seeds=(None,),
+                                  convention="per_fold", method="L-BFGS-B")
+    scores = paired_scores(folds, "per_fold")
+    assert scores["model"].tolist() == ["afm", "compat"]
+    assert scores["seed"].isna().all()
+    assert paired_contrasts(folds, baseline="compat")["n_folds"].tolist() == [3]
 
 
 def test_paired_scores_reject_an_unknown_convention():

@@ -70,23 +70,25 @@ def test_cli_none_cannot_be_combined_with_a_scheme(tmp_path):
                      "--cv", "item_blocked"]) == 1
 
 
-def test_cli_cv_folds_writes_one_row_per_model_scheme_and_seed(tmp_path):
+def test_cli_cv_folds_writes_one_row_per_model_scheme_seed_and_fold(tmp_path):
     folds = tmp_path / "cv-folds.csv"
     assert cli_main([str(_cli_export(tmp_path)),
                      "--cv", "student_blocked", "--cv", "item_blocked",
                      "--seeds", "0:3", "--cv-folds", str(folds)]) == 0
     detail = pd.read_csv(folds)
-    assert len(detail) == 1 * 2 * 3, "one KC model x two schemes x three seeds"
+    assert len(detail) == 1 * 2 * 3 * 3, "one KC model x two schemes x three seeds x three folds"
     assert set(detail["scheme"]) == {"student_blocked", "item_blocked"}
+    assert set(detail["seed"]) == {0, 1, 2}
     assert detail["kc_model"].unique().tolist() == ["M"]
 
 
-def test_cli_cv_folds_falls_back_to_per_fold_rows_without_seeds(tmp_path):
+def test_cli_cv_folds_without_seeds_records_one_unseeded_run(tmp_path):
     folds = tmp_path / "cv-folds.csv"
     assert cli_main([str(_cli_export(tmp_path)), "--cv", "item_blocked",
                      "--folds", "3", "--cv-folds", str(folds)]) == 0
     detail = pd.read_csv(folds)
     assert len(detail) == 3 and set(detail["fold"]) == {0, 1, 2}
+    assert detail["seed"].isna().all(), "LabelKFold's partition takes no seed"
     assert detail["scheme"].unique().tolist() == ["item_blocked"]
 
 

@@ -18,6 +18,21 @@ while the major version is 0, a minor bump may change the public API.
   on a parameter (each component's practice sequences, and the clock) once
   per search rather than once per evaluation. Together these take the
   vignette's RPFA search from 10.6 s to 5.0 s.
+- **One cross-validation engine.** `cross_validate` and
+  `repeated_cross_validate` are `paired_cross_validate` over a single
+  design, scored by `paired_scores`, where they were a second
+  implementation of the same folds. The scores are the same, except that
+  the pooled RMSE is now `sqrt(sum(sse) / sum(n_test))` rather than the
+  RMSE of the concatenated residuals: the same quantity, summed in a
+  different order, so it can move in the last bit (by 5.6e-17 where it
+  moved in the checks). Workers no longer send each fold's residuals back.
+  `repeated_cross_validate` returns one row per distinct seed.
+- `leapfit-afm --cv-folds` writes one row per KC model, scheme, seed and
+  fold for every run. An independent run, `--no-paired` or a single KC
+  model, used to write one row per seed with `--seeds` and one per fold
+  without, each with its own columns. It now writes the paired layout,
+  with an empty `seed` for an unseeded run. The three cross-validation
+  paths in the command line are now one.
 - `leapfit-lfa` reads the export once, as `leapfit-afm` does, rather than
   once per KC model it loads: the factor models, `--root` and each
   `--compare`. On the E-learning 2022 export, which has 100 KC models,
@@ -87,6 +102,9 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Fixed
 
+- `paired_scores` returned an empty table, and `paired_contrasts` could not
+  find its baseline, for a run with `seed=None`, LabelKFold's deterministic
+  partition: grouping on the seed dropped the missing key. Both now keep it.
 - The source distribution ships `examples/README.md`. The repository's
   `.gitignore` drops every `*.md` and hatchling honours it, so every release
   so far packed the examples without their README. It is now named in
