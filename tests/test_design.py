@@ -22,6 +22,15 @@ from helpers import co_occurring_kc_data, multi_kc_data, separated_frame, step_d
 # --------------------------------------------------------------------------
 
 
+def test_from_levels_puts_each_rows_values_in_its_levels_columns():
+    block = Block.from_levels("kc", [("B",), ("A", "B"), ("A",)],
+                              values=[(2.0,), (0.0, 3.0), (1.0,)])
+    assert block.columns == ["A", "B"]
+    np.testing.assert_array_equal(block.matrix.toarray(), [[0, 2], [0, 3], [1, 0]])
+    assert block.matrix.nnz == 3, "a zero value is a structural zero, not stored"
+    assert Block.from_levels("f", [("x",), ("y",)]).matrix.toarray().tolist() == [[1, 0], [0, 1]]
+
+
 def test_take_preserves_labels_penalty_and_bounds():
     data = synthetic(n_students=5, n_kcs=3, n_items=15, seed=2)
     design = build_afm_design(data)
@@ -222,11 +231,7 @@ def _two_cohort_data(n_per_cohort=4, n_steps=4):
 
 def _one_hot(labels: list[str], name: str) -> Block:
     """A crossed factor as a design block: one column per level, one per row."""
-    levels = sorted(set(labels))
-    index = {v: j for j, v in enumerate(levels)}
-    matrix = np.zeros((len(labels), len(levels)))
-    matrix[np.arange(len(labels)), [index[v] for v in labels]] = 1.0
-    return Block.build(name, matrix, levels)
+    return Block.from_levels(name, [(v,) for v in labels])
 
 
 def test_a_third_partitioning_block_carries_a_second_redundancy():

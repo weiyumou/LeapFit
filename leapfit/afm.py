@@ -23,7 +23,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
 
 from leapfit.data import StepData
 from leapfit.design import Block, Design
@@ -88,38 +87,13 @@ def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
     if identify is None:
         identify = not learnsphere_compat
 
-    students = data.student_names
-    kcs = data.kc_names
-    s_index = {s: i for i, s in enumerate(students)}
-    k_index = {k: i for i, k in enumerate(kcs)}
-    n = len(data)
-
-    rows = np.arange(n)
-    student_mat = sparse.csr_matrix(
-        (np.ones(n), (rows, [s_index[s] for s in data.students])),
-        shape=(n, len(students)),
-    )
-
     opportunities = (data.recomputed_opportunities() if recompute_opportunities
                      else data.opportunities)
-    q_rows, q_cols, q_vals, t_vals = [], [], [], []
-    for i, (labels, counts) in enumerate(zip(data.kcs, opportunities)):
-        for label, count in zip(labels, counts):
-            q_rows.append(i)
-            q_cols.append(k_index[label])
-            q_vals.append(1.0)
-            t_vals.append(float(count))
-
-    shape = (n, len(kcs))
-    kc_mat = sparse.csr_matrix((q_vals, (q_rows, q_cols)), shape=shape)
-    opp_mat = sparse.csr_matrix((t_vals, (q_rows, q_cols)), shape=shape)
-    opp_mat.eliminate_zeros()  # a T=0 entry is a structural zero, not a datum
-
     design = Design((
-        Block.build("student", student_mat, students, l2=student_l2),
-        Block.build("kc_intercept", kc_mat, kcs),
-        Block.build("kc_slope", opp_mat, kcs,
-                    lower=0.0 if bound_slopes else -np.inf),
+        Block.from_levels("student", [(s,) for s in data.students], l2=student_l2),
+        Block.from_levels("kc_intercept", data.kcs),
+        Block.from_levels("kc_slope", data.kcs, values=opportunities,
+                          lower=0.0 if bound_slopes else -np.inf),
     ))
     return design.identify() if identify else design
 

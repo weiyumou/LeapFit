@@ -36,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Sequence, Sized
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import chain
 
 import numpy as np
 import pandas as pd
@@ -75,6 +76,31 @@ class Block:
             lower=np.full(n, float(lower)),
             upper=np.full(n, float(upper)),
         )
+
+    @classmethod
+    def from_levels(cls, name: str, labels: Sequence[Sequence[str]], *,
+                    values: Sequence[Sequence[float]] | None = None, l2: float = 0.0,
+                    lower: float = -np.inf, upper: float = np.inf) -> Block:
+        """One column per level, sorted, and row ``n``'s entries in the columns
+        of ``labels[n]``.
+
+        A factor gives each row one label, such as its student; a multi-KC
+        step gives it several. ``values[n]`` are the entries, aligned with
+        ``labels[n]`` by position, and default to 1: an indicator for each
+        label, or with values a count per label. A zero value is a structural
+        zero rather than a datum, so it is not stored.
+        """
+        flat = list(chain.from_iterable(labels))
+        levels = sorted(set(flat))
+        lengths = np.fromiter(map(len, labels), dtype=np.intp, count=len(labels))
+        entries = (np.ones(len(flat)) if values is None else
+                   np.fromiter(chain.from_iterable(values), dtype=float, count=len(flat)))
+        matrix = sparse.csr_matrix(
+            (entries, (np.repeat(np.arange(len(labels)), lengths),
+                       pd.Index(levels).get_indexer(flat))),
+            shape=(len(labels), len(levels)))
+        matrix.eliminate_zeros()
+        return cls.build(name, matrix, levels, l2=l2, lower=lower, upper=upper)
 
     def keep(self, mask: np.ndarray) -> Block:
         """Column subset, preserving labels, penalty, and bounds."""

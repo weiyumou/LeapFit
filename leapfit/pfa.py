@@ -50,7 +50,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
 
 from leapfit.data import StepData
 from leapfit.design import Block, Design
@@ -124,40 +123,14 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
 
     s_counts, f_counts = success_failure_counts(data, inclusive=(counts == "inclusive"))
 
-    kcs = data.kc_names
-    k_index = {k: i for i, k in enumerate(kcs)}
-    n = len(data)
-
-    q_rows, q_cols, s_vals, f_vals = [], [], [], []
-    for i, (labels, s_row, f_row) in enumerate(zip(data.kcs, s_counts, f_counts)):
-        for label, s, f in zip(labels, s_row, f_row):
-            q_rows.append(i)
-            q_cols.append(k_index[label])
-            s_vals.append(float(s))
-            f_vals.append(float(f))
-
-    shape = (n, len(kcs))
-    kc_mat = sparse.csr_matrix((np.ones(len(q_rows)), (q_rows, q_cols)), shape=shape)
-
     blocks: list[Block] = []
     if student_intercepts:
-        students = data.student_names
-        s_index = {s: i for i, s in enumerate(students)}
-        student_mat = sparse.csr_matrix(
-            (np.ones(n), (np.arange(n), [s_index[s] for s in data.students])),
-            shape=(n, len(students)),
-        )
-        blocks.append(Block.build("student", student_mat, students, l2=student_l2))
-
-    blocks.append(Block.build("kc_intercept", kc_mat, kcs))
-
+        blocks.append(Block.from_levels("student", [(s,) for s in data.students],
+                                        l2=student_l2))
+    blocks.append(Block.from_levels("kc_intercept", data.kcs))
     if slopes == "per_kc":
-        s_mat = sparse.csr_matrix((s_vals, (q_rows, q_cols)), shape=shape)
-        f_mat = sparse.csr_matrix((f_vals, (q_rows, q_cols)), shape=shape)
-        s_mat.eliminate_zeros()  # a zero count is a structural zero, not a datum
-        f_mat.eliminate_zeros()
-        blocks.append(Block.build("kc_success", s_mat, kcs))
-        blocks.append(Block.build("kc_failure", f_mat, kcs))
+        blocks.append(Block.from_levels("kc_success", data.kcs, values=s_counts))
+        blocks.append(Block.from_levels("kc_failure", data.kcs, values=f_counts))
     else:
         # Pooled: gamma * sum_k q_jk s_ik — the row totals across the step's KCs.
         s_tot = np.array([float(sum(row)) for row in s_counts])

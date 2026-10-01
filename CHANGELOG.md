@@ -44,6 +44,10 @@ while the major version is 0, a minor bump may change the public API.
   they return is unchanged. LKT builds its features over the same grouping
   of each student's practice, so the tests that only checked the copies
   agree with each other are gone.
+- `Block.from_levels(name, labels, values=None)`: a block with one column
+  per level, from each row's labels and, optionally, the value each label
+  carries. The AFM and PFA builders construct every block through it, where
+  each built its own sparse triplets, and give the same matrices.
 - `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
   `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
   the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them
