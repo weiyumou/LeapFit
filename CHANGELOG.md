@@ -78,8 +78,9 @@ while the major version is 0, a minor bump may change the public API.
   agree with each other are gone.
 - `Block.from_levels(name, labels, values=None)`: a block with one column
   per level, from each row's labels and, optionally, the value each label
-  carries. The AFM and PFA builders construct every block through it, where
-  each built its own sparse triplets, and give the same matrices.
+  carries, with the same `l2`, `lower` and `upper` as `Block.build`. The
+  AFM and PFA builders construct every block through it, where each built
+  its own sparse triplets, and give the same matrices.
 - `Aliased.in_blocks(*blocks)` and `Separated.in_blocks(*blocks)`: the
   columns in the named blocks, by their names within the block. The KC and
   component tables and the LFA screens read separation through it, where
@@ -95,6 +96,11 @@ while the major version is 0, a minor bump may change the public API.
   `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
   the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them
   back and forth on every fit.
+- A Recipes section in the README. It computes what this release removes as
+  methods and options from what every fit carries: the Brier score, RMSE,
+  the unpenalized AIC and BIC, the coefficient table, predictions from a
+  bare matrix and a ridge on PFA's students. It also gives the held-out
+  Brier score from cross-validation.
 
 ### Removed
 
