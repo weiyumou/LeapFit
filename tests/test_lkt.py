@@ -421,11 +421,13 @@ def test_the_same_factor_under_two_names_is_refused_rather_than_halved(example):
     """The export's own KC column read as a component partitions the rows
     exactly as the parsed KC does. That is nested in the extreme — every level
     pairs with one level of the other — and it is a mistake in the
-    specification, not a property of the data, so it is refused by name
-    rather than resolved by silently dropping one copy whole."""
+    specification, not a property of the data, so it is refused, naming the
+    block that already spans it, rather than resolved by silently dropping one
+    copy whole."""
     spec = [Term("kc", "intercept"), Term("KC (Topics)", "intercept")]
-    with pytest.raises(ValueError, match=r"kc_intercept and intercept\[KC \(Topics\)\] "
-                                         "partition the rows identically"):
+    with pytest.raises(ValueError, match=r"intercept\[KC \(Topics\)\] adds nothing to this "
+                                         r"design: every column of it lies in the span of "
+                                         r"kc_intercept"):
         build_lkt_design(example, spec)
 
 

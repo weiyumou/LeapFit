@@ -33,6 +33,16 @@ while the major version is 0, a minor bump may change the public API.
   without, each with its own columns. It now writes the paired layout,
   with an empty `seed` for an unseeded run. The three cross-validation
   paths in the command line are now one.
+- Identification loses a special case. A block that partitions the rows
+  exactly as another does (one factor under two names, such as the export's
+  own `KC (...)` column read beside the parsed KC) had a check of its own.
+  The general check refuses it just the same, as a block identification
+  would drop whole, naming the block that spans it, and its message now
+  says such a block may be a factor already in the design under another
+  name, as well as a parent. The special case also refused cohorts that
+  are each one student on one KC, where those two blocks pair level for
+  level. Those are now identified as a lone cohort is: each cohort gives up
+  its only student.
 - `leapfit-lfa` reads the export once, as `leapfit-afm` does, rather than
   once per KC model it loads: the factor models, `--root` and each
   `--compare`. On the E-learning 2022 export, which has 100 KC models,

@@ -473,15 +473,6 @@ class Design:
 
         r = identified.rank()
         if r != identified.n_params:
-            if repeated := reduced._coinciding_pairs():
-                named = "; ".join(f"{a} and {b}" for a, b in repeated)
-                raise ValueError(
-                    f"Design still rank-deficient after identification: "
-                    f"{identified.n_params} columns, rank {r}. {named} partition "
-                    f"the rows identically — one factor under two names — and a "
-                    f"repeated factor is refused rather than one copy of it "
-                    f"silently dropped. Keep one of them."
-                )
             raise ValueError(
                 f"Design still rank-deficient after identification: "
                 f"{identified.n_params} columns, rank {r}. Either a block added to "
@@ -514,8 +505,9 @@ class Design:
         A block other than the student block that would lose every column
         raises instead, naming the blocks those drops are
         reported against: they span it, so it is not a factor with a reference
-        level but a block that adds nothing — a parent declared after the
-        levels it groups.
+        level but a block that adds nothing: a parent declared after the
+        levels it groups, or one factor entered a second time under another
+        name.
         """
         redundancies = self._sum_redundancies()
         if not redundancies:
@@ -613,18 +605,6 @@ class Design:
                 out.append(b.name)
         return out
 
-    def _has_sum_redundancy(self) -> bool:
-        """Whether any two blocks span the same direction over some rows.
-
-        Every row carries exactly one student, so the student columns sum to
-        the all-ones vector. If every row also carries the *same* number ``m``
-        of KCs, the KC-intercept columns sum to ``m * 1``, and the two blocks
-        are linearly dependent whatever ``m`` is — not only for the usual
-        one-KC-per-row partition. Nothing here is specific to those two blocks;
-        see :meth:`_sum_redundancies`.
-        """
-        return bool(self._sum_redundancies())
-
     def row_components(self, names: Sequence[str] | None = None) -> np.ndarray:
         """Component label per row, from the graph over some blocks' levels.
 
@@ -692,17 +672,10 @@ class Design:
         sort rather than one scan per component, so this stays linear-ish
         however many components there are — a design where no two students
         share an item has as many components as students.
-
-        Two blocks that partition the rows identically are left out: that is
-        one factor under two names, a mistake in the specification rather than
-        a property of the data, and :meth:`identify` refuses it rather than
-        silently dropping one of them whole.
         """
         sums = {name: self._row_sums(name) for name in self._covering_blocks()}
         out = []
         for first, second, rows, n_components, columns in self._pair_graphs():
-            if _coincide(n_components, columns):
-                continue
             for label, group in _members(rows).items():
                 a, b = sums[first][group], sums[second][group]
                 if np.allclose(a, a[0]) and np.allclose(b, b[0]):
@@ -712,11 +685,6 @@ class Design:
                         (columns[0].get(label, empty), columns[1].get(label, empty)),
                         (float(b[0]), -float(a[0]))))
         return out
-
-    def _coinciding_pairs(self) -> list[tuple[str, str]]:
-        """Pairs of covering blocks that partition the rows identically."""
-        return [(first, second) for first, second, _, n_components, columns
-                in self._pair_graphs() if _coincide(n_components, columns)]
 
     def recentring_is_valid(self) -> bool:
         """Whether shifting students into KC intercepts leaves predictions fixed.
@@ -749,12 +717,14 @@ def _whole_block_refusal(name: str, spanning: list[str]) -> str:
     """Why a block that identification would drop whole is refused instead."""
     return (
         f"{name} adds nothing to this design: every column of it lies in the span "
-        f"of {' and '.join(spanning)}, the way a parent block's columns are sums of "
-        f"the levels it groups, so identification would drop it whole. A block "
+        f"of {' and '.join(spanning)}, so identification would drop it whole. It "
+        f"is either a factor already in the design under another name, or a parent "
+        f"block whose columns are sums of the levels it groups, and a block "
         f"collinear with what is already there is refused rather than silently "
-        f"dropped. Remove it; or, to keep it, declare it before the finer blocks, "
-        f"which then give up one reference level per level of {name} instead; and "
-        f"where a ridge is what identifies the hierarchy, leave identification out."
+        f"dropped. Remove it; or, to keep a parent, declare it before the finer "
+        f"blocks, which then give up one reference level per level of {name} "
+        f"instead; and where a ridge is what identifies the hierarchy, leave "
+        f"identification out."
     )
 
 
@@ -780,19 +750,6 @@ def _members(labels: np.ndarray) -> dict[int, np.ndarray]:
     order = np.argsort(labels, kind="stable")
     groups = np.split(order, np.flatnonzero(np.diff(labels[order])) + 1)
     return {int(labels[g[0]]): g for g in groups if g.size and labels[g[0]] >= 0}
-
-
-def _coincide(n_components: int, columns: tuple[dict, dict]) -> bool:
-    """Whether a pair's graph pairs every level of one block with exactly one of
-    the other's — the same partition of the rows, under two sets of names.
-
-    One component does not count: a single student and a single KC are two
-    constant columns, and that is the ordinary reference level, not a
-    repeated factor.
-    """
-    return n_components > 1 and all(
-        len(columns[0].get(label, ())) == len(columns[1].get(label, ())) == 1
-        for label in range(n_components))
 
 
 def _reduce(vector: dict[int, Fraction],

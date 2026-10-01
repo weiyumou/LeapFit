@@ -15,7 +15,14 @@ import pytest
 from leapfit import Block, Design, accumulator_block, build_afm_design, fit_afm, from_frame
 from leapfit.fit import _expit, _objective
 
-from helpers import co_occurring_kc_data, multi_kc_data, separated_frame, step_data, synthetic
+from helpers import (
+    co_occurring_kc_data,
+    multi_kc_data,
+    separated_frame,
+    step_data,
+    step_row,
+    synthetic,
+)
 
 # --------------------------------------------------------------------------
 # Design structure
@@ -134,23 +141,22 @@ def test_sum_redundancy_is_detected_for_any_constant_kcs_per_row():
     """
     design = build_afm_design(multi_kc_data(), identify=False)
     assert design.kc_per_row() == 2.0
-    assert design._has_sum_redundancy()
     assert design.rank() == design.n_params - 1
     assert build_afm_design(multi_kc_data()).n_params == design.n_params - 1
 
 
 def test_identify_raises_on_a_collinear_extra_block():
     """The guard that protects blocks added later. A copy of the KC intercepts
-    under new names is one factor entered twice — every level pairs with
-    exactly one of the other's — and is refused by name, rather than resolved
-    like a nested factor by silently dropping one copy whole."""
+    under new names is one factor entered twice, every level paired with
+    exactly one of the other's. Identification would drop the copy whole, so
+    it is refused instead, naming the block that already spans it."""
     data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
     design = build_afm_design(data, identify=False)
     kc_block = design.get("kc_intercept")
     duplicate = Block.build("copy", kc_block.matrix.copy(),
                             [f"dup_{c}" for c in kc_block.columns])
-    with pytest.raises(ValueError, match="kc_intercept and copy partition the rows "
-                                         "identically"):
+    with pytest.raises(ValueError, match="copy adds nothing to this design: every column "
+                                         "of it lies in the span of kc_intercept"):
         design.with_blocks(duplicate).identify()
 
 
@@ -286,7 +292,6 @@ def test_a_block_that_leaves_a_row_at_zero_does_not_partition():
     design = Design((_one_hot(labels, "left"),
                      Block.build("sparse", partial, ["p", "q"])))
     assert design._covering_blocks() == ["left"]
-    assert not design._has_sum_redundancy()
     assert design.identify().n_params == design.n_params
 
 
@@ -319,6 +324,17 @@ def test_a_cohort_of_one_student_gives_up_its_only_student():
     assert ident.n_params == ident.rank()
     assert len(ident.aliased.by_block()["student"]) == 2
     assert ident.get("student").matrix.shape[1] == 0
+
+
+def test_cohorts_of_one_student_on_one_kc_each_give_up_their_students():
+    """Here the student and KC blocks pair level for level, the shape a repeated
+    factor has. But the student block is the one allowed to go whole, so each
+    cohort gives up its only student, as a lone cohort does."""
+    rows = [step_row(f"s{c}", f"st{c}{j}", j % 2, kc, j + 1)
+            for c, kc in enumerate("AB") for j in range(4)]
+    ident = build_afm_design(step_data(rows), identify=False).identify()
+    assert ident.n_params == ident.rank()
+    assert ident.aliased.columns == ("student:s0", "student:s1")
 
 
 def test_a_component_without_the_sum_redundancy_keeps_every_student():
