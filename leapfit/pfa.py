@@ -181,11 +181,12 @@ class PFAFit(LogisticFit):
 
 def fit_pfa(design: Design, y, *, method: str = DEFAULT_METHOD,
             max_fun: int | None = None, tol: float | None = None,
+            w0: np.ndarray | None = None,
             warn_not_converged: bool = True,
             warn_separated: bool = True) -> PFAFit:
     """Fit PFA by penalized maximum likelihood — :func:`leapfit.fit.fit_logistic`
     with a PFA reporting view. See that function for the parameters."""
     return fit_logistic(design, y, method=method, max_fun=max_fun, tol=tol,
-                        warn_not_converged=warn_not_converged,
+                        w0=w0, warn_not_converged=warn_not_converged,
                         warn_separated=warn_separated, result_type=PFAFit,
                         label="PFA", stacklevel=3)  # 3: attribute past this wrapper

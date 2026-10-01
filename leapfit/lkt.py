@@ -76,7 +76,8 @@ default here is ``l2 = 0`` and an identified design, as everywhere else.
 DIVERGENCE (block names): two block names are fixed by the shared layer rather
 than by this module's scheme. ``Design.identify`` *detects* sum redundancies
 from the row sums, so any number of intercept components identifies correctly;
-but it takes its first reference level from the block named ``student``, and ``Design.recentring_is_valid`` looks for ``kc_intercept``.
+but it takes its first reference level from the block named ``student``, and
+``Design.recentring_is_valid`` looks for ``kc_intercept``.
 A per-level intercept on those two components therefore uses those names, and
 every other term is named ``feature[component]`` — which also makes an LKT AFM
 spec produce a design identical to :func:`~leapfit.afm.build_afm_design`'s,

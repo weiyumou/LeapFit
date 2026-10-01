@@ -429,11 +429,15 @@ def test_the_children_of_a_state_in_the_order_an_expansion_scores_them():
                       aic=0.0, bic=0.0, n_kcs=2, n_params=0, is_optimal=True,
                       n_separated=0)
     children = _children(parent, F_AND_G, ("all",) * 3, "both")
-    assert [(labels, history) for labels, history, _ in children] == [
+    assert [(labels, history) for labels, history, _, _ in children] == [
         (("all*f", "all*g", "all"), (SPLIT_F, SPLIT_G)),
         (("all",) * 3, ()),
         (("all+all*f",) * 3, (SPLIT_F, Move("merge", "all", "all*f"))),
     ]
+    # What a refusal records. The undo used to be logged under the last move
+    # left on its history, here none at all ("root").
+    assert [move for *_, move in children] == [
+        "split all by g", "undo split all by f", "merge all and all*f"]
 
 
 def test_the_same_split_is_never_offered_twice_on_one_lineage(search):

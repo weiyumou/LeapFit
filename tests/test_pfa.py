@@ -196,6 +196,22 @@ def test_inclusive_counts_manufacture_learning_rates_from_noise():
         "the leak buys a large spurious likelihood gain")
 
 
+def test_a_fit_that_stops_short_names_its_family():
+    """Regression: the warning said AFM whatever was fitted."""
+    data, _ = simulate_pfa(n_students=8, n_reps=6)
+    with pytest.warns(RuntimeWarning, match="The PFA fit is not at a stationary point"):
+        fit_pfa(build_pfa_design(data), data.y, method="TNC", max_fun=2)
+
+
+def test_a_pfa_fit_can_start_from_another():
+    """``w0``, as fit_afm and fit_lkt take it: the same optimum from a warm start."""
+    data, _ = simulate_pfa(n_students=8, n_reps=6)
+    design = build_pfa_design(data)
+    cold = fit_pfa(design, data.y, warn_not_converged=False)
+    warm = fit_pfa(design, data.y, w0=cold.weights, warn_not_converged=False)
+    assert warm.ll == pytest.approx(cold.ll, abs=1e-6)
+
+
 def test_pooled_kc_values_broadcast_the_shared_slopes():
     data, _ = simulate_pfa(n_students=15, n_reps=8)
     fit = fit_pfa(build_pfa_design(data, slopes="pooled"), data.y,

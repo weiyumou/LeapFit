@@ -391,8 +391,9 @@ def fit_logistic(design: Design, y, *, method: str = DEFAULT_METHOD,
         )
     if warn_not_converged and not fit.is_optimal:
         warnings.warn(
-            f"AFM is not at a stationary point: max |gradient| on free coefficients "
-            f"is {fit.max_free_gradient:.3g} (tolerance {fit.gradient_tolerance:.3g}) "
+            f"The {fit.label} fit is not at a stationary point: max |gradient| on "
+            f"free coefficients is {fit.max_free_gradient:.3g} (tolerance "
+            f"{fit.gradient_tolerance:.3g}) "
             f"after {fit.n_iter} iterations ({fit.message}). Fit statistics for this "
             f"{fit.n_params:,}-parameter model are not the optimum; raise max_fun or "
             "try method='L-BFGS-B'.",

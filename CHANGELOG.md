@@ -112,6 +112,18 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Fixed
 
+- `leapfit-lfa` stopped with a traceback when two factor models covered as
+  many rows as each other but not the same ones. It grouped the models by
+  row count, and `build_factor_matrix` then refused the mismatch. It now
+  groups them by the rows they cover, and excludes the minority with its
+  reason, as it already did for a model over fewer rows.
+- The warning for a fit that stops short of its optimum said "AFM" for
+  every model family. It now names the family: "The PFA fit is not at a
+  stationary point", and so on.
+- A refused lineage merge was recorded under the wrong move: the last
+  move left on its history, or "root" when none was. It is now recorded
+  as the undo itself, `undo split <skill> by <factor>`.
+- `fit_pfa` takes `w0`, as `fit_afm` and `fit_lkt` do.
 - `paired_scores` returned an empty table, and `paired_contrasts` could not
   find its baseline, for a run with `seed=None`, LabelKFold's deterministic
   partition: grouping on the seed dropped the missing key. Both now keep it.

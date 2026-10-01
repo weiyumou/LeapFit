@@ -272,6 +272,23 @@ def test_cli_lfa_excludes_a_multi_kc_model_from_the_factors(tmp_path, capsys):
     assert "excluding 'wide'" in err and "more than one KC" in err
 
 
+def test_cli_lfa_excludes_a_model_over_other_rows_of_the_same_size(tmp_path, capsys):
+    """Regression: equal counts are not equal rows. Two models that each blank a
+    different step used to reach build_factor_matrix and end in a traceback."""
+    rows = mixed("s1", "a", "X", 4) + mixed("s1", "b", "Y", 4) + \
+        mixed("s2", "a", "X", 4) + mixed("s2", "b", "Y", 4)
+    df = rollup(rows, "one")
+    df["KC (two)"], df["Opportunity (two)"] = df["KC (one)"], df["Opportunity (one)"]
+    df.loc[0, ["KC (one)", "Opportunity (one)"]] = ""
+    df.loc[1, ["KC (two)", "Opportunity (two)"]] = ""
+    export = tmp_path / "export.txt"
+    df.to_csv(export, sep="\t", index=False, lineterminator="\n")
+
+    assert _lfa_cli("--min-opportunities", "1", export=str(export)) == 0
+    err = capsys.readouterr().err
+    assert "excluding 'two'" in err and "but not the same rows" in err
+
+
 def test_cli_lfa_refuses_an_unknown_model_name(tmp_path, capsys):
     assert _lfa_cli("--factors", "Nope") == 1
     assert "Unknown KC model" in capsys.readouterr().err

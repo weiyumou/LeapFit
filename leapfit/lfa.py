@@ -763,9 +763,10 @@ def _run_candidates(jobs: list[tuple], pool) -> list[tuple]:
 
 
 def _children(parent: LFAState, factors: FactorMatrix, start: tuple[str, ...],
-              merges: str) -> list[tuple[tuple[str, ...], tuple[Move, ...], tuple[str, ...]]]:
-    """Every state one move from ``parent``: its labels, its history, and the
-    KC labels the move touched, in the order an expansion scores them.
+              merges: str) -> list[tuple[tuple[str, ...], tuple[Move, ...], tuple[str, ...], str]]:
+    """Every state one move from ``parent``: its labels, its history, the KC
+    labels the move touched, and the move as a refusal records it, in the
+    order an expansion scores them.
 
     Splits come first, every skill by every factor, then the merges ``merges``
     offers. A move already on the parent's lineage is not offered again, and a
@@ -780,8 +781,9 @@ def _children(parent: LFAState, factors: FactorMatrix, start: tuple[str, ...],
                 continue
             child = split(parent.labels, factors.steps, skill, factor, members)
             if child is not None:
-                out.append((child, (*parent.history, Move("split", skill, factor)),
-                            (f"{skill}{SPLIT_SEP}{factor}", skill)))
+                move = Move("split", skill, factor)
+                out.append((child, (*parent.history, move),
+                            (f"{skill}{SPLIT_SEP}{factor}", skill), str(move)))
     if merges in ("lineage", "both"):
         for i, move in enumerate(parent.history):
             if move.kind != "split":
@@ -791,14 +793,14 @@ def _children(parent: LFAState, factors: FactorMatrix, start: tuple[str, ...],
                 child = replay(history, factors, start)
             except ValueError:
                 continue
-            out.append((child, history, tuple(sorted(set(child)))))
+            out.append((child, history, tuple(sorted(set(child))), f"undo {move}"))
     if merges in ("pairwise", "both"):
         for i, left in enumerate(skills):
             for right in skills[i + 1:]:
                 if ("merge", left, right) not in done:
-                    out.append((merge(parent.labels, left, right),
-                                (*parent.history, Move("merge", left, right)),
-                                (MERGE_SEP.join(sorted((left, right))),)))
+                    move = Move("merge", left, right)
+                    out.append((merge(parent.labels, left, right), (*parent.history, move),
+                                (MERGE_SEP.join(sorted((left, right))),), str(move)))
     return out
 
 
@@ -967,8 +969,8 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
             # shipping an LFAState to each worker.
             seed = ((parent.columns, parent.weights)
                     if warm_start and parent.weights is not None else None)
-            jobs, keys, queued = [], [], set()
-            for child, history, touched in _children(parent, factors, start, merges):
+            jobs, keys, offered, queued = [], [], [], set()
+            for child, history, touched, move in _children(parent, factors, start, merges):
                 key = _partition(child)
                 if key in cache:
                     # Already scored. Re-offering it is what makes merge useful:
@@ -980,12 +982,13 @@ def lfa_search(data: StepData, factors: FactorMatrix, *,
                     continue        # two moves reaching one partition this round
                 queued.add(key)
                 keys.append(key)
+                offered.append(move)
                 jobs.append((child, history, touched, seed, iteration))
 
             scored = _run_candidates(jobs, pool)
-            for (_, history, *_), key, (state, reason) in zip(jobs, keys, scored):
+            for move, key, (state, reason) in zip(offered, keys, scored):
                 if state is None:
-                    moves.append(str(history[-1]) if history else "root")
+                    moves.append(move)
                     reasons.append(reason)
                     continue
                 cache[key] = state

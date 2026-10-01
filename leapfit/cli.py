@@ -554,18 +554,23 @@ def _eligible_factor_models(export: pd.DataFrame, wanted: list[str]) -> tuple[di
     if not loaded:
         return loaded, excluded
 
-    coverage: dict[int, list[str]] = {}
+    # Grouped by the rows covered, not by how many: two models can each blank
+    # a different step and land on the same count.
+    coverage: dict[bytes, list[str]] = {}
     for name, data in loaded.items():
-        coverage.setdefault(len(data), []).append(name)
+        coverage.setdefault(data.source_rows.tobytes(), []).append(name)
     if len(coverage) > 1:
         keep = max(coverage.values(), key=len)
-        for size, names in coverage.items():
+        majority = len(loaded[keep[0]])
+        for names in coverage.values():
             if names is keep:
                 continue
             for name in names:
-                majority = len(loaded[keep[0]])
-                reason = (f"covers {size:,} observations, not "
-                          f"{majority:,} like the majority")
+                size = len(loaded[name])
+                reason = (f"covers {size:,} observations, not {majority:,} like the "
+                          "majority" if size != majority else
+                          f"covers {size:,} observations like the majority, but not "
+                          "the same rows")
                 excluded.append((name, reason))
                 del loaded[name]
     return loaded, excluded
