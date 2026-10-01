@@ -242,7 +242,7 @@ def test_the_gap_is_the_solver_not_the_parameterization(data, fit):
 
     # R's contrasts drop the first student level; identification drops the last.
     full = build_lkt_design(data, terms, cost=REFERENCE_COST, identify=False)
-    student = next(b for b in full.blocks if b.name == "student")
+    student = full.get("student")
     keep = np.ones(student.matrix.shape[1], dtype=bool)
     keep[0] = False
     other_reference = fit_lkt(

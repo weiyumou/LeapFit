@@ -53,6 +53,8 @@ while the major version is 0, a minor bump may change the public API.
   component tables and the LFA screens read separation through it, where
   each combined `by_block()` entries by hand; the two records now share
   their column handling instead of each defining it.
+- `Design.get(name)`: the block of that name, or `None`. It replaces five
+  hand-written lookups across the package and the tests.
 - `Design.lower` and `Design.upper`: the coefficient bounds as arrays, with
   `-inf` and `inf` where a coefficient is unbounded. `Design.bounds` keeps
   the `(min, max)` pairs with `None`; `fit_logistic` no longer converts them

@@ -242,6 +242,10 @@ class Design:
         """
         return sum(b.matrix.shape[1] for b in self.blocks)
 
+    def get(self, name: str) -> Block | None:
+        """The block called ``name``, or ``None`` if the design has none."""
+        return next((b for b in self.blocks if b.name == name), None)
+
     @property
     def matrix(self) -> sparse.csr_matrix:
         return sparse.hstack([b.matrix for b in self.blocks], format="csr")
@@ -457,27 +461,12 @@ class Design:
             on: it is the guard that catches aliasing introduced by blocks
             added later.
         """
-        keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
-        dropped, reasons = [], []
-
-        for b in self.blocks:
-            nnz = np.asarray((b.matrix != 0).sum(axis=0)).ravel()
-            for j in np.flatnonzero(nnz == 0):
-                keep[b.name][j] = False
-                dropped.append(f"{b.name}:{b.columns[j]}")
-                reasons.append("column is identically zero (not estimable)")
-
-        for b in self.blocks:
-            for j, first in b.duplicate_columns():
-                keep[b.name][j] = False
-                dropped.append(f"{b.name}:{b.columns[j]}")
-                reasons.append(f"duplicate of {b.name}:{b.columns[first]}")
-
-        reduced = Design(
-            tuple(b.keep(keep[b.name]) for b in self.blocks),
-            Aliased(tuple(self.aliased.columns) + tuple(dropped),
-                    tuple(self.aliased.reasons) + tuple(reasons)),
-        )
+        dead = [(b.name, j, "column is identically zero (not estimable)")
+                for b in self.blocks
+                for j in np.flatnonzero(np.asarray((b.matrix != 0).sum(axis=0)).ravel() == 0)]
+        repeated = [(b.name, j, f"duplicate of {b.name}:{b.columns[first]}")
+                    for b in self.blocks for j, first in b.duplicate_columns()]
+        reduced = self._without(dead + repeated)
         identified = reduced._drop_reference_levels(prefer_drop, check=check)
 
         if check:
@@ -540,14 +529,13 @@ class Design:
                     vectors.setdefault((name, int(j)), {})[k] = Fraction(weight)
         support = [sum(map(len, r.columns)) for r in redundancies]
 
-        by_name = {b.name: b for b in self.blocks}
         involved = [b.name for b in self.blocks
                     if any(b.name in r.blocks for r in redundancies)]
         basis: dict[int, dict[int, Fraction]] = {}
         seen: set[frozenset] = set()
         drops = []
         for name in self._drop_order(involved, prefer_drop):
-            for j in range(by_name[name].matrix.shape[1] - 1, -1, -1):
+            for j in range(self.get(name).matrix.shape[1] - 1, -1, -1):
                 vector = vectors.get((name, j))
                 if not vector or (key := frozenset(vector.items())) in seen:
                     continue  # in no redundancy, or identical to a column visited
@@ -563,23 +551,27 @@ class Design:
                 spanned_by.setdefault(name, set()).update(redundancies[k].blocks)
             for name, blocks in spanned_by.items():
                 taken = sum(drop[1] == name for drop in drops)
-                if name != prefer_drop and taken == by_name[name].matrix.shape[1]:
+                if name != prefer_drop and taken == self.get(name).matrix.shape[1]:
                     raise ValueError(_whole_block_refusal(
-                        name, [b for b in by_name if b in blocks and b != name]))
+                        name, [b.name for b in self.blocks
+                               if b.name in blocks and b.name != name]))
 
+        return self._without([
+            (name, j, _reference_reason(list(redundancies[k].blocks), redundancies[k].label,
+                                        redundancies[k].n_components))
+            for k, name, j in sorted(drops, key=lambda drop: drop[0])])
+
+    def _without(self, drops: list[tuple[str, int, str]]) -> Design:
+        """This design less the ``(block, column index, reason)`` drops, each
+        recorded in :attr:`aliased` in the order given."""
         keep = {b.name: np.ones(b.matrix.shape[1], dtype=bool) for b in self.blocks}
-        dropped, reasons = [], []
-        for k, name, j in sorted(drops, key=lambda drop: drop[0]):
+        for name, j, _ in drops:
             keep[name][j] = False
-            dropped.append(f"{name}:{by_name[name].columns[j]}")
-            redundancy = redundancies[k]
-            reasons.append(_reference_reason(list(redundancy.blocks), redundancy.label,
-                                             redundancy.n_components))
         return Design(
-            tuple(b.keep(keep[b.name]) if not keep[b.name].all() else b
-                  for b in self.blocks),
-            Aliased(tuple(self.aliased.columns) + tuple(dropped),
-                    tuple(self.aliased.reasons) + tuple(reasons)),
+            tuple(b if keep[b.name].all() else b.keep(keep[b.name]) for b in self.blocks),
+            Aliased(self.aliased.columns
+                    + tuple(f"{name}:{self.get(name).columns[j]}" for name, j, _ in drops),
+                    self.aliased.reasons + tuple(reason for _, _, reason in drops)),
         )
 
     @staticmethod
@@ -596,7 +588,7 @@ class Design:
         return ordered + [n for n in reversed(names) if n != prefer_drop]
 
     def _row_sums(self, name: str) -> np.ndarray | None:
-        b = next((x for x in self.blocks if x.name == name), None)
+        b = self.get(name)
         return None if b is None else np.asarray(b.matrix.sum(axis=1)).ravel()
 
     def kc_per_row(self) -> float | None:
@@ -651,8 +643,7 @@ class Design:
         if len(names) < 2:
             return np.zeros(self.n_obs, dtype=np.int64)
 
-        by_name = {b.name: b for b in self.blocks}
-        incidence = sparse.hstack([by_name[n].matrix for n in names], format="csr")
+        incidence = sparse.hstack([self.get(n).matrix for n in names], format="csr")
         incidence = (incidence != 0).astype(np.int8)
         n_rows = incidence.shape[0]
         graph = sparse.bmat([[None, incidence], [incidence.T, None]], format="csr")
@@ -668,7 +659,7 @@ class Design:
         the first stored row decides it. Empty columns get ``-1`` and match no
         component.
         """
-        M = next(b for b in self.blocks if b.name == name).matrix.tocsc()
+        M = self.get(name).matrix.tocsc()
         starts, ends = M.indptr[:-1], M.indptr[1:]
         out = np.full(M.shape[1], -1, dtype=np.int64)
         occupied = starts < ends

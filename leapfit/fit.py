@@ -292,8 +292,7 @@ class LogisticFit:
 
     def _block_values(self, name: str) -> dict[str, float]:
         """Fitted value per column label for one block, aliased columns absent."""
-        block = next((b for b in self.design.blocks if b.name == name), None)
-        if block is None:
+        if (block := self.design.get(name)) is None:
             return {}
         return dict(zip(block.columns, self.weights[self.design.slices()[name]]))
 

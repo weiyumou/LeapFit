@@ -146,7 +146,7 @@ def test_identify_raises_on_a_collinear_extra_block():
     like a nested factor by silently dropping one copy whole."""
     data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
     design = build_afm_design(data, identify=False)
-    kc_block = next(b for b in design.blocks if b.name == "kc_intercept")
+    kc_block = design.get("kc_intercept")
     duplicate = Block.build("copy", kc_block.matrix.copy(),
                             [f"dup_{c}" for c in kc_block.columns])
     with pytest.raises(ValueError, match="kc_intercept and copy partition the rows "
@@ -160,7 +160,7 @@ def test_identify_raises_on_a_collinear_accumulator():
     redundancy can explain it."""
     data = synthetic(n_students=6, n_kcs=3, n_items=12, seed=36, n_reps=5)
     design = build_afm_design(data, identify=False)
-    slopes = next(b for b in design.blocks if b.name == "kc_slope")
+    slopes = design.get("kc_slope")
     duplicate = Block.build("counts", slopes.matrix.copy(),
                             [f"dup_{c}" for c in slopes.columns])
     with pytest.raises(ValueError, match="a block added to this design is collinear"):
@@ -318,7 +318,7 @@ def test_a_cohort_of_one_student_gives_up_its_only_student():
     ident = build_afm_design(data, identify=False).identify()
     assert ident.n_params == ident.rank()
     assert len(ident.aliased.by_block()["student"]) == 2
-    assert next(b for b in ident.blocks if b.name == "student").matrix.shape[1] == 0
+    assert ident.get("student").matrix.shape[1] == 0
 
 
 def test_a_component_without_the_sum_redundancy_keeps_every_student():
