@@ -47,6 +47,12 @@ from scipy.sparse import csgraph
 #: a KC, because the KC intercepts are the reported output; see Design.identify.
 _PREFER_DROP = "student"
 
+#: The basis entries :func:`_indicator_ones` may touch in its exact elimination,
+#: about a third of a second's work. Interlocked combinations of KCs fill the
+#: basis in fast: five hundred KCs in three thousand combinations touch six
+#: million entries, and a thousand in ten thousand take half a minute.
+_ELIMINATION_BUDGET = 1_000_000
+
 
 @dataclass(frozen=True)
 class Block:
@@ -423,14 +429,24 @@ class Design:
            linearly dependent — add a constant to every student, subtract it
            from every KC intercept, and no prediction moves.
 
+           A KC block whose rows carry different numbers of KCs can span it
+           too, with unequal weights. E-learning-24's ``Default`` model has
+           one KC that only ever tags a step beside another, so the other 86
+           put exactly one KC on every row, and add up to ``1`` without it.
+           For a block of indicators that is a linear system — the weights of
+           each row's levels sum to 1 — solved exactly, in rationals, by
+           :func:`_indicator_ones`. Usually it has no solution, because two
+           KCs that each tag steps alone also tag one together. A block of
+           other values whose row sums vary is not tried.
+
            The dependency lives on the two blocks' *own* graph, and on each of
            its connected components separately. Each component shifts
            independently, so cohorts that share no material carry one apiece:
            on the spacing-exp2 export the ten components are its courses, and
-           one reference student is dropped per course. A component where one
-           of the two blocks' row sums varies — rows that do not all carry the
-           same number of KCs, say — has no redundancy to break and keeps
-           every column. And no third block enters a pair's graph: a
+           one reference student is dropped per course. A component where
+           either block has no combination of columns adding up to the
+           all-ones vector has no redundancy to break and keeps every column.
+           And no third block enters a pair's graph: a
            decayed-history feature touches every row without relating two
            cohorts to each other, and a nested factor — items within KCs —
            splits its pair's graph into one component per KC however well
@@ -478,9 +494,9 @@ class Design:
                 f"{identified.n_params} columns, rank {r}. Either a block added to "
                 f"this design is collinear with the others, or the KC model "
                 f"carries a dependency this pass does not model exactly — a KC "
-                f"that tags every row of its component, say. Drop or "
-                f"reparameterize the offending columns before fitting, or "
-                f"AIC/BIC will count parameters that do not exist."
+                f"that tags exactly the steps two others tag between them, say. "
+                f"Drop or reparameterize the offending columns before fitting, "
+                f"or AIC/BIC will count parameters that do not exist."
             )
         return identified
 
@@ -516,10 +532,10 @@ class Design:
         # Column (block, j) -> {redundancy index: its coefficient there}.
         vectors: dict[tuple[str, int], dict[int, Fraction]] = {}
         for k, redundancy in enumerate(redundancies):
-            for name, columns, weight in zip(redundancy.blocks, redundancy.columns,
-                                             redundancy.weights):
-                for j in columns:
-                    vectors.setdefault((name, int(j)), {})[k] = Fraction(weight)
+            for name, columns, weights in zip(redundancy.blocks, redundancy.columns,
+                                              redundancy.weights):
+                for j, weight in zip(columns.tolist(), weights):
+                    vectors.setdefault((name, j), {})[k] = weight
         support = [sum(map(len, r.columns)) for r in redundancies]
 
         involved = [b.name for b in self.blocks
@@ -665,25 +681,40 @@ class Design:
         """Every sum redundancy between two covering blocks: pairs in design
         order, and within a pair its graph's components in label order.
 
-        A component carries one wherever both blocks' row sums are constant on
-        it, and none where either varies — a block can be constant within one
-        cohort and not across the export, so the question is asked per
-        component rather than of the block. Rows and columns are grouped by one
-        sort rather than one scan per component, so this stays linear-ish
-        however many components there are — a design where no two students
-        share an item has as many components as students.
+        A component carries one wherever each of the two blocks has columns
+        that add up to the all-ones vector over its rows, and none where either
+        has not — a block can have them within one cohort and not across the
+        export, so the question is asked per component rather than of the
+        block. Rows that all sum to ``c`` there add up with every column at
+        ``1/c``, whatever the block holds. Rows that do not are tried only in a
+        block of indicators, by :func:`_indicator_ones`. Rows and columns are
+        grouped by one sort rather than one scan per component, so this stays
+        linear-ish however many components there are — a design where no two
+        students share an item has as many components as students.
         """
-        sums = {name: self._row_sums(name) for name in self._covering_blocks()}
+        names = self._covering_blocks()
+        sums = {name: self._row_sums(name) for name in names}
+        indicators = {name for name in names if np.all(self.get(name).matrix.data == 1)}
+
+        def ones(name: str, rows: np.ndarray, columns: np.ndarray,
+                 ) -> tuple[np.ndarray, tuple[Fraction, ...]] | None:
+            """A block's columns in a component, and the weights that add them
+            up to 1 on its rows; ``None`` where none do."""
+            row_sums = sums[name][rows]
+            if np.allclose(row_sums, row_sums[0]):
+                return columns, (1 / Fraction(float(row_sums[0])),) * len(columns)
+            return _indicator_ones(self.get(name).matrix[rows]) if name in indicators else None
+
         out = []
+        empty = np.array([], dtype=np.int64)
         for first, second, rows, n_components, columns in self._pair_graphs():
             for label, group in _members(rows).items():
-                a, b = sums[first][group], sums[second][group]
-                if np.allclose(a, a[0]) and np.allclose(b, b[0]):
-                    empty = np.array([], dtype=np.int64)
-                    out.append(_SumRedundancy(
-                        (first, second), label, n_components,
-                        (columns[0].get(label, empty), columns[1].get(label, empty)),
-                        (float(b[0]), -float(a[0]))))
+                if (a := ones(first, group, columns[0].get(label, empty))) is None:
+                    continue
+                if (b := ones(second, group, columns[1].get(label, empty))) is None:
+                    continue
+                out.append(_SumRedundancy((first, second), label, n_components,
+                                          (a[0], b[0]), (a[1], tuple(-w for w in b[1]))))
         return out
 
     def recentring_is_valid(self) -> bool:
@@ -730,19 +761,21 @@ def _whole_block_refusal(name: str, spanning: list[str]) -> str:
 
 @dataclass(frozen=True)
 class _SumRedundancy:
-    """Two blocks that span the same direction over one component of their graph.
+    """Two blocks that span the all-ones direction over one component of their graph.
 
-    Where the two blocks' rows sum to constants ``c1`` and ``c2`` there, adding
-    ``c2`` to each of the first block's levels in the component and taking
-    ``c1`` from each of the second's leaves every prediction where it was: that
-    null vector is ``weights`` on ``columns``.
+    Each block has columns there that add up to 1 on every row of the
+    component, at their weights: every column at ``1/c`` where the block's
+    rows all sum to ``c``. Adding a constant to the first block's levels in
+    that proportion and taking it from the second's leaves every prediction
+    where it was, so that null vector is ``weights`` on ``columns``: the
+    first block's weights, and the second's negated.
     """
 
     blocks: tuple[str, str]
     label: int                              # the component, in the pair's own graph
     n_components: int                       # how many components that graph has
-    columns: tuple[np.ndarray, np.ndarray]  # each block's columns in the component
-    weights: tuple[float, float]
+    columns: tuple[np.ndarray, np.ndarray]  # each block's columns in it, weight nonzero
+    weights: tuple[tuple[Fraction, ...], tuple[Fraction, ...]]  # aligned with columns
 
 
 def _members(labels: np.ndarray) -> dict[int, np.ndarray]:
@@ -752,18 +785,30 @@ def _members(labels: np.ndarray) -> dict[int, np.ndarray]:
     return {int(labels[g[0]]): g for g in groups if g.size and labels[g[0]] >= 0}
 
 
-def _reduce(vector: dict[int, Fraction],
-            basis: dict[int, dict[int, Fraction]]) -> dict[int, Fraction]:
+@dataclass
+class _Budget:
+    """Entries an elimination may still touch, as :func:`_reduce` counts them."""
+
+    left: int
+
+
+def _reduce(vector: dict[int, Fraction], basis: dict[int, dict[int, Fraction]],
+            budget: _Budget | None = None) -> dict[int, Fraction] | None:
     """What is left of ``vector`` once the span of ``basis`` is taken out.
 
     ``basis`` is in echelon form: each vector is keyed by its smallest index,
     where it is 1. Eliminating the smallest index the two share therefore
     never reintroduces one already eliminated, and each step moves strictly
-    rightwards.
+    rightwards. A ``budget`` is charged the entries each step touches, and
+    once it runs out ``None`` comes back instead.
     """
     residual = dict(vector)
     while hits := [k for k in residual if k in basis]:
         k = min(hits)
+        if budget is not None:
+            budget.left -= len(residual) + len(basis[k])
+            if budget.left < 0:
+                return None
         coefficient = residual[k]
         for m, value in basis[k].items():
             updated = residual.get(m, 0) - coefficient * value
@@ -772,6 +817,110 @@ def _reduce(vector: dict[int, Fraction],
             else:
                 residual.pop(m, None)
     return residual
+
+
+def _indicator_ones(matrix: sparse.csr_matrix) -> tuple[np.ndarray, tuple[Fraction, ...]] | None:
+    """Weights that add up a block of indicators' columns to 1 on every row.
+
+    ``matrix`` is the block's rows in one component, each 1 in the columns of
+    its levels: a KC model whose steps carry one KC or several. The weights of
+    each row's levels must sum to 1, a linear system decided exactly, in
+    rationals, in three passes from cheapest to dearest:
+
+    1. A level alone on some row weighs 1, so a row whose levels are each
+       alone somewhere sums to more than 1 and nothing adds up. That is the
+       usual multi-KC export, two KCs that each tag steps of their own also
+       tagging steps together, and it is checked for every row at once.
+    2. The levels never alone are left, one equation per distinct combination
+       they appear in, asking them for what the alone levels leave of its 1. A
+       level in one equation only can always meet it, whatever the rest weigh,
+       so that equation is set aside, which can leave another level in one
+       only, and so on; the set-aside equations are met last, in reverse.
+       That settles E-learning-24's ``Default``, one equation, and any number
+       of KCs each paired with a general one.
+    3. What remains is eliminated as :func:`_reduce` does, unless every
+       equation in it asks for 0, which zeros meet. The elimination fills in
+       as it goes, and interlocked combinations make it slow, so it gives up
+       once it has touched :data:`_ELIMINATION_BUDGET` entries, and the rank
+       check refuses whatever dependency is left, as it did before. No export
+       checked has needed it: the first two passes settled every one.
+
+    The weights need not be 0 or 1. Where ``C`` only tags steps with both
+    ``A`` and ``B``, and each of those also tags steps alone, ``A + B - C``
+    adds up to 1. Where the solution is not unique, the levels left free
+    weigh 0: the columns then also carry a dependency within the block, which
+    this does not break and the rank check in :meth:`Design.identify` refuses.
+
+    :returns: the columns of nonzero weight, and their weights; or ``None``.
+    """
+    matrix = matrix.tocsr().sorted_indices()  # a copy: the caller's is left as it was
+    starts, counts = matrix.indptr[:-1], np.diff(matrix.indptr)
+    alone = np.zeros(matrix.shape[1], dtype=bool)
+    alone[matrix.indices[starts[counts == 1]]] = True
+    shared = np.flatnonzero(counts > 1)
+    n_alone = np.add.reduceat(alone[matrix.indices].astype(np.intp), starts)
+    if np.any(n_alone[shared] == counts[shared]):
+        return None
+
+    equations: dict[tuple[int, ...], int] = {}  # levels never alone -> what they owe
+    seen: set[bytes] = set()
+    for r in shared:
+        levels = matrix.indices[starts[r]:starts[r] + counts[r]]
+        if (key := levels.tobytes()) in seen:
+            continue
+        seen.add(key)
+        free = tuple(levels[~alone[levels]].tolist())
+        owed = len(free) - len(levels) + 1
+        if equations.setdefault(free, owed) != owed:
+            return None  # one combination asked for two different sums
+
+    system = list(equations.items())
+    holding: dict[int, list[int]] = {}  # level -> the equations it is in
+    for e, (free, _) in enumerate(system):
+        for k in free:
+            holding.setdefault(k, []).append(e)
+    degree = {k: len(es) for k, es in holding.items()}
+    live = [True] * len(system)
+    set_aside = []  # (equation, the level that meets it), in the order set aside
+    candidates = [k for k, d in degree.items() if d == 1]
+    while candidates:
+        if degree[k := candidates.pop()] != 1:
+            continue
+        e = next(e for e in holding[k] if live[e])
+        live[e] = False
+        set_aside.append((e, k))
+        for m in system[e][0]:
+            degree[m] -= 1
+            if degree[m] == 1:
+                candidates.append(m)
+    core = [system[e] for e in range(len(system)) if live[e]]
+
+    weights = dict.fromkeys(np.flatnonzero(alone).tolist(), Fraction(1))
+    if any(owed for _, owed in core):
+        rhs = matrix.shape[1]  # a key past every column, so never a pivot while one remains
+        basis: dict[int, dict[int, Fraction]] = {}
+        budget = _Budget(_ELIMINATION_BUDGET)
+        for free, owed in core:
+            equation = dict.fromkeys(free, Fraction(1))
+            if owed:
+                equation[rhs] = Fraction(owed)
+            if (residual := _reduce(equation, basis, budget)) is None:
+                return None  # out of budget: whatever is left, the rank check refuses
+            if not residual:
+                continue  # implied by the equations before it
+            if (pivot := min(residual)) == rhs:
+                return None  # reduced to 0 = owed: the combinations disagree
+            basis[pivot] = {k: v / residual[pivot] for k, v in residual.items()}
+        for pivot in sorted(basis, reverse=True):  # each row's other levels lie past it
+            row = basis[pivot]
+            weights[pivot] = row.get(rhs, Fraction(0)) - sum(
+                (v * weights.get(k, 0) for k, v in row.items() if k not in (pivot, rhs)),
+                Fraction(0))
+    for e, k in reversed(set_aside):
+        free, owed = system[e]
+        weights[k] = owed - sum((weights.get(m, 0) for m in free if m != k), Fraction(0))
+    columns = sorted(k for k, w in weights.items() if w)
+    return np.array(columns, dtype=np.int64), tuple(weights[k] for k in columns)
 
 
 def accumulator_block(data: Sized, values: np.ndarray, *,

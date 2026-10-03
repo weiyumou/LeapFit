@@ -10,6 +10,8 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
+  Transactions, exported from DataShop or made for its import, are rolled up
+  into those columns first, the way DataShop's own student-step export is.
 - **Grounded.** AFM, PFA and LFA are adapted from LearnSphere's reference
   components and validated for equivalence against their output, so results
   stay comparable with numbers DataShop already reports. LKT is validated
@@ -23,16 +25,16 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 ```bash
 # Not on PyPI — install from a release tag:
-uv pip install "git+https://github.com/weiyumou/LeapFit@v0.7.0"
+uv pip install "git+https://github.com/weiyumou/LeapFit@v0.8.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync --extra dev    # or: uv pip install -e ".[dev]"
-uv run pytest          # 315 pass, 44 skip in ~16s; extras need R / reference-run artifacts
+uv run pytest          # 352 pass, 44 skip in ~16s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
-`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.7.0"` in its
+`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.8.0"` in its
 `dependencies` or in an extra. Two consequences worth knowing before you do:
 PyPI refuses distributions whose metadata carries a direct URL, so a package
 that is itself published to PyPI cannot declare leapfit this way even in an
@@ -243,6 +245,42 @@ the parser does not recognize (a file coding `1`/`0` needs
 [`examples/generate.py`](examples/generate.py) is a minimal reference for
 producing compatible files from your own data.
 
+### Transactions
+
+A DataShop transaction export, one row per action rather than per step, is
+rolled up into its student-step table first. So is a file made for DataShop's
+import, which lacks the columns DataShop adds on import:
+
+```python
+import pandas as pd
+from leapfit import from_frame, load_transactions, rollup_transactions
+
+data = load_transactions("transactions.txt", kc_model="Topics")
+
+# or roll it up once, for several KC models
+steps  = rollup_transactions(pd.read_csv("transactions.txt", sep="\t", dtype=str,
+                                         keep_default_na=False))
+models = {m: from_frame(steps, m) for m in ("Topics", "Skills")}
+```
+
+The commands accept either, and say on stderr that they rolled it up. A
+step's row is the student's first attempt at it in one problem view, the
+transaction DataShop numbered `Attempt At Step` 1, and its `Outcome` becomes
+`First Attempt`. A file made for import has no `Attempt At Step`, because
+DataShop numbers the attempts itself on import, so they are numbered the same
+way: every transaction that names a step, in time order. Its `Time` may be in
+any format DataShop's import reads, and comes back as DataShop's exports
+write it, with Unix milliseconds in UTC. It must carry `Problem View`, which
+DataShop can derive on import and this does not. A step's KCs in a model are
+every label in the model's `KC (<model>)` columns, which the export repeats
+once per KC, and `Opportunity (<model>)` counts each student's encounters with
+each KC, in practice order. Where the file has `Duration (sec)`, the step's
+durations add up to `Step Duration (sec)`. Checked against DataShop's own
+student-step exports of three datasets, one of them rolled up from the very
+file imported to make it, every row, outcome and time agrees on all three,
+and every column on one; the docstring of `rollup_transactions` records where
+the others differ, and why.
+
 ## What you get beyond point estimates
 
 - **Identified parameter counts.** Aliased columns are removed, so
@@ -251,16 +289,18 @@ producing compatible files from your own data.
   25% of its BIC penalty. Three sources, all removed exactly rather than
   numerically: a KC no student practises twice; two KCs that tag identical
   steps (one keeps the estimate, the other reports `NaN` rather than a number
-  that is really its twin's); and sum redundancies between blocks that
-  partition the rows — *all of them, pair by pair and component by
-  component*. Any block whose rows sum to one positive constant spans the
-  all-ones direction, so two of them (student and KC intercepts, or either
-  beside an item or cohort factor) are dependent on each connected component
-  of their own graph: once per cohort, where cohorts never met the same
-  material, and once per KC, where items nest within KCs. With three or more
-  blocks the dependencies overlap, and exact elimination drops just as many
-  columns as they span. Intercept levels are then comparable only within a
-  cohort. Anything left over raises instead of being counted, so a collinear
+  that is really its twin's); and sum redundancies between blocks that span
+  the all-ones direction — *all of them, pair by pair and component by
+  component*. Any block whose rows sum to one positive constant spans it, and
+  so can a KC block whose steps carry different numbers of KCs, when one KC
+  only ever appears beside another, say; that is decided exactly, as a linear
+  system in rationals. So two such blocks (student and KC intercepts, or
+  either beside an item or cohort factor) are dependent on each connected
+  component of their own graph: once per cohort, where cohorts never met the
+  same material, and once per KC, where items nest within KCs. With three or
+  more blocks the dependencies overlap, and exact elimination drops just as
+  many columns as they span. Intercept levels are then comparable only within
+  a cohort. Anything left over raises instead of being counted, so a collinear
   block added later cannot slip through: one factor entered twice under two
   names is refused by name, and so is a parent block declared after the levels
   it groups, which they already span.
@@ -286,7 +326,8 @@ producing compatible files from your own data.
   except for one appended `Predicted Error Rate (<model>)` column per fitted KC
   model, following DataShop's convention (error rate = `1 − P(correct)`, blank
   for rows without a KC), so learning-curve tooling that reads DataShop exports
-  can consume the result directly.
+  can consume the result directly. Transactions come back as the
+  student-step table they roll up to.
 - **A compatibility switch.** `build_afm_design(data, learnsphere_compat=True)`
   reproduces LearnSphere's exact conventions (ridge, parameter counting) when
   you need to match a published table; the default is the statistically clean
@@ -364,7 +405,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 315 pass, 44 skip, ~16s
+uv run pytest                                       # 352 pass, 44 skip, ~16s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 15 LKT equivalence tests

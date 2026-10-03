@@ -3,6 +3,67 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
+## 0.8.0 — 2026-10-03
+
+### Added
+
+- **Transactions.** `load_transactions(path, kc_model)` reads a DataShop
+  transaction export, or a file made for DataShop's import, and
+  `rollup_transactions(df)` rolls one up into its student-step table, so every
+  model can fit one. A step's row is the transaction DataShop numbered
+  `Attempt At Step` 1, in the file's own problem view. A file made for import
+  has no such numbers, and they are made as DataShop makes them on import;
+  its times may be Unix milliseconds or any other format DataShop's import
+  reads. A step with several KCs in a model, which the export writes as that
+  model's KC column repeated, gets every one of them, each with its own
+  opportunity count. Opportunities are counted in practice order, a
+  problem's earlier view first within a second, and the rows come back in
+  that order, so a recount agrees with them. `Step Duration (sec)` is the sum
+  of the step's transaction durations. A file that sets `Event Type` is
+  refused, since DataShop then counts only some steps as opportunities.
+  Against DataShop's own student-step exports of three datasets, every row,
+  outcome and time agrees on all three, and every KC on the two whose
+  transactions carry KCs, apart from one model renamed between the two
+  exports of one of them. On the first, every opportunity count and every
+  duration agrees too, and so does AFM's fit. On the second, every duration
+  but one does, but about a quarter of the opportunity counts do not,
+  because 76% of its steps share a second with another step of the same
+  student, and DataShop orders those by something neither export records.
+  The third was rolled up from the very file imported to make it: every
+  count of the Unique-step model DataShop made agrees, and every count of
+  its Single-KC model but 0.7%, all inside seconds that several steps of one
+  problem share. `leapfit-afm`, `leapfit-pfa` and `leapfit-lfa` roll
+  transactions up the same way, and `--predictions` then writes the
+  student-step table.
+
+### Fixed
+
+- The error for an unrecognized `First Attempt` value listed `correct`
+  among the failures. `from_frame`'s default `failure_values` included it,
+  so with `success_values=("1",)` and the default failures, a `correct` was
+  scored as a failure without complaint. It is now refused like any other
+  unrecognized value. A label declared both ways is scored as a success,
+  and is now listed only as one.
+- Identification refused some KC models whose steps carry different numbers
+  of KCs, as still rank-deficient. The sum redundancy between the students
+  and the KC intercepts, which a reference student breaks, was looked for
+  only where every row carries the same number of KCs. But some KCs'
+  intercepts can add up to 1 on every row of such a model too: in
+  E-learning-24's `Default` model (ds6499), one KC only ever tags a step
+  beside another, so the other 86 put exactly one KC on every row. For a
+  block of indicators whose rows carry different numbers of levels, the
+  weights that add its columns up to 1 are now solved for exactly, in
+  rationals, and where they exist one reference student is dropped, as
+  elsewhere. They need not be 0 or 1: where `C` only tags steps with both
+  `A` and `B`, `A + B - C` adds up to 1. The exact elimination stops after
+  about a third of a second's work, which only hundreds of KCs in
+  interlocked combinations need, and the design is then refused as before.
+  So is a dependency among the KCs themselves, such as a KC that tags
+  exactly the steps two others tag between them. Of 195 KC models in 12
+  exports, run before and after, the 194 identified before are identified
+  exactly as they were, and ds6499's `Default` now fits, its optimum
+  certified.
+
 ## 0.7.0 — 2026-10-01
 
 ### Changed

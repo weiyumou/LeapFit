@@ -12,7 +12,9 @@ R's ``stats::glm``.
 **One input format.** Every model here reads the same six columns of a DataShop
 student-step export — ``Anon Student Id``, ``Problem Name``, ``Step Name``,
 ``First Attempt``, ``KC (<model>)``, ``Opportunity (<model>)`` — so switching
-model families never means reshaping data.
+model families never means reshaping data. Transactions, exported or made for
+DataShop's import, are rolled up into those columns first, by
+``load_transactions`` or ``rollup_transactions``.
 
     from leapfit import load_student_step, build_afm_design, fit_afm, cross_validate
 
@@ -25,7 +27,8 @@ model families never means reshaping data.
 Layout — shared infrastructure, one module per model family, then searches
 over the KC model a family conditions on:
 
-    leapfit.data      the export -> StepData (parsing rules, practice order)
+    leapfit.data      the export -> StepData (parsing rules, practice order,
+                      transactions rolled up into student-steps)
     leapfit.design    Block / Design: columns carrying their own penalty+bounds
     leapfit.fit       the penalized-logistic solver and its KKT certificate
     leapfit.crossval  fold schemes and both RMSE conventions
@@ -37,7 +40,7 @@ over the KC model a family conditions on:
                       scored by AFM
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from leapfit.afm import (
     STUDENT_L2,
@@ -62,6 +65,8 @@ from leapfit.data import (
     from_frame,
     list_kc_models,
     load_student_step,
+    load_transactions,
+    rollup_transactions,
 )
 from leapfit.design import (
     Aliased,
@@ -164,11 +169,13 @@ __all__ = [
     "list_kc_models",
     "lkt_terms",
     "load_student_step",
+    "load_transactions",
     "make_folds",
     "paired_contrasts",
     "paired_cross_validate",
     "paired_scores",
     "repeated_cross_validate",
+    "rollup_transactions",
     "root_labels",
     "success_failure_counts",
     "validate_top",
