@@ -365,6 +365,12 @@ def load_student_step(path: str, kc_model: str, **kwargs) -> StepData:
     return from_frame(df, kc_model, **kwargs)
 
 
+def _is_transactions(df: pd.DataFrame) -> bool:
+    """Whether ``df`` is a transaction export or import file, not a student-step
+    table: it has the transactions' ``Time`` and no ``First Attempt``."""
+    return "Time" in df.columns and "First Attempt" not in df.columns
+
+
 def from_frame(df: pd.DataFrame, kc_model: str, *,
                success_values: tuple[str, ...] = (CORRECT,),
                failure_values: tuple[str, ...] = tuple(sorted(FIRST_ATTEMPT_VALUES - {CORRECT})),
@@ -389,7 +395,7 @@ def from_frame(df: pd.DataFrame, kc_model: str, *,
     if missing := [c for c in required if c not in df.columns]:
         available = sorted(m.group("name") for c in df.columns if (m := KC_COLUMN.match(c)))
         message = f"Missing column(s) {missing}. KC models present: {available or 'none'}"
-        if "Time" in df.columns and "First Attempt" not in df.columns:
+        if _is_transactions(df):
             message += (". This looks like a transaction export or import file: roll it "
                         "up with rollup_transactions(), or read it with load_transactions()")
         raise KeyError(message)

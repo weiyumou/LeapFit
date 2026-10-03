@@ -38,17 +38,12 @@ def test_cli_predictions_writes_one_column_per_model(tmp_path):
         written["Predicted Error Rate (M2)"].tolist()
 
 
-@pytest.mark.parametrize("made_for_import", [False, True], ids=["export", "import file"])
-def test_cli_rolls_transactions_up_before_fitting(tmp_path, capsys, made_for_import):
-    """A transaction export, or a file made for DataShop's import: the same fit
-    as from the student-step export it rolls up to, and --predictions writes
-    that student-step table."""
+def test_cli_rolls_transactions_up_before_fitting(tmp_path, capsys):
+    """A transaction export: the same fit as from the student-step export it
+    rolls up to, and --predictions writes that student-step table."""
     steps = minimal_frame()
-    transactions = as_transactions(steps)
-    if made_for_import:
-        transactions = transactions.drop(columns="Attempt At Step")
     tx, direct = tmp_path / "tx.txt", tmp_path / "steps.txt"
-    transactions.to_csv(tx, sep="\t", index=False, lineterminator="\n")
+    as_transactions(steps).to_csv(tx, sep="\t", index=False, lineterminator="\n")
     steps.to_csv(direct, sep="\t", index=False, lineterminator="\n")
 
     from_tx, from_steps = tmp_path / "tx.csv", tmp_path / "steps.csv"

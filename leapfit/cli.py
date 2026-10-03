@@ -106,6 +106,7 @@ from leapfit import (
     rollup_transactions,
     validate_top,
 )
+from leapfit.data import _is_transactions
 from leapfit.lfa import BEAM, MAX_ITERATIONS, MIN_OPPORTUNITIES, PATIENCE, _state_design
 
 
@@ -228,7 +229,7 @@ def _read_export(path: str) -> pd.DataFrame:
     rolled up into their student-step table first, as
     :func:`~leapfit.load_transactions` does."""
     export = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-    if "First Attempt" in export.columns or "Time" not in export.columns:
+    if not _is_transactions(export):
         return export
     steps = rollup_transactions(export)
     print(f"{path}: {len(export):,} transactions rolled up into {len(steps):,} "

@@ -12,7 +12,6 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
-import leapfit.design
 from leapfit import Block, Design, accumulator_block, build_afm_design, fit_afm, from_frame
 from leapfit.fit import _expit, _objective
 
@@ -195,7 +194,7 @@ def test_an_elimination_out_of_budget_leaves_the_redundancy_to_the_rank_check(mo
     parameter that does not exist."""
     data = _tagged_data(["A", "C~~D", "C~~E", "D~~E"])
     assert build_afm_design(data).n_params == build_afm_design(data, identify=False).n_params - 1
-    monkeypatch.setattr(leapfit.design, "_ELIMINATION_BUDGET", 0)
+    monkeypatch.setattr("leapfit.design._ELIMINATION_BUDGET", 0)
     with pytest.raises(ValueError, match="still rank-deficient"):
         build_afm_design(data)
 

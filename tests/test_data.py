@@ -430,32 +430,23 @@ def test_reading_a_transaction_export_as_student_steps_points_to_the_rollup():
         from_frame(pd.DataFrame([tx_row("s1", "st1", "CORRECT", 0)]), "M")
 
 
-def test_the_example_comes_back_from_a_transaction_export_of_itself(example):
-    """Every step's first attempt, time, KCs and opportunities come back, so AFM
-    fits the rolled-up table exactly as it fits the student-step export."""
+@pytest.mark.parametrize("made_for_import", [False, True], ids=["export", "import file"])
+def test_the_example_comes_back_from_a_transaction_export_of_itself(example, made_for_import):
+    """Every step's first attempt, time, KCs and opportunities come back. A file
+    made for import has no attempt numbers, since DataShop ignores any it has and
+    makes its own, and gives the same table. A blank Event Type, as DataShop's
+    exports carry it, changes nothing."""
     source = example.source
-    steps = rollup_transactions(as_transactions(source))
+    transactions = as_transactions(source).assign(**{"Event Type": ""})
+    if made_for_import:
+        transactions = transactions.drop(columns="Attempt At Step")
+    steps = rollup_transactions(transactions)
     both = source.merge(steps, on=["Anon Student Id", "Problem Name", "Step Name"],
                         suffixes=("", " rolled up"))
     assert len(both) == len(source) == len(steps)
     for column in ["First Attempt", "First Transaction Time", "KC (Topics)",
                    "Opportunity (Topics)", "KC (Skills)", "Opportunity (Skills)"]:
         assert both[column].tolist() == both[f"{column} rolled up"].tolist(), column
-
-    again = from_frame(steps, "Topics")
-    fit = fit_afm(build_afm_design(example), example.y)
-    refit = fit_afm(build_afm_design(again), again.y)
-    assert refit.ll == pytest.approx(fit.ll, rel=1e-9)
-    assert refit.n_params == fit.n_params
-
-
-def test_a_file_made_for_import_rolls_up_as_its_export_does(example):
-    """DataShop ignores an import's attempt numbers and makes its own, so a file
-    without them gives the table its export gives. A blank Event Type, as
-    DataShop's exports carry it, changes nothing."""
-    export = as_transactions(example.source).assign(**{"Event Type": ""})
-    imported = export.drop(columns="Attempt At Step")
-    pd.testing.assert_frame_equal(rollup_transactions(imported), rollup_transactions(export))
 
 
 def test_an_import_numbers_the_attempts_at_each_step_by_time():
