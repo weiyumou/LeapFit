@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
-## Unreleased
+## 0.8.0 — 2026-10-03
 
 ### Added
 

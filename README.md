@@ -25,7 +25,7 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
 
 ```bash
 # Not on PyPI — install from a release tag:
-uv pip install "git+https://github.com/weiyumou/LeapFit@v0.7.0"
+uv pip install "git+https://github.com/weiyumou/LeapFit@v0.8.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
@@ -34,7 +34,7 @@ uv run pytest          # 352 pass, 44 skip in ~16s; extras need R / reference-ru
 ```
 
 Another project can depend on leapfit with the same direct reference —
-`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.7.0"` in its
+`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.8.0"` in its
 `dependencies` or in an extra. Two consequences worth knowing before you do:
 PyPI refuses distributions whose metadata carries a direct URL, so a package
 that is itself published to PyPI cannot declare leapfit this way even in an
