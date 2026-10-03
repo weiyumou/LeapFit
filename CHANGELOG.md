@@ -44,6 +44,25 @@ while the major version is 0, a minor bump may change the public API.
   scored as a failure without complaint. It is now refused like any other
   unrecognized value. A label declared both ways is scored as a success,
   and is now listed only as one.
+- Identification refused some KC models whose steps carry different numbers
+  of KCs, as still rank-deficient. The sum redundancy between the students
+  and the KC intercepts, which a reference student breaks, was looked for
+  only where every row carries the same number of KCs. But some KCs'
+  intercepts can add up to 1 on every row of such a model too: in
+  E-learning-24's `Default` model (ds6499), one KC only ever tags a step
+  beside another, so the other 86 put exactly one KC on every row. For a
+  block of indicators whose rows carry different numbers of levels, the
+  weights that add its columns up to 1 are now solved for exactly, in
+  rationals, and where they exist one reference student is dropped, as
+  elsewhere. They need not be 0 or 1: where `C` only tags steps with both
+  `A` and `B`, `A + B - C` adds up to 1. The exact elimination stops after
+  about a third of a second's work, which only hundreds of KCs in
+  interlocked combinations need, and the design is then refused as before.
+  So is a dependency among the KCs themselves, such as a KC that tags
+  exactly the steps two others tag between them. Of 195 KC models in 12
+  exports, run before and after, the 194 identified before are identified
+  exactly as they were, and ds6499's `Default` now fits, its optimum
+  certified.
 
 ## 0.7.0 — 2026-10-01
 

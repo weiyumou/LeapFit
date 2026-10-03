@@ -289,16 +289,18 @@ the others differ, and why.
   25% of its BIC penalty. Three sources, all removed exactly rather than
   numerically: a KC no student practises twice; two KCs that tag identical
   steps (one keeps the estimate, the other reports `NaN` rather than a number
-  that is really its twin's); and sum redundancies between blocks that
-  partition the rows — *all of them, pair by pair and component by
-  component*. Any block whose rows sum to one positive constant spans the
-  all-ones direction, so two of them (student and KC intercepts, or either
-  beside an item or cohort factor) are dependent on each connected component
-  of their own graph: once per cohort, where cohorts never met the same
-  material, and once per KC, where items nest within KCs. With three or more
-  blocks the dependencies overlap, and exact elimination drops just as many
-  columns as they span. Intercept levels are then comparable only within a
-  cohort. Anything left over raises instead of being counted, so a collinear
+  that is really its twin's); and sum redundancies between blocks that span
+  the all-ones direction — *all of them, pair by pair and component by
+  component*. Any block whose rows sum to one positive constant spans it, and
+  so can a KC block whose steps carry different numbers of KCs, when one KC
+  only ever appears beside another, say; that is decided exactly, as a linear
+  system in rationals. So two such blocks (student and KC intercepts, or
+  either beside an item or cohort factor) are dependent on each connected
+  component of their own graph: once per cohort, where cohorts never met the
+  same material, and once per KC, where items nest within KCs. With three or
+  more blocks the dependencies overlap, and exact elimination drops just as
+  many columns as they span. Intercept levels are then comparable only within
+  a cohort. Anything left over raises instead of being counted, so a collinear
   block added later cannot slip through: one factor entered twice under two
   names is refused by name, and so is a parent block declared after the levels
   it groups, which they already span.

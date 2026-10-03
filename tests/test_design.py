@@ -12,6 +12,7 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
+import leapfit.design
 from leapfit import Block, Design, accumulator_block, build_afm_design, fit_afm, from_frame
 from leapfit.fit import _expit, _objective
 
@@ -117,12 +118,15 @@ def test_aliased_columns_carry_no_information():
     pytest.param(lambda: synthetic(n_students=8, n_kcs=4, n_items=16, seed=33, n_reps=6),
                  1, id="reference-student"),
     pytest.param(co_occurring_kc_data, 3, id="duplicate-kcs"),
+    pytest.param(lambda: _tagged_data(["A", "B", "A~~P", "B"]), 1,
+                 id="kc-only-beside-another"),
 ])
 def test_identification_does_not_change_the_maximised_likelihood(make_data, n_aliased):
     """Same optimum as the unidentified design, just without the columns that
-    carry nothing: the phantom reference student, or a KC that tags exactly the
-    steps another does (with its slope, and then a reference student). That
-    equivalence is what licenses the drop."""
+    carry nothing: the phantom reference student, a KC that tags exactly the
+    steps another does (with its slope, and then a reference student), or the
+    reference student of KCs that add up to one per row without tagging the
+    same number of steps each. That equivalence is what licenses the drop."""
     data = make_data()
     kwargs = {"method": "L-BFGS-B", "max_fun": 200_000,
               "warn_not_converged": False, "warn_separated": False}
@@ -143,6 +147,57 @@ def test_sum_redundancy_is_detected_for_any_constant_kcs_per_row():
     assert design.kc_per_row() == 2.0
     assert design.rank() == design.n_params - 1
     assert build_afm_design(multi_kc_data()).n_params == design.n_params - 1
+
+
+@pytest.mark.parametrize("tagging", [
+    pytest.param(["A", "B", "A~~P", "B"], id="a-kc-only-beside-another"),
+    pytest.param(["A", "B", "A~~B~~C"], id="a-kc-only-beside-two"),
+    pytest.param(["A", "C~~D", "C~~E", "D~~E"], id="kcs-only-in-pairs"),
+])
+def test_kcs_that_add_up_to_one_on_every_row_carry_the_sum_redundancy(tagging):
+    """Rows carry one KC or several, yet some KCs' intercepts still add up to 1.
+
+    Where ``P`` only tags a step beside ``A``, ``A + B`` does; E-learning-24's
+    ``Default`` model has this shape, one KC only ever paired with another.
+    Where ``C`` only tags steps with both ``A`` and ``B``, ``A + B - C`` does, so
+    a weight can be negative, and no subset of the KCs would find it. Where
+    ``C``, ``D`` and ``E`` only ever tag steps in pairs, ``A`` and the three at
+    a half each do, which takes the elimination to find. Either way the
+    students span the same direction, and one gives way.
+    """
+    design = build_afm_design(_tagged_data(tagging), identify=False)
+    assert design.kc_per_row() is None, "rows carry different numbers of KCs"
+    assert design.rank() == design.n_params - 1
+
+    identified = design.identify()
+    assert identified.n_params == identified.rank()
+    assert len(identified.aliased) == 1
+    assert identified.aliased.columns[0].startswith("student:")
+    assert identified.aliased.reasons == ("reference level (student/KC sum redundancy)",)
+
+
+def test_a_kc_spanned_by_two_others_is_still_refused():
+    """The redundancy above is the only multi-KC dependency identification
+    models. Here ``A`` tags exactly the steps ``B`` and ``C`` tag between them,
+    so its intercept column is theirs added up: a dependency among the KCs
+    themselves, which no reference student breaks, so the design is refused
+    rather than counted."""
+    design = build_afm_design(_tagged_data(["A~~B", "A~~C", "D"]), identify=False)
+    assert design.rank() < design.n_params - 1, "more than the students' redundancy"
+    with pytest.raises(ValueError, match="carries a dependency this pass does not model"):
+        design.identify()
+
+
+def test_an_elimination_out_of_budget_leaves_the_redundancy_to_the_rank_check(monkeypatch):
+    """The exact elimination stops at a budget, because interlocked
+    combinations of KCs make it slow. Stopped, it finds no redundancy, and the
+    rank check refuses the design as it did before, rather than counting a
+    parameter that does not exist."""
+    data = _tagged_data(["A", "C~~D", "C~~E", "D~~E"])
+    assert build_afm_design(data).n_params == build_afm_design(data, identify=False).n_params - 1
+    monkeypatch.setattr(leapfit.design, "_ELIMINATION_BUDGET", 0)
+    with pytest.raises(ValueError, match="still rank-deficient"):
+        build_afm_design(data)
 
 
 def test_identify_raises_on_a_collinear_extra_block():
@@ -238,6 +293,24 @@ def _two_cohort_data(n_per_cohort=4, n_steps=4):
 def _one_hot(labels: list[str], name: str) -> Block:
     """A crossed factor as a design block: one column per level, one per row."""
     return Block.from_levels(name, [(v,) for v in labels])
+
+
+def _tagged_data(tagging, n_students=6, n_reps=3):
+    """Every student works through the steps ``n_reps`` times, step ``j``
+    tagged with the ``~~``-joined KCs ``tagging[j]``, each KC's opportunities
+    counted as they come."""
+    rows = []
+    for i in range(n_students):
+        seen: dict[str, int] = {}
+        for rep in range(n_reps):
+            for j, kcs in enumerate(tagging):
+                counts = []
+                for kc in kcs.split("~~"):
+                    seen[kc] = seen.get(kc, 0) + 1
+                    counts.append(str(seen[kc]))
+                rows.append(step_row(f"s{i}", f"st{j}", (i + j + rep) % 3, kcs,
+                                     "~~".join(counts)))
+    return step_data(rows)
 
 
 def test_a_third_partitioning_block_carries_a_second_redundancy():
@@ -338,7 +411,10 @@ def test_cohorts_of_one_student_on_one_kc_each_give_up_their_students():
 
 
 def test_a_component_without_the_sum_redundancy_keeps_every_student():
-    """One cohort tags some steps with two KCs: no redundancy there to break.
+    """One cohort tags some steps with two KCs, each of which also tags steps
+    alone: weighing 1 apiece there, they would sum to 2 on the steps they
+    share, so nothing adds up to the all-ones vector and there is no
+    redundancy to break.
 
     Observed on the spacing-exp2 export's ``Question Group`` model, where nine
     of the ten courses contribute a reference student and the tenth does not.
