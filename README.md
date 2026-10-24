@@ -303,7 +303,11 @@ the others differ, and why.
   a cohort. Anything left over raises instead of being counted, so a collinear
   block added later cannot slip through: one factor entered twice under two
   names is refused by name, and so is a parent block declared after the levels
-  it groups, which they already span.
+  it groups, which they already span. A dependency among the KCs themselves,
+  a KC that tags exactly the steps two others tag between them, say, is
+  refused too unless asked for: `dependent="drop"` (`--drop-dependent`) then
+  drops the broad column numerically, which leaves every fitted value where it
+  was, and the narrow KCs keep their estimates.
 - **Separation detection.** A KC answered correctly by everyone has no finite
   intercept estimate; leapfit reports it (`fit.separated`, a `Separated` flag
   in `kc_values`) instead of printing the arbitrary number the optimizer

@@ -33,7 +33,7 @@ STUDENT_L2 = 1.0  # LearnSphere's ridge on student intercepts (PyAFM: l2 = 1.0)
 
 def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
                      student_l2: float | None = None, bound_slopes: bool = False,
-                     identify: bool | None = None,
+                     identify: bool | None = None, dependent: str = "raise",
                      recompute_opportunities: bool = False) -> Design:
     """Assemble the AFM design from parsed student-step data.
 
@@ -70,6 +70,12 @@ def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
         slopes, a low-slope screen (``gamma <= 0.001``) selects KCs where
         students did not learn *or got worse*.
     :param identify: drop aliased columns. Defaults to ``not learnsphere_compat``.
+    :param dependent: what to do with a dependency among the KC columns that
+        identification does not model exactly, such as a KC that tags exactly
+        the steps two others tag between them: ``"raise"`` refuses the design,
+        ``"drop"`` drops the broad column and keeps the narrow ones, which
+        leaves every fitted value unchanged. See
+        :meth:`~leapfit.design.Design.identify`.
     :param recompute_opportunities: derive ``T`` from
         :meth:`~leapfit.data.StepData.practice_order` instead of reading
         DataShop's ``Opportunity`` column.
@@ -95,7 +101,7 @@ def build_afm_design(data: StepData, *, learnsphere_compat: bool = False,
         Block.from_levels("kc_slope", data.kcs, values=opportunities,
                           lower=0.0 if bound_slopes else -np.inf),
     ))
-    return design.identify() if identify else design
+    return design.identify(dependent=dependent) if identify else design
 
 
 @dataclass

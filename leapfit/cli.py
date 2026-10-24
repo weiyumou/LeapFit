@@ -195,6 +195,11 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
     p.add_argument("--identification", metavar="FILE",
                    help="write every aliased column and the reason it was dropped "
                         "to this CSV: what the parameter count excludes, and why")
+    p.add_argument("--drop-dependent", action="store_true",
+                   help="drop, numerically, KC columns that are linear combinations "
+                        "of others, such as a KC that tags exactly the steps two "
+                        "others tag between them, instead of refusing the KC model. "
+                        "Predictions do not change; the broad KC reports no estimate")
     p.add_argument("--kc-values", metavar="DIR",
                    help="also write per-KC parameters (DataShop layout) into DIR")
     p.add_argument("--predictions", metavar="FILE",
@@ -207,10 +212,11 @@ def build_parser(family: str = "afm") -> argparse.ArgumentParser:
 
 def _build_and_fit(args, family: str, data):
     """The one family-specific step: assemble the design, fit it."""
+    dependent = "drop" if args.drop_dependent else "raise"
     if family == "afm":
         design = build_afm_design(
             data, learnsphere_compat=args.learnsphere_compat,
-            student_l2=args.student_l2,
+            student_l2=args.student_l2, dependent=dependent,
             recompute_opportunities=args.recompute_opportunities)
         fit = fit_afm(design, data.y, method=args.method, max_fun=args.max_fun)
     else:
@@ -218,7 +224,8 @@ def _build_and_fit(args, family: str, data):
             data,
             slopes="pooled" if args.pooled_slopes else "per_kc",
             student_intercepts=args.student_intercepts,
-            counts="inclusive" if args.inclusive_counts else "prior")
+            counts="inclusive" if args.inclusive_counts else "prior",
+            dependent=dependent)
         fit = fit_pfa(design, data.y, method=args.method, max_fun=args.max_fun)
     return design, fit
 

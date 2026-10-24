@@ -42,6 +42,25 @@ from helpers import (
 # --------------------------------------------------------------------------
 
 
+def test_take_keeps_the_rows_as_data_of_their_own():
+    """A search inside a fold sees the training rows only. The rows come with
+    everything that is theirs, the counts they had, and their place in the
+    source table; a mask picks the same rows as the indices do."""
+    data = synthetic(n_students=4, n_kcs=2, n_items=6, seed=7, n_reps=2)
+    rows = np.array([9, 0, 17, 4])
+    part = data.take(rows)
+    assert len(part) == 4 and part.kc_model == data.kc_model
+    np.testing.assert_array_equal(part.y, data.y[rows])
+    for field in ("students", "items", "kcs", "opportunities"):
+        assert getattr(part, field) == [getattr(data, field)[i] for i in rows]
+    assert part.source is data.source
+    np.testing.assert_array_equal(part.source_rows, data.source_rows[rows])
+    mask = np.zeros(len(data), dtype=bool)
+    mask[rows] = True
+    assert data.take(mask).items == [data.items[i] for i in sorted(rows)]
+    assert part.recomputed_opportunities() != part.opportunities, "counted among the rows kept"
+
+
 def test_opportunity_is_zero_based():
     df = rollup([{
         "Anon Student Id": "s1", "Problem Name": "p", "Step Name": "st",

@@ -12,7 +12,15 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
-from leapfit import Block, Design, accumulator_block, build_afm_design, fit_afm, from_frame
+from leapfit import (
+    Block,
+    Design,
+    accumulator_block,
+    build_afm_design,
+    build_pfa_design,
+    fit_afm,
+    from_frame,
+)
 from leapfit.fit import _expit, _objective
 
 from helpers import (
@@ -185,6 +193,49 @@ def test_a_kc_spanned_by_two_others_is_still_refused():
     assert design.rank() < design.n_params - 1, "more than the students' redundancy"
     with pytest.raises(ValueError, match="carries a dependency this pass does not model"):
         design.identify()
+    with pytest.raises(ValueError, match="dependent must be 'raise' or 'drop'"):
+        design.identify(dependent="maybe")
+
+
+def test_dependent_columns_are_dropped_numerically_on_request():
+    """``dependent="drop"`` is for the Q-matrices identification cannot model
+    exactly, such as clusters of solution steps, where a small cluster rides
+    along with the clusters its steps' problems also carry. Here ``A`` tags the
+    steps ``B`` and ``C`` tag between them, so its intercept column is theirs
+    added up, and on this regular schedule its slope column is a combination
+    of theirs too. The broad KC goes and the narrow ones keep their estimates,
+    and the reference student goes exactly, as before."""
+    data = _tagged_data(["A~~B", "A~~C", "D"])
+    full = build_afm_design(data, identify=False)
+    identified = full.identify(dependent="drop")
+    assert identified.n_params == identified.rank() == full.rank()
+    dropped = dict(zip(identified.aliased.columns, identified.aliased.reasons))
+    students = [c for c in dropped if c.startswith("student:")]
+    assert len(students) == 1 and dropped[students[0]].startswith("reference level")
+    assert set(dropped) - set(students) == {"kc_intercept:A", "kc_slope:A"}
+    assert dropped["kc_intercept:A"] == "linear combination of columns kept before it (numerical)"
+    assert build_afm_design(data, dependent="drop").aliased == identified.aliased
+
+    pfa = build_pfa_design(data, dependent="drop")
+    assert pfa.n_params == pfa.rank() and "kc_intercept:A" in pfa.aliased.columns
+    with pytest.raises(ValueError, match="still rank-deficient"):
+        build_pfa_design(data)
+
+
+def test_dropping_dependent_columns_does_not_change_the_maximised_likelihood():
+    """The equivalence that licenses the numerical drop, as for the exact ones:
+    the fit of the reduced design is a point of the full design's, at the same
+    optimum, with the same fitted values."""
+    data = _tagged_data(["A~~B", "A~~C", "D"])
+    kwargs = {"method": "L-BFGS-B", "max_fun": 200_000,
+              "warn_not_converged": False, "warn_separated": False}
+    full = build_afm_design(data, identify=False)
+    reduced = build_afm_design(data, dependent="drop")
+    fit_full, fit_reduced = fit_afm(full, data.y, **kwargs), fit_afm(reduced, data.y, **kwargs)
+    assert fit_reduced.ll_unpenalized == pytest.approx(fit_full.ll_unpenalized, abs=1e-4)
+    assert fit_reduced.n_params == full.rank() == full.n_params - 3
+    np.testing.assert_allclose(fit_reduced.predict_proba(reduced), fit_full.predict_proba(full),
+                               rtol=0, atol=1e-3)
 
 
 def test_an_elimination_out_of_budget_leaves_the_redundancy_to_the_rank_check(monkeypatch):
@@ -225,6 +276,10 @@ def test_identify_raises_on_a_collinear_accumulator():
                             [f"dup_{c}" for c in slopes.columns])
     with pytest.raises(ValueError, match="a block added to this design is collinear"):
         design.with_blocks(duplicate).identify()
+    # Dropping dependent columns numerically visits the copy last, so it would
+    # take every column of it: the whole-block refusal applies there too.
+    with pytest.raises(ValueError, match="counts adds nothing to this design"):
+        design.with_blocks(duplicate).identify(dependent="drop")
 
 
 def test_identify_raises_on_a_hierarchical_parent_block():

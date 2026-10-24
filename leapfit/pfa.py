@@ -85,7 +85,7 @@ def success_failure_counts(
 
 def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
                      student_intercepts: bool = False, counts: str = "prior",
-                     identify: bool = True) -> Design:
+                     identify: bool = True, dependent: str = "raise") -> Design:
     """Assemble the PFA design from parsed student-step data.
 
     :param slopes: ``"per_kc"`` (canonical: one ``gamma_k``/``rho_k`` per KC)
@@ -105,6 +105,9 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
         ``gamma_k`` is not estimable, the analogue of AFM's never-practised-
         twice slopes — and one student is dropped as the reference level when
         the student block makes the design redundant.
+    :param dependent: what to do with a dependency among the KC columns that
+        identification does not model exactly, as in
+        :func:`~leapfit.afm.build_afm_design`: ``"raise"`` or ``"drop"``.
     """
     if slopes not in ("per_kc", "pooled"):
         raise ValueError(f"slopes must be 'per_kc' or 'pooled', got {slopes!r}")
@@ -136,7 +139,7 @@ def build_pfa_design(data: StepData, *, slopes: str = "per_kc",
         blocks.append(Block.build("failure", f_tot[:, None], ["failure"]))
 
     design = Design(tuple(blocks))
-    return design.identify() if identify else design
+    return design.identify(dependent=dependent) if identify else design
 
 
 @dataclass

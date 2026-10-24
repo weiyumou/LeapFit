@@ -63,7 +63,7 @@ from __future__ import annotations
 import re
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import chain
 
 import numpy as np
@@ -141,6 +141,30 @@ class StepData:
     @property
     def kc_names(self) -> list[str]:
         return sorted({kc for row in self.kcs for kc in row})
+
+    def take(self, rows) -> StepData:
+        """The observations at ``rows`` (indices, or a mask), as data of their own.
+
+        For a search that may see the training rows only, such as an LFA run
+        inside a cross-validation fold. Everything per observation comes
+        along; ``source`` stays whole and ``source_rows`` is taken with the
+        rest, so predictions still write back against the right rows.
+
+        The opportunity counts are kept as they are, counted over all the
+        data, as :meth:`~leapfit.design.Design.take` keeps them for a fold:
+        what a student had practised before a step does not change by leaving
+        other rows out of a fit. :meth:`recomputed_opportunities` counts them
+        among the rows kept instead.
+        """
+        rows = np.asarray(rows)
+        if rows.dtype == bool:
+            rows = np.flatnonzero(rows)
+        pick = lambda values: None if values is None else [values[i] for i in rows]  # noqa: E731
+        return replace(
+            self, y=self.y[rows], students=pick(self.students), items=pick(self.items),
+            kcs=pick(self.kcs), opportunities=pick(self.opportunities), times=pick(self.times),
+            durations=None if self.durations is None else self.durations[rows],
+            source_rows=None if self.source_rows is None else self.source_rows[rows])
 
     def practice_order(self) -> dict[str, np.ndarray]:
         """Each student's row indices, in the order they practised.

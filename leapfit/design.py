@@ -41,6 +41,7 @@ from itertools import chain
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.linalg import solve_triangular
 from scipy.sparse import csgraph
 
 #: The block identification takes a reference level from first. A student, not
@@ -330,6 +331,12 @@ class Design:
         The Gram is ``p x p``, so this stays cheap where a dense ``n x p``
         factorization would not: 63 MB at ``p = 2811`` against 948 MB dense.
         """
+        return self._gram_rank()[2]
+
+    def _gram_rank(self) -> tuple[np.ndarray, float, int]:
+        """The Gram matrix of the unit-scaled columns, the threshold under which
+        an eigenvalue of it, or a Cholesky pivot, reads as zero, and the rank:
+        what :meth:`rank` reports and :meth:`_drop_dependent` decides by."""
         X = self.matrix
         norms = sparse.linalg.norm(X, axis=0)
         norms[norms == 0.0] = 1.0
@@ -337,7 +344,7 @@ class Design:
         gram = ((X @ D).T @ (X @ D)).toarray()
         ev = np.linalg.eigvalsh(gram)
         tol = max(self.n_obs, gram.shape[0]) * np.finfo(float).eps * max(ev.max(), 0.0)
-        return int((ev > tol).sum())
+        return gram, tol, int((ev > tol).sum())
 
     def separated(self, y) -> Separated:
         """Columns whose coefficient has no finite maximizer, given ``y``.
@@ -390,11 +397,11 @@ class Design:
             tuple(1 if rises[j] else -1 for j in idx),
         )
 
-    def identify(self) -> Design:
+    def identify(self, *, dependent: str = "raise") -> Design:
         """Drop columns that are not estimable, so ``n_params == rank(X)``.
 
         Three sources of aliasing are removed, all exactly rather than
-        numerically:
+        numerically, and a fourth on request:
 
         1. **Dead columns.** A column of all zeros carries no information and
            its coefficient is arbitrary. In AFM these are KCs that no student
@@ -478,7 +485,25 @@ class Design:
         Finally the result is checked numerically: a design that is still not
         full rank raises. That is the guard that catches aliasing introduced
         by blocks added later.
+
+        4. **Any other dependency, numerically, on request.** A Q-matrix can
+           carry dependencies among its KCs that no reference level breaks:
+           a KC that tags exactly the steps two others tag between them has
+           their intercept columns added up for its own. Clusters of
+           solution steps do this all the time, since a small cluster rides
+           along with the clusters its steps' problems also carry. With
+           ``dependent="drop"`` what the three exact passes leave is dropped
+           by :meth:`_drop_dependent`: the columns are visited in the order
+           they are to be kept, and one in the span of those before it goes.
+           The fitted values do not move, so the choice only decides which
+           KCs keep an estimate; the rule keeps the narrow ones and drops the
+           broad one they add up to, and students, visited last, give up
+           reference levels before any KC does. The default, ``"raise"``,
+           refuses the design as before, because a dependency this pass does
+           not model exactly is usually a block that should not be there.
         """
+        if dependent not in ("raise", "drop"):
+            raise ValueError(f"dependent must be 'raise' or 'drop', got {dependent!r}")
         dead = [(b.name, j, "column is identically zero (not estimable)")
                 for b in self.blocks
                 for j in np.flatnonzero(np.asarray((b.matrix != 0).sum(axis=0)).ravel() == 0)]
@@ -487,18 +512,92 @@ class Design:
         reduced = self._without(dead + repeated)
         identified = reduced._drop_reference_levels()
 
-        r = identified.rank()
-        if r != identified.n_params:
+        gram, tol, r = identified._gram_rank()
+        if r == identified.n_params:
+            return identified
+        if dependent == "drop":
+            return identified._drop_dependent(gram, tol, identified.n_params - r)
+        raise ValueError(
+            f"Design still rank-deficient after identification: "
+            f"{identified.n_params} columns, rank {r}. Either a block added to "
+            f"this design is collinear with the others, or the KC model "
+            f"carries a dependency this pass does not model exactly — a KC "
+            f"that tags exactly the steps two others tag between them, say. "
+            f"Drop or reparameterize the offending columns before fitting, "
+            f"or pass dependent='drop' to drop them numerically; otherwise "
+            f"AIC/BIC will count parameters that do not exist."
+        )
+
+    def _drop_dependent(self, gram: np.ndarray, tol: float, deficiency: int) -> Design:
+        """Drop the ``deficiency`` columns that are linear combinations of the
+        rest, decided numerically, for :meth:`identify`.
+
+        The columns are visited in the order they are to be kept, and one
+        that lies in the span of those kept before it is dropped: the blocks
+        in design order with the student block last, as :meth:`_drop_order`
+        has it, so that students give up levels before any KC does, and
+        within a block the columns of smallest support first, so that of a KC
+        whose steps are two others' put together it is the broad one that
+        goes, and the two it is made of keep their estimates. Any choice
+        leaves the fitted values where they are; this one keeps the KCs a
+        reader can still name a step of.
+
+        Decided on the same column-scaled Gram matrix :meth:`rank` reads, by
+        a Cholesky factorization in that order that skips a column whose
+        pivot, the squared length of what is left of the unit column once
+        the columns kept are projected out, falls under the rank's own
+        threshold. So a column goes exactly when the rank check would have
+        counted it out. Exactly ``deficiency`` columns must go and the
+        result must be full rank, or the design is refused as before: one
+        so ill-conditioned that the two readings disagree is not one to
+        count parameters on. A block other than the student block that would
+        lose every column is refused too, as :meth:`_drop_reference_levels`
+        refuses it.
+        """
+        names = self._drop_order([b.name for b in self.blocks])[::-1]  # kept first
+        order = []
+        for name in names:
+            support = np.asarray((self.get(name).matrix != 0).sum(axis=0)).ravel()
+            order += [(name, int(j)) for j in np.argsort(support, kind="stable")]
+
+        offsets = self.slices()
+        factor = np.zeros_like(gram)
+        kept: list[int] = []
+        drops = []
+        for name, j in order:
+            col = offsets[name].start + j
+            k = len(kept)
+            row = gram[kept, col]
+            if k:
+                row = solve_triangular(factor[:k, :k], row, lower=True)
+            pivot = gram[col, col] - row @ row
+            if pivot > tol:
+                factor[k, :k], factor[k, k] = row, np.sqrt(pivot)
+                kept.append(col)
+            else:
+                drops.append((name, j, "linear combination of columns kept before it (numerical)"))
+
+        if len(drops) != deficiency:
             raise ValueError(
-                f"Design still rank-deficient after identification: "
-                f"{identified.n_params} columns, rank {r}. Either a block added to "
-                f"this design is collinear with the others, or the KC model "
-                f"carries a dependency this pass does not model exactly — a KC "
-                f"that tags exactly the steps two others tag between them, say. "
-                f"Drop or reparameterize the offending columns before fitting, "
-                f"or AIC/BIC will count parameters that do not exist."
+                f"Design still rank-deficient after identification: {self.n_params} columns, "
+                f"rank {self.n_params - deficiency}, but {len(drops)} column(s) read as linear combinations "
+                f"of the others. The design is too ill-conditioned for its dependent "
+                f"columns to be told apart numerically; drop or reparameterize them "
+                f"before fitting."
             )
-        return identified
+        for name in names:
+            taken = sum(drop[0] == name for drop in drops)
+            if name != _PREFER_DROP and taken == self.get(name).matrix.shape[1]:
+                raise ValueError(_whole_block_refusal(
+                    name, [other for other in names[:names.index(name)] if other != _PREFER_DROP]))
+        reduced = self._without(drops)
+        if (rank := reduced.rank()) != reduced.n_params:
+            raise ValueError(
+                f"Design still rank-deficient after dropping {len(drops)} dependent "
+                f"column(s) numerically: {reduced.n_params} columns, rank {rank}. "
+                f"Drop or reparameterize the offending columns before fitting."
+            )
+        return reduced
 
     def _drop_reference_levels(self) -> Design:
         """Break every sum redundancy, on the columns that survive.
