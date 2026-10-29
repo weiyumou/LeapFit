@@ -14,6 +14,13 @@ One command per model family, identical interfaces:
 
     leapfit-pfa examples/student-step.txt --cv item_blocked
 
+    leapfit-bkt examples/student-step.txt --cv student_blocked --restarts 5 -j -1
+
+``leapfit-bkt`` reads the same file and fills the same columns, but fits a
+different kind of model — a latent state carried along each student's
+sequence, not a design — so it has no identification or optimality columns,
+and its default scheme is ``student_blocked``. See :mod:`leapfit.bkt`.
+
 ``leapfit-lfa`` is the odd one out, because it answers a different question —
 *which* KC model, rather than how well a given one fits. It searches, then
 checks the shortlist out of sample, and can write the labelling it found back
@@ -105,6 +112,13 @@ from leapfit import (
     paired_scores,
     rollup_transactions,
     validate_top,
+)
+from leapfit.bkt import (
+    DEFAULT_MAX_ITER,
+    DEFAULT_TOL,
+    MULTI_KC,
+    bkt_from_data,
+    cross_validate_bkt,
 )
 from leapfit.data import _is_transactions
 from leapfit.lfa import BEAM, MAX_ITERATIONS, MIN_OPPORTUNITIES, PATIENCE, _state_design
@@ -716,6 +730,169 @@ def main_lfa(argv: list[str] | None = None) -> int:
                       max_fun=args.max_fun, warn_separated=False)
         fit.annotate(scored).to_csv(args.predictions, sep="\t", index=False,
                                     float_format="%.6f", lineterminator="\n")
+        print(f"wrote {args.predictions}", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# leapfit-bkt: a latent state carried along a sequence, not a design
+#
+# A separate entry point because the fit is a different kind of object: no
+# design, so no aliasing or separation to report, no optimality certificate,
+# and its own cross-validation. The vocabulary is the same — ``--cv``, ``-j``,
+# ``--seeds``, ``--out``, ``--predictions`` mean what they mean above — and so
+# are the columns that matter for a comparison table.
+# --------------------------------------------------------------------------
+
+def build_bkt_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="leapfit-bkt",
+        description="Fit Bayesian Knowledge Tracing to a DataShop student-step export.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Every KC is held to G + S < 1, so 'known' is the state more likely to "
+               "answer correctly; a KC the data would rather fit the other way round "
+               "is reported in n_at_bound. A KC model that tags steps with several "
+               "KCs is skipped unless --multi-kc replicate asks for LearnSphere's "
+               "convention. See docs/DESIGN.md.")
+    p.add_argument("export", help="DataShop student-step export (tab-delimited)")
+    p.add_argument("--kc-model", action="append", dest="kc_models", metavar="NAME",
+                   help="KC model to fit; repeat for several. Default: all.")
+    p.add_argument("--list-models", action="store_true",
+                   help="print the KC models in the export and exit")
+    p.add_argument("--multi-kc", choices=MULTI_KC, default="refuse",
+                   help="what to do with a step tagged with several KCs: 'refuse' "
+                        "skips the KC model (default); 'replicate' puts the step into "
+                        "each KC's sequence and averages their predictions, "
+                        "LearnSphere's convention — N is then (step, KC) pairs, "
+                        "reported beside n_rows")
+    p.add_argument("--forget", action="store_true",
+                   help="fit a forgetting probability F; classical BKT pins it at 0")
+    p.add_argument("--restarts", type=int, default=5, metavar="N",
+                   help="EM runs per KC, keeping the best (default: 5). BKT's "
+                        "likelihood is multimodal; the spread across restarts is "
+                        "reported, and one restart does not make it unimodal, only "
+                        "unmeasured.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="seeds the random restarts (restart 0 is always the "
+                        "textbook starting point, so --restarts 1 ignores this)")
+    p.add_argument("--tol", type=float, default=DEFAULT_TOL,
+                   help=f"EM relative-improvement stopping tolerance "
+                        f"(default: {DEFAULT_TOL:g})")
+    p.add_argument("--max-iter", type=int, default=DEFAULT_MAX_ITER,
+                   help=f"EM iteration cap per KC (default: {DEFAULT_MAX_ITER})")
+    p.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                   help="worker processes for EM batches and CV folds; -1 for every "
+                        "core. Changes the wall clock and no number.")
+    p.add_argument("--cv", action="append", dest="cv_schemes",
+                   choices=(*SCHEMES, "none"), metavar="SCHEME",
+                   help=f"blocking scheme, one of {', '.join((*SCHEMES, 'none'))}; "
+                        "repeat to score several (default: student_blocked, the "
+                        "one scheme under which a held-out BKT response shares no "
+                        "history with the training split)")
+    p.add_argument("--convention", choices=CONVENTIONS, default="per_fold")
+    p.add_argument("--folds", type=int, default=3)
+    p.add_argument("--seeds", metavar="LO:HI|a,b,c",
+                   help="repeat CV over these seeds and report the mean and sd")
+    p.add_argument("--out", help="write the table to this CSV")
+    p.add_argument("--kc-values", metavar="DIR",
+                   help="also write per-KC BKT parameters into DIR")
+    p.add_argument("--predictions", metavar="FILE",
+                   help="write the input file back out with one 'Predicted Error "
+                        "Rate (<model>)' column per fitted KC model")
+    return p
+
+
+def main_bkt(argv: list[str] | None = None) -> int:
+    """The ``leapfit-bkt`` console script."""
+    import os
+
+    args = build_bkt_parser().parse_args(argv)
+    code, _, wanted = _kc_models(args, args.kc_models)
+    if code is not None:
+        return code
+
+    schemes = args.cv_schemes or ["student_blocked"]
+    if "none" in schemes and len(schemes) > 1:
+        print(f"--cv none cannot be combined with {[s for s in schemes if s != 'none']}",
+              file=sys.stderr)
+        return 1
+    suffix = (lambda s: "") if len(schemes) == 1 else (lambda s: f"_{s}")
+    seeds = parse_seeds(args.seeds) or [None]
+
+    fit_options = {"forget": args.forget, "n_restarts": args.restarts, "tol": args.tol,
+                   "max_iter": args.max_iter}
+
+    export = _read_export(args.export)
+    rows, skipped = [], []
+    annotated = None
+    for name in wanted:
+        data = from_frame(export, kc_model=name)
+        print(f"\n=== {name} ===\n{data.summary()}", file=sys.stderr)
+        try:
+            _, fit = bkt_from_data(data, multi_kc=args.multi_kc, seed=args.seed,
+                                   n_jobs=args.jobs, **fit_options)
+        except ValueError as exc:  # a multi-KC model under --multi-kc refuse
+            print(f"  skipped: {exc}", file=sys.stderr)
+            skipped.append(name)
+            continue
+        print(fit.summary(), file=sys.stderr)
+
+        row = {
+            "kc_model": name,
+            "n_kcs": len(data.kc_names),
+            "n_students": len(data.student_names),
+            "n_obs": fit.n_obs,
+            "n_rows": fit.n_rows,
+            "n_sequences": fit.n_seq,
+            "n_params": fit.n_params,
+            "n_at_bound": len(fit.at_bound),
+            "n_degenerate": len(fit.degenerate),
+            "n_unestimable": len(fit.unestimable),
+            "log_likelihood": fit.ll,
+            "aic": fit.aic,
+            "bic": fit.bic,
+            "restart_spread": float(np.max(
+                fit.restart_spread[np.isfinite(fit.restart_spread)], initial=0.0)),
+        }
+
+        for scheme in (s for s in schemes if s != "none"):
+            scores = [cross_validate_bkt(data, scheme=scheme, n_folds=args.folds,
+                                         seed=seed, convention=args.convention,
+                                         restart_seed=args.seed, multi_kc=args.multi_kc,
+                                         n_jobs=args.jobs, **fit_options).rmse
+                      for seed in seeds]
+            row[f"cv_rmse{suffix(scheme)}"] = float(np.mean(scores))
+            if len(scores) > 1:
+                row[f"cv_rmse_sd{suffix(scheme)}"] = float(np.std(scores, ddof=1))
+            print(f"  CV {scheme}: RMSE = {np.mean(scores):.4f}"
+                  + (f" (sd {np.std(scores, ddof=1):.4f} over {len(scores)} seeds)"
+                     if len(scores) > 1 else ""), file=sys.stderr)
+        rows.append(row)
+
+        if args.predictions:
+            annotated = fit.annotate(data, into=annotated)
+        if args.kc_values:
+            os.makedirs(args.kc_values, exist_ok=True)
+            path = os.path.join(args.kc_values, f"{name.replace('/', '_')}_bkt-values.csv")
+            fit.kc_values().to_csv(path, index=False)
+            print(f"  KC parameters -> {path}", file=sys.stderr)
+
+    if not rows:
+        print("\nNo KC model could be fitted.", file=sys.stderr)
+        return 1
+    if skipped:
+        print(f"\nskipped {len(skipped)} KC model(s): {', '.join(skipped)}",
+              file=sys.stderr)
+
+    table = pd.DataFrame(rows)
+    print()
+    print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    if args.out:
+        table.to_csv(args.out, index=False)
+        print(f"\nwrote {args.out}", file=sys.stderr)
+    if annotated is not None:
+        annotated.to_csv(args.predictions, sep="\t", index=False,
+                         float_format="%.6f", lineterminator="\n")
         print(f"wrote {args.predictions}", file=sys.stderr)
     return 0
 

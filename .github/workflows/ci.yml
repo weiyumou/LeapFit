@@ -82,3 +82,4 @@ jobs:
           /tmp/venv/bin/leapfit-afm --help
           /tmp/venv/bin/leapfit-pfa --help
           /tmp/venv/bin/leapfit-lfa --help
+          /tmp/venv/bin/leapfit-bkt --help

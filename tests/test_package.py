@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 #: per model family — the split that makes adding PFA/BKT/IRT a new module
 #: rather than a rewrite.
 SHARED = ["leapfit.data", "leapfit.design", "leapfit.fit", "leapfit.crossval"]
-FAMILIES = ["leapfit.afm", "leapfit.pfa", "leapfit.lkt"]
+FAMILIES = ["leapfit.afm", "leapfit.pfa", "leapfit.lkt", "leapfit.bkt"]
 
 #: Modules that sit *above* a family rather than beside it. A search over KC
 #: models is scored by AFM's own AIC/BIC, so ``leapfit.lfa`` imports
@@ -104,7 +104,8 @@ def test_a_search_module_may_import_the_family_it_scores_with():
 
 #: Each console script, and options its ``--help`` must list.
 SCRIPTS = {"leapfit-afm": ("--kc-model",), "leapfit-pfa": ("--pooled-slopes",),
-           "leapfit-lfa": ("--factors", "--qmatrix")}
+           "leapfit-lfa": ("--factors", "--qmatrix"),
+           "leapfit-bkt": ("--multi-kc", "--restarts")}
 
 
 @pytest.mark.parametrize("script", sorted(SCRIPTS))

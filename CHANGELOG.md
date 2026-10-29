@@ -7,6 +7,84 @@ while the major version is 0, a minor bump may change the public API.
 
 ### Added
 
+- **Bayesian Knowledge Tracing** (`leapfit/bkt.py`, `leapfit-bkt`). The first
+  family in the package that is not a penalized logistic regression: a
+  two-state HMM per knowledge component, fitted by Baum-Welch. It reads the
+  same `StepData` every other family reads and reports the same statistics
+  (`n_obs`, `n_params`, `ll`, `aic`, `bic`, `rmse`, `annotate`), so a BKT row
+  sits in the same table as an AFM one — but it brings its own fitter, its own
+  result type and its own cross-validation, and shares only `leapfit.data` plus
+  `crossval`'s fold schemes and result types.
+
+  - `bkt_filter` is the recursion — predict, Bayes update, transition — pinned
+    in the tests against a plain-Python transcription of the textbook
+    equations, and the only place it lives: predictions and the E-step both
+    read it. Its parameters may be given once or once per sequence, which is
+    what lets one pass serve many chains.
+  - `fit_bkt` runs EM with every (KC, restart) pair as an independent chain in
+    **one vectorized forward-backward pass**: the Python-level loop is over
+    the length of a sequence, never over KCs or restarts, and a chain that has
+    converged is dropped from the batch while the others go on. Batches of
+    chains spread over `n_jobs` processes. Neither changes a number, and the
+    tests pin that: a KC fits the same alone or beside others, restart 0 of a
+    five-restart fit is the single-restart fit bitwise, and one process
+    returns what eight return. On the E-learning 2022 export a five-restart
+    fit of the 1,865-KC `Unique-step` model takes 18 s in one process and
+    7 s in four, where the per-KC loop it replaces took 101 s.
+  - **Every KC is held to `G + S < 1`.** Where the free M-step update would
+    cross that line, the M-step objective is maximized *on* it instead, so EM
+    stays monotone and "known" stays the state more likely to answer
+    correctly. `BKTFit.at_bound` names the KCs the constraint held, and a
+    warning fires: for those the data prefer the label swap, and the
+    constrained fit is one in which knowing the KC makes no difference.
+    Baker, Corbett & Aleven's (2008) criterion (`G > 0.5` or `S > 0.5`) is
+    reported separately as `degenerate`, for the reader, and not acted on.
+  - **Multi-KC steps are refused by default, and replicated on request.**
+    `extract_sequences(data, multi_kc="replicate")` — `--multi-kc replicate`
+    on the command line — applies LearnSphere's convention: one observation
+    per (step, KC) pair, a step predicted by the mean of its KCs. `N` is then
+    pairs, reported as `n_obs` beside `n_rows`.
+  - `cross_validate_bkt` returns a `crossval.CVResult`, defaults to
+    `student_blocked`, and fits its folds across `n_jobs` processes.
+  - `scripts/validate_bkt.py` validates by transplantation against **two**
+    references: pyBKT, and Yudelson's `hmm-scalable`, the C++ tool behind
+    LearnSphere's `AnalysisBkt` component. On the shipped example each one's
+    fitted parameters, loaded into leapfit's recursion, reproduce its
+    predictions — pyBKT's to 3e-16 and hmm-scalable's to 1e-10, on both
+    `Topics` and `Skills`.
+
+  Adapted from the `BKTFilter` in the companion `betabern` project; the
+  recursion carries over, the fitter does not (that one is gradient descent on
+  the prequential NLL, deliberately). See `docs/DESIGN.md`.
+
+### Honest statistics, BKT edition
+
+- **No optimality certificate, and none implied.** BKT's likelihood is not
+  concave, so `BKTFit` has no `is_optimal` attribute rather than one meaning
+  something weaker under a familiar name. `restart_spread` — the range of final
+  log-likelihoods across seeded EM restarts — is what stands in its place, with
+  `final_improvement` reporting the last step EM actually took.
+- **Parameters with no data behind them are not counted.** A KC no student
+  practises twice has no observed transition, so its learn rate is `NaN` in
+  `kc_values()` rather than `0`, and is excluded from `n_params` — the same
+  rule AFM applies to a slope with no second opportunity.
+- **A KC at the constraint is named, not repaired.** See `at_bound` above.
+- **`N` under replication is visible.** A table that mixed a replicated BKT
+  row with an AFM row on the same file would compare AIC/BIC over different
+  `N`; `n_obs` and `n_rows` are both reported so that it cannot happen
+  silently.
+- **`forget=True` fits forgetting.** `F = 0` is an absorbing fixed point of
+  its own M-step — every `xi_t(known, unknown)` carries a factor of `F` — so
+  an initializer at zero would make `forget=True` silently identical to
+  classical BKT while still charging a parameter for it. `DEFAULT_INIT`
+  starts it at 0.01, and a test pins both that `F` moves and that the nested
+  model cannot fit worse.
+- **EM's tolerance is tight because its stopping rule measures the step.**
+  BKT's likelihood has flat ridges where EM's steps shrink long before it
+  arrives; at a relative 1e-8 the shipped example stopped 0.046 nats short on
+  one KC while reporting convergence. Defaults are `tol=1e-10` with a
+  2000-iteration cap, and `final_improvement` makes the claim auditable.
+
 - **Dependent KC columns, dropped on request.** Identification refuses a
   design it cannot make full rank exactly, and a Q-matrix can carry a
   dependency among its KCs that no reference level breaks: a KC that tags

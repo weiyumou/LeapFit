@@ -1,9 +1,10 @@
 """Bayesian Knowledge Tracing: a two-state HMM per knowledge component, fitted by EM.
 
 BKT is the first model in this package that is not a logistic regression, so it
-brings its own fitter and shares only :mod:`leapfit.data`. What it does *not*
-bring is a different input format: it reads the same
-:class:`~leapfit.data.StepData` every other family reads, and reshapes it here.
+brings its own fitter and shares only :mod:`leapfit.data` and the fold schemes
+of :mod:`leapfit.crossval`. What it does *not* bring is a different input
+format: it reads the same :class:`~leapfit.data.StepData` every other family
+reads, and reshapes it here.
 
 The model, per knowledge component, over one student's responses to that KC in
 practice order. The latent ``K_t`` is binary -- the student either knows the KC
@@ -29,19 +30,36 @@ computes exactly this, and it is what both the predictions and the E-step use.
 The recursion is the textbook one (Corbett & Anderson 1995). The
 implementation is adapted from the ``BKTFilter`` in the companion ``betabern``
 project, which fits the same recursion by gradient descent on the prequential
-NLL; the arithmetic, the logit-space guards and the treatment of ``forget``
-carry over unchanged, the fitter does not. Validation follows that project's
-*transplantation* protocol against pyBKT -- load the reference's fitted
-parameters into this implementation and compare predictions row by row -- which
-separates "is this the same model" from "is this the same fitting procedure".
-See ``scripts/validate_bkt.py``.
+NLL; the arithmetic and the logit-space guards carry over, the fitter does not.
+Validation follows that project's *transplantation* protocol against two
+references -- pyBKT (Badrinath, Wang & Pardos 2021) and Yudelson's
+``hmm-scalable``, the C++ tool behind LearnSphere's ``AnalysisBkt`` component:
+load each reference's fitted parameters into this recursion and compare
+predictions row by row, which separates "is this the same model" from "is this
+the same fitting procedure". ``scripts/validate_bkt.py`` runs both.
 
-DIVERGENCE (fitting procedure): the reference implementations fit by EM, and so
-does this one, but pyBKT's EM is compiled over its own sequence layout and
-initialises from ``num_fits`` random restarts. We expose restarts explicitly
-(``n_restarts``, seeded) and report the spread of final log-likelihoods across
-them, because BKT's likelihood is genuinely multimodal and a single fit that
-does not say so is a fit you cannot audit.
+The fitter is Baum-Welch, as in both references, and there is one of it: every
+(KC, restart) pair is an independent two-state chain, so all of them are run
+through the same forward-backward pass at once, as rows of one padded array,
+and a chain that has converged is dropped from the array while the others go
+on. That is where the speed comes from -- the Python-level loop is over the
+*length* of a sequence, never over KCs or restarts -- and ``n_jobs`` then
+spreads batches of chains over processes. Neither changes a number: the
+batches are cut deterministically and the per-chain arithmetic is the same
+whichever batch a chain lands in.
+
+DIVERGENCE (``G + S < 1``, always): both references fit guess and slip without
+a joint constraint (``hmm-scalable`` caps each at 0.3 by default; pyBKT caps
+neither), and both can return fits in which the "known" state is the one that
+predicts failure. The names then no longer mean what they say, and the
+likelihood is no help: on real data the label-swapped optimum is routinely the
+higher one. This fitter requires ``G + S < 1`` for every KC -- the state called
+"known" is the state more likely to answer correctly -- by maximizing the
+M-step's objective *on* the boundary when the unconstrained update would cross
+it, which keeps EM monotone. A KC whose fit sits on that boundary is reported
+in :attr:`BKTFit.at_bound`: there, the data prefer the swap, and the
+constrained fit is a model in which knowing the KC makes no difference. That
+is a finding about the KC, not a repaired estimate, and it is printed as one.
 
 DIVERGENCE (no optimality certificate): every other fit in this package carries
 one -- the logistic objective is convex, so satisfying the KKT conditions *is*
@@ -51,26 +69,33 @@ therefore means only that EM stopped on its tolerance, and
 :attr:`BKTFit.restart_spread` is the evidence offered in place of a proof. Do
 not read the two as equivalent.
 
-DIVERGENCE (multi-KC steps): unresolved, and raised rather than guessed. A
-DataShop step may be tagged with several KCs, which AFM absorbs additively;
-BKT is defined on one skill at a time and has no additive form. The available
-conventions -- replicate the row once per KC (pyBKT's, which inflates ``N`` and
-so makes AIC/BIC incomparable with AFM's on the same file), or model only the
-step's first KC, or refuse -- are not interchangeable, and picking one silently
-would put an uncomparable number in a comparison table. Until that is decided,
-:func:`extract_sequences` raises on a multi-KC export naming the offending
-rows. See ``docs/DESIGN.md``.
+DIVERGENCE (multi-KC steps): a DataShop step may be tagged with several KCs,
+which AFM absorbs additively; BKT is defined on one skill at a time and has no
+additive form. Two conventions are offered, named, and neither is silent:
+
+* ``multi_kc="refuse"`` (default): :func:`extract_sequences` raises and names
+  the offending rows. A step with several KCs is one observation for AFM and
+  would be several for BKT, so ``N`` -- and with it AIC and BIC -- would differ
+  between two rows of the same table.
+* ``multi_kc="replicate"``: LearnSphere's convention. Each (step, KC) pair is
+  one observation in that KC's sequence, and a step's prediction is the mean of
+  its KCs' predictions. ``N`` is then the number of pairs, which
+  :attr:`BKTFit.n_obs` reports next to :attr:`BKTFit.n_rows`, so the inflation
+  is visible wherever the statistics are.
 """
 
 from __future__ import annotations
 
+import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
-from leapfit.data import StepData
+from leapfit.crossval import CONVENTIONS, CVResult, FoldResult, make_folds
+from leapfit.data import StepData, _sequences
 
 #: Keeps probabilities off 0 and 1 so the Bayes ratio and the logs stay finite.
 #: The same guard the reference implementation uses.
@@ -91,8 +116,8 @@ DEFAULT_TOL = 1e-10
 DEFAULT_MAX_ITER = 2000
 
 #: Textbook starting point, and the reference implementation's default. The
-#: guess/slip pair sits well inside the ``G + S < 1`` region that keeps BKT
-#: identified, so restart 0 begins somewhere defensible rather than at random.
+#: guess/slip pair sits well inside the ``G + S < 1`` region, so restart 0
+#: begins somewhere defensible rather than at random.
 #:
 #: ``forget`` starts at 0.01 rather than 0 **and must**: zero is an absorbing
 #: fixed point of its own M-step. The update is
@@ -104,9 +129,22 @@ DEFAULT_MAX_ITER = 2000
 DEFAULT_INIT = (0.3, 0.1, 0.2, 0.1, 0.01)  # (prior, learn, guess, slip, forget)
 
 #: Range random restarts sample from. Bounded away from 0 and 1 because EM's
-#: fixed points include the degenerate corners, and a restart that starts in
-#: one never leaves it.
+#: fixed points include the corners, and a restart that starts in one never
+#: leaves it. Guess/slip pairs are redrawn until ``G + S < 1``.
 _RESTART_RANGE = (0.05, 0.95)
+
+#: The conventions for a step tagged with several KCs. See the module docstring.
+MULTI_KC = ("refuse", "replicate")
+
+#: Cells -- sequence x step x restart -- per EM batch. Bounds the memory one
+#: forward-backward pass touches (about a hundred bytes per cell) and gives
+#: ``n_jobs`` something to spread; it does not change any number. Measured on
+#: the E-learning 2022 export, 100k is the fastest budget in one process (a
+#: smaller batch pads less and sheds its converged chains sooner) and within
+#: a third of the fastest with four; 500k was 30% slower serially.
+BATCH_CELLS = 100_000
+
+PARAM_NAMES = ("prior", "learn", "guess", "slip", "forget")
 
 
 def _clip(x):
@@ -129,7 +167,8 @@ class Sequences:
     ``rows[s, t]`` is the position in the originating ``StepData`` of the
     response at ``y[s, t]``, or ``-1`` where padded -- which is what lets a
     prediction computed in sequence space be written back against the right
-    row of the export.
+    row of the export. Under ``multi_kc="replicate"`` a row appears once per
+    KC it carries, in that many sequences.
     """
 
     y: np.ndarray             # (n_seq, max_len) int8 in {0, 1}, 0-padded
@@ -139,70 +178,74 @@ class Sequences:
     students: list[str]       # (n_seq,)
     kc_names: list[str]
     kc_model: str
-    n_source_rows: int        # len(StepData) this came from
+    n_source_rows: int        # len() of the StepData these came from
+    multi_kc: str = "refuse"
 
     def __len__(self) -> int:
-        return int(self.mask.shape[0])
+        return int(self.y.shape[0])
 
     @property
     def n_obs(self) -> int:
-        """Total real responses. Equals ``len(StepData)`` for a single-KC export."""
+        """Observations: (row, KC) pairs, which is rows unless replicated."""
         return int(self.mask.sum())
+
+    @property
+    def n_rows(self) -> int:
+        """Source rows that appear in at least one sequence."""
+        return int(np.unique(self.rows[self.mask]).size)
 
     @property
     def lengths(self) -> np.ndarray:
         return self.mask.sum(axis=1)
 
     def for_kc(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """The ``(y, mask)`` block for one KC, trimmed to its own longest sequence."""
-        sel = self.kc_of_seq == k
-        if not sel.any():
-            return np.zeros((0, 0), dtype=np.int8), np.zeros((0, 0), dtype=bool)
-        y, mask = self.y[sel], self.mask[sel]
-        width = int(mask.sum(axis=1).max())
-        return y[:, :width], mask[:, :width]
+        """This KC's sequences, trimmed to their own longest."""
+        selected = self.kc_of_seq == k
+        mask = self.mask[selected]
+        width = int(mask.sum(axis=1).max(initial=0))
+        return self.y[selected][:, :width], mask[:, :width]
 
     def take(self, seq_index: np.ndarray) -> Sequences:
-        """Whole sequences by index, re-trimmed; the KC vocabulary is not resized.
-
-        The sequence-level analogue of :meth:`leapfit.design.Design.take`, for
-        splitting by student or by KC. Cross-validation does *not* use it: a
-        fold holds out individual responses, which shortens a sequence rather
-        than removing it, and that is :func:`_restrict`.
-        """
-        seq_index = np.asarray(seq_index, dtype=int)
+        """A subset of sequences, re-trimmed to the longest kept."""
+        seq_index = np.asarray(seq_index)
         mask = self.mask[seq_index]
-        width = max(1, int(mask.sum(axis=1).max(initial=0)))
+        width = max(int(mask.sum(axis=1).max(initial=0)), 1)
         return Sequences(
             y=self.y[seq_index][:, :width], mask=mask[:, :width],
             rows=self.rows[seq_index][:, :width], kc_of_seq=self.kc_of_seq[seq_index],
             students=[self.students[i] for i in seq_index], kc_names=self.kc_names,
             kc_model=self.kc_model, n_source_rows=self.n_source_rows,
+            multi_kc=self.multi_kc,
         )
 
 
-def extract_sequences(data: StepData) -> Sequences:
+def extract_sequences(data: StepData, *, multi_kc: str = "refuse") -> Sequences:
     """Reshape parsed student-step data into per-(student, KC) sequences.
 
     Order comes from :meth:`~leapfit.data.StepData.practice_order` -- the same
     canonical ordering AFM's opportunity counts and PFA's prior-success counts
     are built over, so "before" means one thing across the package.
 
-    :raises ValueError: if any step carries more than one KC. See the module
-        docstring: the convention for that case is deliberately unresolved
-        rather than silently chosen.
+    :param multi_kc: what to do with a step that carries several KCs:
+        ``"refuse"`` raises and names the rows; ``"replicate"`` puts the step
+        into each KC's sequence, LearnSphere's convention. See the module
+        docstring for why the default is to refuse.
+    :raises ValueError: on a multi-KC step under ``"refuse"``, or on an
+        observation with no KC at all.
     """
+    if multi_kc not in MULTI_KC:
+        raise ValueError(f"multi_kc must be one of {MULTI_KC}, got {multi_kc!r}")
     multi = [i for i, labels in enumerate(data.kcs) if len(labels) > 1]
-    if multi:
+    if multi and multi_kc == "refuse":
         shown = ", ".join(str(i) for i in multi[:5])
         more = f" (and {len(multi) - 5} more)" if len(multi) > 5 else ""
         raise ValueError(
             f"BKT needs one KC per step, but {len(multi)} of {len(data)} rows in KC "
             f"model {data.kc_model!r} carry several -- observations {shown}{more}. "
             "BKT is defined on a single skill and has no additive form, so the "
-            "convention for multi-KC steps changes N and therefore AIC/BIC; leapfit "
-            "does not pick one for you yet. Fit a single-KC model, or see "
-            "docs/DESIGN.md for the open question."
+            "convention for multi-KC steps changes N and therefore AIC/BIC. Pass "
+            "multi_kc='replicate' for LearnSphere's convention (one observation per "
+            "(step, KC) pair, predictions averaged per step), or fit a single-KC model."
         )
     empty = [i for i, labels in enumerate(data.kcs) if not labels]
     if empty:
@@ -211,69 +254,64 @@ def extract_sequences(data: StepData) -> Sequences:
             "those, so this StepData was probably built by hand."
         )
 
-    kc_names = data.kc_names
-    kc_index = {k: i for i, k in enumerate(kc_names)}
+    # Every (observation, KC) pair, grouped into (student, KC) runs in practice
+    # order — the same layout LKT's features are built over.
+    layout = _sequences(data, data.kcs)
+    starts = np.asarray(layout.starts, dtype=int)
+    n_seq = max(len(starts) - 1, 0)
+    lengths = np.diff(starts) if n_seq else np.zeros(0, dtype=int)
+    max_len = int(lengths.max(initial=1))
 
-    # One sequence per (student, KC), rows in practice order.
-    grouped: dict[tuple[str, str], list[int]] = {}
-    for student, order in data.practice_order().items():
-        for i in order:
-            grouped.setdefault((student, data.kcs[i][0]), []).append(int(i))
-
-    keys = sorted(grouped)  # deterministic sequence order, whatever dict insertion did
-    max_len = max((len(grouped[k]) for k in keys), default=1)
-    n_seq = len(keys)
+    run = np.repeat(np.arange(n_seq), lengths)
+    position = np.arange(len(layout.rows)) - starts[run]
 
     y = np.zeros((n_seq, max_len), dtype=np.int8)
     mask = np.zeros((n_seq, max_len), dtype=bool)
     rows = np.full((n_seq, max_len), -1, dtype=int)
-    kc_of_seq = np.empty(n_seq, dtype=int)
-    students = []
+    y[run, position] = layout.y.astype(np.int8)
+    mask[run, position] = True
+    rows[run, position] = layout.rows
+    kc_of_seq = layout.columns[starts[:-1]] if n_seq else np.zeros(0, dtype=int)
+    students = [data.students[layout.rows[s]] for s in starts[:-1]]
 
-    for s, (student, kc) in enumerate(keys):
-        idx = grouped[(student, kc)]
-        y[s, :len(idx)] = data.y[idx]
-        mask[s, :len(idx)] = True
-        rows[s, :len(idx)] = idx
-        kc_of_seq[s] = kc_index[kc]
-        students.append(student)
-
-    return Sequences(y=y, mask=mask, rows=rows, kc_of_seq=kc_of_seq, students=students,
-                     kc_names=kc_names, kc_model=data.kc_model, n_source_rows=len(data))
+    return Sequences(y=y, mask=mask, rows=rows, kc_of_seq=np.asarray(kc_of_seq, dtype=int),
+                     students=students, kc_names=list(layout.levels),
+                     kc_model=data.kc_model, n_source_rows=len(data), multi_kc=multi_kc)
 
 
 # ==================================================================================
 # The recursion
 # ==================================================================================
 
-def _transition(learn: float, forget: float) -> np.ndarray:
-    """``A[i, j] = P(K_t+1 = j | K_t = i)`` over ``(unknown, known)``."""
-    return np.array([[1.0 - learn, learn], [forget, 1.0 - forget]])
+def _per_sequence(value, n: int) -> np.ndarray:
+    """A parameter given once, or once per sequence, as a ``(n,)`` float array."""
+    value = np.asarray(value, dtype=float)
+    if value.ndim == 0:
+        return np.full(n, float(value))
+    if value.shape != (n,):
+        raise ValueError(f"expected a scalar or {n} per-sequence values, got shape {value.shape}")
+    return value
 
 
-def _emissions(y: np.ndarray, guess: float, slip: float) -> np.ndarray:
-    """``b[s, t, i] = P(y_st | K_t = i)``, shape ``(n_seq, len, 2)``."""
-    correct = np.array([guess, 1.0 - slip])  # P(y = 1 | unknown), P(y = 1 | known)
-    return np.where(y[..., None] == 1, correct, 1.0 - correct)
-
-
-def bkt_filter(y: np.ndarray, mask: np.ndarray, prior: float, learn: float,
-               guess: float, slip: float, forget: float = 0.0) -> dict:
+def bkt_filter(y: np.ndarray, mask: np.ndarray, prior, learn, guess, slip,
+               forget=0.0) -> dict:
     """Run BKT forward over padded sequences: predict, update, transition.
 
     This is the scaled forward pass of the HMM, written in BKT's own terms. It
     is the single place the recursion lives -- predictions read ``p_correct``
     off it, and the E-step reads ``filtered`` and ``scale``.
 
-    Padding is inert: past a sequence's length the state is frozen and the
-    scale is 1, so a padded step contributes nothing to any sum and nothing to
-    the log-likelihood.
+    Each parameter is a scalar shared by every row of ``y``, or one value per
+    row, which is how one call runs many KCs (or many restarts of one KC) at
+    once. Padding is inert: past a sequence's length the state is frozen and
+    the scale is 1, so a padded step contributes nothing to any sum and
+    nothing to the log-likelihood.
 
     :return: a dict with
 
         ``p_correct`` (n, L)
             ``P(y_t = 1 | y_<t)`` -- the one-step-ahead prediction, which is
-            what "a BKT prediction" means and what pyBKT's ``predict`` returns.
+            what "a BKT prediction" means and what both references return.
         ``predicted`` (n, L, 2)
             ``P(K_t | y_<t)`` -- mastery *before* the response is seen.
         ``filtered`` (n, L, 2)
@@ -282,180 +320,256 @@ def bkt_filter(y: np.ndarray, mask: np.ndarray, prior: float, learn: float,
         ``scale`` (n, L)
             ``P(y_t | y_<t)`` for the response actually observed; its masked
             log-sum is the log-likelihood.
+        ``emission`` (n, L, 2)
+            ``P(y_t | K_t)``, kept so the backward pass need not rebuild it.
     """
     y = np.asarray(y)
     mask = np.asarray(mask, dtype=bool)
     n, length = y.shape
+    prior, learn, guess, slip, forget = (
+        _per_sequence(v, n) for v in (prior, learn, guess, slip, forget))
 
-    step = _transition(learn, forget)
-    correct = np.array([guess, 1.0 - slip])
-    b = _emissions(y, guess, slip)
+    correct = np.stack([guess, 1.0 - slip], axis=1)         # P(y = 1 | unknown), (.. | known)
+    emission = np.where(y[..., None] == 1, correct[:, None, :], 1.0 - correct[:, None, :])
+    stay_unknown, stay_known = 1.0 - learn, 1.0 - forget
 
     predicted = np.empty((n, length, 2))
     filtered = np.empty((n, length, 2))
     p_correct = np.zeros((n, length))
     scale = np.ones((n, length))
 
-    state = np.tile(np.array([1.0 - prior, prior]), (n, 1))  # P(K_1) = L0
+    state = np.stack([1.0 - prior, prior], axis=1)          # P(K_1) = L0
     for t in range(length):
         live = mask[:, t]
         keep = live[:, None]
 
         # --- 1. Predict ---
         predicted[:, t] = state
-        p_correct[:, t] = state @ correct
+        p_correct[:, t] = state[:, 0] * correct[:, 0] + state[:, 1] * correct[:, 1]
 
         # --- 2. Update: Bayes on the observed response. ---
-        unnormalized = state * b[:, t]
+        unnormalized = state * emission[:, t]
         evidence = np.where(live, unnormalized.sum(axis=1), 1.0).clip(EPS)
-        filtered[:, t] = np.where(keep, unnormalized / evidence[:, None], state)
+        now = np.where(keep, unnormalized / evidence[:, None], state)
+        filtered[:, t] = now
         scale[:, t] = evidence
 
         # --- 3. Transition: learn out of unknown, forget out of known. ---
-        state = np.where(keep, filtered[:, t] @ step, state)
+        moved = np.stack([now[:, 0] * stay_unknown + now[:, 1] * forget,
+                          now[:, 0] * learn + now[:, 1] * stay_known], axis=1)
+        state = np.where(keep, moved, state)
 
-    return {"p_correct": p_correct, "predicted": predicted,
-            "filtered": filtered, "scale": scale}
+    return {"p_correct": p_correct, "predicted": predicted, "filtered": filtered,
+            "scale": scale, "emission": emission}
 
 
-def _backward(b: np.ndarray, mask: np.ndarray, scale: np.ndarray,
-              step: np.ndarray) -> np.ndarray:
+def _backward(emission: np.ndarray, mask: np.ndarray, scale: np.ndarray,
+              learn: np.ndarray, forget: np.ndarray) -> np.ndarray:
     """Scaled backward variable ``beta_t(i) = P(y_>t | K_t = i) / prod(scale_>t)``.
 
     Scaled by the same constants the forward pass divided by, so that
     ``filtered * beta`` is already the posterior and needs no renormalizing.
     """
-    n, length, _ = b.shape
+    n, length, _ = emission.shape
+    stay_unknown, stay_known = 1.0 - learn, 1.0 - forget
     beta = np.ones((n, length, 2))
     for t in range(length - 2, -1, -1):
-        ahead = b[:, t + 1] * beta[:, t + 1] / scale[:, t + 1][:, None]
-        beta[:, t] = np.where(mask[:, t + 1][:, None], ahead @ step.T, beta[:, t + 1])
+        ahead = emission[:, t + 1] * beta[:, t + 1] / scale[:, t + 1][:, None]
+        back = np.stack([stay_unknown * ahead[:, 0] + learn * ahead[:, 1],
+                         forget * ahead[:, 0] + stay_known * ahead[:, 1]], axis=1)
+        beta[:, t] = np.where(mask[:, t + 1][:, None], back, beta[:, t + 1])
     return beta
 
 
 # ==================================================================================
-# EM
+# EM over a batch of chains
+#
+# A *chain* is one (KC, restart) pair: its own five parameters, its own
+# sequences, its own stopping rule. Chains share nothing but the array they
+# are stacked in, which is what lets one forward-backward pass serve all of
+# them. ``chain[s]`` says which chain sequence ``s`` belongs to.
 # ==================================================================================
 
 @dataclass
-class _KCFit:
-    """One KC's EM run: the parameters, and what the run itself did."""
+class _ChainFits:
+    """What EM produced for every chain of one batch, as arrays over chains."""
 
-    prior: float
-    learn: float
-    guess: float
-    slip: float
-    forget: float
-    ll: float
-    n_iter: int
-    converged: bool
-    monotone: bool          # EM never decreased the likelihood -- a numerics check
-    n_transitions: int      # observed opportunities to learn or forget
-    final_improvement: float  # the last step EM took, in nats
+    prior: np.ndarray
+    learn: np.ndarray
+    guess: np.ndarray
+    slip: np.ndarray
+    forget: np.ndarray
+    ll: np.ndarray
+    n_iter: np.ndarray
+    converged: np.ndarray
+    monotone: np.ndarray        # EM never decreased the likelihood -- a numerics check
+    final_improvement: np.ndarray  # the last step EM took, in nats
+    at_bound: np.ndarray        # the G + S < 1 constraint was active at the end
 
 
-def _em(y: np.ndarray, mask: np.ndarray,
-        init: tuple[float, float, float, float, float], *, fit_forget: bool,
-        bound_degenerate: bool, tol: float, max_iter: int) -> _KCFit:
-    """Baum-Welch for the two-state BKT chain over one KC's sequences.
+def _identified(guess: np.ndarray, slip: np.ndarray, a: np.ndarray, b: np.ndarray,
+                c: np.ndarray, d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The M-step for (G, S), held to ``G + S < 1``.
+
+    The unconstrained update ``G = a / (a + b)``, ``S = c / (c + d)`` -- ``a``
+    and ``b`` the expected correct and incorrect counts in the unknown state,
+    ``c`` and ``d`` the expected incorrect and correct counts in the known
+    state -- maximizes ``Q = a log G + b log(1 - G) + c log S + d log(1 - S)``,
+    which is concave and separable. Where that update lands on or past the
+    line ``G + S = 1``, the constrained maximum lies *on* the line, so it is
+    found there by bisection on the (monotone) derivative. Because the
+    replacement maximizes the same ``Q`` over a set containing the current
+    parameters, EM's monotonicity survives the constraint.
+    """
+    ceiling = 1.0 - EPS                        # the boundary G + S = ceiling
+    over = (guess + slip) >= ceiling
+    if not over.any():
+        return guess, slip
+    a, b, c, d = (v[over] for v in (a, b, c, d))
+    lo = np.full(a.shape, EPS)
+    hi = np.full(a.shape, ceiling - EPS)
+    for _ in range(100):                       # 1e-30 of the interval; more than enough
+        g = 0.5 * (lo + hi)
+        s = ceiling - g
+        slope = a / g - b / (1.0 - g) - c / s + d / (1.0 - s)   # dQ/dG along the line
+        lo = np.where(slope > 0, g, lo)
+        hi = np.where(slope > 0, hi, g)
+    g = 0.5 * (lo + hi)
+    guess, slip = guess.copy(), slip.copy()
+    guess[over], slip[over] = g, ceiling - g
+    return guess, slip
+
+
+def _em_chains(y: np.ndarray, mask: np.ndarray, chain: np.ndarray, n_chains: int,
+               init: np.ndarray, *, fit_forget: bool, tol: float,
+               max_iter: int) -> _ChainFits:
+    """Baum-Welch for a batch of independent chains, stopping each on its own.
+
+    ``init`` is ``(n_chains, 5)`` in :data:`PARAM_NAMES` order. A chain that
+    has converged (or has no sequences) is frozen and its rows are dropped from
+    the arrays, so the batch shrinks to the chains still moving.
 
     EM is monotone by construction, so the loop tracks whether that actually
     held: a decrease is not a bad fit, it is a bug, and it is reported rather
     than tolerated.
     """
-    prior, learn, guess, slip, start_forget = (float(v) for v in init)
+    init = np.asarray(init, dtype=float)
+    prior, learn, guess, slip = (_clip(init[:, i]) for i in range(4))
     # Pinned at 0 for classical BKT; otherwise started strictly inside (0, 1),
-    # because both ends are absorbing fixed points of the M-step below.
-    forget = _clip(start_forget) if fit_forget else 0.0
-    ceiling = 0.5 - EPS if bound_degenerate else 1.0 - EPS
+    # because both ends are absorbing fixed points of the M-step.
+    forget = _clip(init[:, 4]) if fit_forget else np.zeros(n_chains)
+    guess, slip = _identified(guess, slip, *(np.ones(n_chains),) * 4)
 
-    transitions = mask[:, 1:]
-    n_transitions = int(transitions.sum())
+    ll = np.full(n_chains, -np.inf)
+    previous = np.full(n_chains, -np.inf)
+    improvement = np.full(n_chains, np.inf)
+    monotone = np.ones(n_chains, dtype=bool)
+    converged = np.zeros(n_chains, dtype=bool)
+    n_iter = np.zeros(n_chains, dtype=int)
+    at_bound = np.zeros(n_chains, dtype=bool)
 
-    ll = -np.inf
-    previous = -np.inf
-    improvement = np.inf
-    monotone = True
-    converged = False
-    iterations = 0
+    ys, ms, ch = y, mask, chain
+    for iteration in range(1, max_iter + 1):
+        if not ch.size:
+            break
+        pr, le, gu, sl, fo = prior[ch], learn[ch], guess[ch], slip[ch], forget[ch]
+        state = bkt_filter(ys, ms, pr, le, gu, sl, fo)
+        beta = _backward(state["emission"], ms, state["scale"], le, fo)
 
-    for iterations in range(1, max_iter + 1):
-        step = _transition(learn, forget)
-        b = _emissions(y, guess, slip)
-        state = bkt_filter(y, mask, prior, learn, guess, slip, forget)
-        beta = _backward(b, mask, state["scale"], step)
+        # --- The likelihood of the *current* parameters, per chain. ---
+        now = np.bincount(ch, weights=(np.log(state["scale"]) * ms).sum(axis=1),
+                          minlength=n_chains)
+        live = np.bincount(ch, minlength=n_chains) > 0
+        ll[live] = now[live]
+        n_iter[live] = iteration
+        done = np.zeros(n_chains, dtype=bool)
+        if iteration > 1:
+            floor = 1e-9 * np.maximum(1.0, np.abs(previous))
+            monotone[live & (ll < previous - floor)] = False
+            step = np.abs(ll - previous)
+            improvement[live] = step[live]
+            done = live & (step <= tol * np.maximum(1.0, np.abs(previous)))
+            converged[done] = True
+        previous[live] = ll[live]
+        if iteration == max_iter:
+            break           # the cap: parameters stay where `ll` measured them
 
-        # --- E-step. `ll` is the likelihood of the *current* parameters. ---
-        ll = float(np.sum(np.log(state["scale"]) * mask))
-        if iterations > 1:
-            if ll < previous - 1e-9 * max(1.0, abs(previous)):
-                monotone = False
-            improvement = abs(ll - previous)
-            if improvement <= tol * max(1.0, abs(previous)):
-                converged = True
-                break
-        previous = ll
+        # --- E-step: expected counts, summed within each chain. ---
+        filtered, scale, emission = state["filtered"], state["scale"], state["emission"]
+        transitions = ms[:, 1:]
+        gamma = filtered * beta * ms[:, :, None]                 # P(K_t | y)
+        ahead = emission[:, 1:] * beta[:, 1:] / scale[:, 1:, None]
+        xi01 = (filtered[:, :-1, 0] * le[:, None] * ahead[:, :, 1] * transitions).sum(axis=1)
+        xi10 = (filtered[:, :-1, 1] * fo[:, None] * ahead[:, :, 0] * transitions).sum(axis=1)
+        leaving0 = (gamma[:, :-1, 0] * transitions).sum(axis=1)
+        leaving1 = (gamma[:, :-1, 1] * transitions).sum(axis=1)
+        right = ys == 1
+        a = (gamma[:, :, 0] * right).sum(axis=1)      # correct while unknown
+        b = (gamma[:, :, 0] * ~right * ms).sum(axis=1)  # incorrect while unknown
+        c = (gamma[:, :, 1] * ~right * ms).sum(axis=1)  # incorrect while known
+        d = (gamma[:, :, 1] * right).sum(axis=1)      # correct while known
 
-        gamma = state["filtered"] * beta * mask[:, :, None]        # P(K_t | y)
-        ahead = b[:, 1:] * beta[:, 1:] / state["scale"][:, 1:, None]
-        xi = (state["filtered"][:, :-1, :, None] * step[None, None, :, :]
-              * ahead[:, :, None, :] * transitions[:, :, None, None])  # P(K_t, K_t+1 | y)
+        counts = np.bincount(ch, minlength=n_chains).astype(float)
+        a, b, c, d, leaving0, leaving1, xi01, xi10, first_known = (
+            np.bincount(ch, weights=values, minlength=n_chains)
+            for values in (a, b, c, d, leaving0, leaving1, xi01, xi10, gamma[:, 0, 1]))
 
-        # --- M-step. Each parameter is a ratio of expected counts. ---
-        prior = _clip(float(gamma[:, 0, 1].mean()))
+        # --- M-step: each parameter is a ratio of expected counts. ---
+        update = live & ~done
+        new_prior = _clip(np.where(counts > 0, first_known / np.maximum(counts, 1), prior))
+        new_learn = _clip(np.where(leaving0 > EPS, xi01 / np.maximum(leaving0, EPS), learn))
+        new_forget = (_clip(np.where(leaving1 > EPS, xi10 / np.maximum(leaving1, EPS), forget))
+                      if fit_forget else forget)
+        new_guess = _clip(np.where(a + b > EPS, a / np.maximum(a + b, EPS), guess))
+        new_slip = _clip(np.where(c + d > EPS, c / np.maximum(c + d, EPS), slip))
+        crossed = (new_guess + new_slip) >= 1.0 - EPS
+        new_guess, new_slip = _identified(new_guess, new_slip, a, b, c, d)
 
-        leaving = (gamma[:, :-1] * transitions[:, :, None]).sum(axis=(0, 1))
-        if leaving[0] > EPS:
-            learn = _clip(float(xi[:, :, 0, 1].sum() / leaving[0]))
-        if fit_forget and leaving[1] > EPS:
-            forget = _clip(float(xi[:, :, 1, 0].sum() / leaving[1]))
+        prior[update], learn[update], forget[update] = (
+            new_prior[update], new_learn[update], new_forget[update])
+        guess[update], slip[update] = new_guess[update], new_slip[update]
+        at_bound[update] = crossed[update]
 
-        occupancy = gamma.sum(axis=(0, 1))
-        if occupancy[0] > EPS:
-            guess = float(np.clip((gamma[:, :, 0] * (y == 1)).sum() / occupancy[0],
-                                  EPS, ceiling))
-        if occupancy[1] > EPS:
-            slip = float(np.clip((gamma[:, :, 1] * (y == 0)).sum() / occupancy[1],
-                                 EPS, ceiling))
+        if done.any():      # drop the frozen chains' rows from the next pass
+            keep = ~done[ch]
+            ys, ms, ch = ys[keep], ms[keep], ch[keep]
+            width = int(ms.sum(axis=1).max(initial=0))
+            ys, ms = ys[:, :width], ms[:, :width]
 
-    if not converged:  # the loop ended on the iteration cap, one M-step past `ll`
-        state = bkt_filter(y, mask, prior, learn, guess, slip, forget)
-        ll = float(np.sum(np.log(state["scale"]) * mask))
-
-    return _KCFit(prior=prior, learn=learn, guess=guess, slip=slip, forget=forget,
-                  ll=ll, n_iter=iterations, converged=converged, monotone=monotone,
-                  n_transitions=n_transitions, final_improvement=float(improvement))
+    # A chain that hit the cap broke out before its M-step, so `ll` is the
+    # likelihood of the parameters it carries, same as a converged one.
+    return _ChainFits(prior=prior, learn=learn, guess=guess, slip=slip, forget=forget,
+                      ll=ll, n_iter=n_iter, converged=converged, monotone=monotone,
+                      final_improvement=improvement, at_bound=at_bound)
 
 
-def _fit_one_kc(y: np.ndarray, mask: np.ndarray, *, fit_forget: bool,
-                bound_degenerate: bool, n_restarts: int,
-                rng: np.random.Generator, tol: float,
-                max_iter: int) -> tuple[_KCFit, np.ndarray]:
-    """Run EM from several starting points and keep the best.
+def _run_batch(job: tuple) -> _ChainFits:
+    """One batch of chains, in whichever process it lands."""
+    y, mask, chain, n_chains, init, fit_forget, tol, max_iter = job
+    return _em_chains(y, mask, chain, n_chains, init, fit_forget=fit_forget,
+                      tol=tol, max_iter=max_iter)
 
-    Restart 0 is always :data:`DEFAULT_INIT`, so a single-restart fit is
-    deterministic and reproduces the textbook starting point. The rest are
-    drawn from a seeded generator. Returns the winner and *every* restart's
-    final log-likelihood -- the spread is the only honest statement available
-    about whether this optimum is the optimum.
-    """
-    scores, best = [], None
-    for restart in range(max(1, n_restarts)):
-        init = DEFAULT_INIT if restart == 0 else tuple(rng.uniform(*_RESTART_RANGE, size=5))
-        run = _em(y, mask, init, fit_forget=fit_forget, bound_degenerate=bound_degenerate,
-                  tol=tol, max_iter=max_iter)
-        scores.append(run.ll)
-        if best is None or run.ll > best.ll:
-            best = run
-    return best, np.asarray(scores)
+
+def _worker_count(n_jobs: int | None, n_tasks: int) -> int:
+    """joblib's convention: ``-1`` is every core, ``-2`` all but one."""
+    if n_jobs is None or n_jobs == 0:
+        return 1
+    if n_jobs < 0:
+        n_jobs = (os.cpu_count() or 1) + 1 + n_jobs
+    return max(1, min(n_jobs, n_tasks))
+
+
+def _run_batches(jobs: list[tuple], n_jobs: int | None) -> list[_ChainFits]:
+    workers = _worker_count(n_jobs, len(jobs))
+    if workers == 1:
+        return [_run_batch(job) for job in jobs]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_run_batch, jobs))
 
 
 # ==================================================================================
 # The fitted model
 # ==================================================================================
-
-PARAM_NAMES = ("prior", "learn", "guess", "slip", "forget")
-
 
 @dataclass
 class BKTFit:
@@ -479,7 +593,8 @@ class BKTFit:
     slip: np.ndarray           # (n_kcs,) S
     forget: np.ndarray         # (n_kcs,) F -- all zero unless fitted
     ll: float
-    n_obs: int
+    n_obs: int                 # (row, KC) pairs the fit saw
+    n_rows: int                # source rows among them
     n_seq: int
     n_seq_per_kc: np.ndarray   # (n_kcs,)
     n_transitions: np.ndarray  # (n_kcs,) observed chances to learn or forget
@@ -488,9 +603,10 @@ class BKTFit:
     n_iter: np.ndarray         # (n_kcs,)
     final_improvement: np.ndarray  # (n_kcs,) the last step EM took, in nats
     restart_lls: np.ndarray    # (n_kcs, n_restarts)
+    bound_active: np.ndarray   # (n_kcs,) bool -- G + S < 1 held the final M-step
     has_forget: bool
-    bound_degenerate: bool
     kc_model: str
+    multi_kc: str = "refuse"
     label: str = "BKT"
 
     # -- what exists, and what does not ------------------------------------------
@@ -513,18 +629,29 @@ class BKTFit:
                 if c > 0 and t == 0]
 
     @property
-    def degenerate(self) -> list[str]:
-        """KCs whose fit says guessing beats knowing (``G + S >= 1``).
+    def at_bound(self) -> list[str]:
+        """KCs whose fit sits on the ``G + S = 1`` boundary.
 
-        A documented failure mode of unconstrained BKT (Baker, Corbett & Aleven
-        2008): the likelihood is happy, but the fitted "knowledge" state is
-        anti-correlated with correctness and the parameters no longer mean what
-        their names say. Flagged rather than silently repaired; pass
-        ``bound_degenerate=True`` to :func:`fit_bkt` to keep the fit out of that
-        region instead.
+        The fitter holds every KC to ``G + S < 1``, so that "known" is the
+        state more likely to answer correctly. A KC listed here is one where
+        the unconstrained M-step wanted to cross that line -- the data prefer
+        the label swap -- and the constrained fit landed on it, where the two
+        states predict alike and BKT reduces to the KC's base rate. Not a
+        repaired estimate: a finding that BKT's story does not fit this KC.
         """
-        total = self.guess + self.slip
-        return [n for n, t in zip(self.kc_names, total) if np.isfinite(t) and t >= 1.0]
+        return [n for n, hit in zip(self.kc_names, self.bound_active) if hit]
+
+    @property
+    def degenerate(self) -> list[str]:
+        """KCs with ``G > 0.5`` or ``S > 0.5``, Baker, Corbett & Aleven's (2008) criterion.
+
+        Weaker than :attr:`at_bound` and reported separately because it is
+        the criterion the literature screens by: a guess above a half can be
+        legitimate (two-option items), a slip above a half rarely is. The
+        fitter does not act on it.
+        """
+        return [n for n, g, s in zip(self.kc_names, self.guess, self.slip)
+                if np.isfinite(g) and (g > 0.5 or s > 0.5)]
 
     @property
     def n_params(self) -> int:
@@ -592,6 +719,7 @@ class BKTFit:
             "Forget (F)": self.forget,
             "Sequences": self.n_seq_per_kc,
             "Transitions": self.n_transitions,
+            "At Bound": np.asarray(self.bound_active, dtype=bool),
             "Degenerate": [n in set(self.degenerate) for n in self.kc_names],
             "Unestimable": [n in set(self.unestimable) for n in self.kc_names],
             "Restart Spread": self.restart_spread,
@@ -617,8 +745,10 @@ class BKTFit:
         measured = self.restart_spread[np.isfinite(self.restart_spread)]
         spread = float(np.max(measured, initial=0.0))
         fitted = int(np.sum(np.asarray(self.n_seq_per_kc) > 0))
+        n = (f"n = {self.n_obs:,}" if self.n_obs == self.n_rows
+             else f"n = {self.n_obs:,} (step, KC) pairs over {self.n_rows:,} steps")
         lines = [
-            (f"{self.label} | n = {self.n_obs:,} | params = {self.n_params:,} | "
+            (f"{self.label} | {n} | params = {self.n_params:,} | "
              f"{fitted} KC(s), {self.n_seq:,} sequence(s)"),
             f"  log-likelihood {self.ll:12.4f}",
             f"  AIC            {self.aic:12.4f}",
@@ -638,12 +768,38 @@ class BKTFit:
         if self.unestimable:
             lines.append(f"  unestimable    {len(self.unestimable)} KC(s) never practised "
                          f"twice — no learn rate: {', '.join(self.unestimable[:4])}")
+        if self.at_bound:
+            lines.append(f"  at bound       {len(self.at_bound)} KC(s) held at G + S = 1, "
+                         f"where knowing makes no difference: {', '.join(self.at_bound[:4])}")
         if self.degenerate:
-            lines.append(f"  degenerate     {len(self.degenerate)} KC(s) with G + S >= 1: "
-                         f"{', '.join(self.degenerate[:4])}")
+            lines.append(f"  degenerate     {len(self.degenerate)} KC(s) with G > 0.5 or "
+                         f"S > 0.5: {', '.join(self.degenerate[:4])}")
         return "\n".join(lines)
 
     # -- prediction ---------------------------------------------------------------
+
+    def _filter(self, sequences: Sequences) -> tuple[dict, np.ndarray]:
+        """Run the recursion over every sequence with a fitted KC, at once."""
+        if list(sequences.kc_names) != list(self.kc_names):
+            raise ValueError(
+                f"The fit covers {len(self.kc_names)} KCs and these sequences carry "
+                f"{len(sequences.kc_names)} — they come from different KC models."
+            )
+        k = sequences.kc_of_seq
+        usable = np.isfinite(self.prior[k]) if k.size else np.zeros(0, dtype=bool)
+        k = k[usable]
+        state = bkt_filter(sequences.y[usable], sequences.mask[usable], self.prior[k],
+                           self.learn[k], self.guess[k], self.slip[k], self.forget[k])
+        return state, usable
+
+    def _per_row(self, sequences: Sequences, values: np.ndarray,
+                 usable: np.ndarray) -> np.ndarray:
+        """Sequence-space values back onto source rows, averaged where a row recurs."""
+        mask = sequences.mask[usable]
+        rows = sequences.rows[usable][mask]
+        total = np.bincount(rows, weights=values[mask], minlength=sequences.n_source_rows)
+        count = np.bincount(rows, minlength=sequences.n_source_rows)
+        return np.where(count > 0, total / np.maximum(count, 1), np.nan)
 
     def predict_proba(self, sequences: Sequences) -> np.ndarray:
         """One-step-ahead ``P(correct)`` per source row, ``NaN`` where unpredictable.
@@ -652,50 +808,24 @@ class BKTFit:
         same sequence, which is what a BKT prediction is. Note the consequence
         for cross-validation: a held-out response is still predicted using its
         own student's earlier responses, including ones that were in the
-        training split. That is pyBKT's convention and the only one the model
-        admits -- a filter has no way to predict a mid-sequence response
-        without the history that precedes it -- but it means BKT's held-out
-        score is not measuring the same independence a design-matrix model's
-        is. What is held out is the *parameter estimation*, not the history.
+        training split. That is both references' convention and the only one
+        the model admits -- a filter has no way to predict a mid-sequence
+        response without the history that precedes it -- but it means BKT's
+        held-out score is not measuring the same independence a design-matrix
+        model's is. What is held out is the *parameter estimation*, not the
+        history.
+
+        A row that appears in several sequences (``multi_kc="replicate"``)
+        gets the mean of its KCs' predictions, as LearnSphere's component
+        reports it.
         """
-        if list(sequences.kc_names) != list(self.kc_names):
-            raise ValueError(
-                f"The fit covers {len(self.kc_names)} KCs and these sequences carry "
-                f"{len(sequences.kc_names)} — they come from different KC models."
-            )
-        out = np.full(sequences.n_source_rows, np.nan)
-        for k in range(len(self.kc_names)):
-            selected = sequences.kc_of_seq == k
-            if not selected.any() or not np.isfinite(self.prior[k]):
-                continue
-            mask = sequences.mask[selected]
-            width = int(mask.sum(axis=1).max(initial=0))
-            if width == 0:
-                continue
-            mask = mask[:, :width]
-            state = bkt_filter(sequences.y[selected][:, :width], mask,
-                               self.prior[k], self.learn[k], self.guess[k],
-                               self.slip[k], self.forget[k])
-            out[sequences.rows[selected][:, :width][mask]] = state["p_correct"][mask]
-        return out
+        state, usable = self._filter(sequences)
+        return self._per_row(sequences, state["p_correct"], usable)
 
     def mastery(self, sequences: Sequences) -> np.ndarray:
         """``P(known)`` before each response, per source row. ``NaN`` where unpredictable."""
-        out = np.full(sequences.n_source_rows, np.nan)
-        for k in range(len(self.kc_names)):
-            selected = sequences.kc_of_seq == k
-            if not selected.any() or not np.isfinite(self.prior[k]):
-                continue
-            mask = sequences.mask[selected]
-            width = int(mask.sum(axis=1).max(initial=0))
-            if width == 0:
-                continue
-            mask = mask[:, :width]
-            state = bkt_filter(sequences.y[selected][:, :width], mask,
-                               self.prior[k], self.learn[k], self.guess[k],
-                               self.slip[k], self.forget[k])
-            out[sequences.rows[selected][:, :width][mask]] = state["predicted"][:, :, 1][mask]
-        return out
+        state, usable = self._filter(sequences)
+        return self._per_row(sequences, state["predicted"][:, :, 1], usable)
 
     def brier(self, sequences: Sequences, y) -> float:
         """Mean squared error on the probability scale, over predictable rows."""
@@ -720,7 +850,7 @@ class BKTFit:
                 "This StepData does not carry its source table, so there is nothing to "
                 "annotate. Build it with load_student_step() or from_frame()."
             )
-        sequences = extract_sequences(data)
+        sequences = extract_sequences(data, multi_kc=self.multi_kc)
         if sequences.n_source_rows != len(data):
             raise ValueError("The sequences and the data describe different files.")
 
@@ -739,26 +869,56 @@ class BKTFit:
 # The fitter
 # ==================================================================================
 
-def fit_bkt(sequences: Sequences, *, forget: bool = False,
-            bound_degenerate: bool = False, n_restarts: int = 1,
+def _feasible_start(rng: np.random.Generator) -> np.ndarray:
+    """A random starting point with ``G + S < 1``, redrawn until it is."""
+    while True:
+        start = rng.uniform(*_RESTART_RANGE, size=5)
+        if start[2] + start[3] < 1.0 - EPS:
+            return start
+
+
+def _batches(sequences: Sequences, n_restarts: int) -> list[list[int]]:
+    """KCs grouped so that one forward-backward pass stays under :data:`BATCH_CELLS`.
+
+    KCs are sorted by their longest sequence first, so a batch pads its rows
+    to a length its members nearly fill rather than to the longest KC in the
+    data. A KC too big for the budget on its own gets a batch of its own.
+    """
+    lengths = sequences.lengths
+    n_kcs = len(sequences.kc_names)
+    longest = np.zeros(n_kcs, dtype=int)
+    np.maximum.at(longest, sequences.kc_of_seq, lengths)
+    n_seq = np.bincount(sequences.kc_of_seq, minlength=n_kcs)
+
+    batches, current, rows = [], [], 0
+    for k in sorted(np.flatnonzero(n_seq > 0), key=lambda k: (longest[k], k)):
+        cells = (rows + n_seq[k]) * n_restarts * longest[k]
+        if current and cells > BATCH_CELLS:
+            batches.append(current)
+            current, rows = [], 0
+        current.append(int(k))
+        rows += int(n_seq[k])
+    if current:
+        batches.append(current)
+    return batches
+
+
+def fit_bkt(sequences: Sequences, *, forget: bool = False, n_restarts: int = 1,
             seed: int | None = 0, tol: float = DEFAULT_TOL,
-            max_iter: int = DEFAULT_MAX_ITER, warn_not_converged: bool = True,
-            warn_degenerate: bool = True) -> BKTFit:
-    """Fit BKT by expectation-maximization, one independent chain per KC.
+            max_iter: int = DEFAULT_MAX_ITER, n_jobs: int | None = 1,
+            warn_not_converged: bool = True, warn_at_bound: bool = True) -> BKTFit:
+    """Fit BKT by expectation-maximization, one independent chain per KC and restart.
 
     Every parameter is per-KC and no KC's data touches another's, so this is
-    ``n_kcs`` separate Baum-Welch runs and the total log-likelihood is their
-    sum. That is also why a bad KC cannot contaminate a good one: a degenerate
-    or unestimable KC is flagged on its own row.
+    ``n_kcs * n_restarts`` separate Baum-Welch runs and the total
+    log-likelihood is the sum of each KC's best. The runs are batched through
+    one vectorized forward-backward pass and the batches spread over
+    ``n_jobs`` processes; neither changes any number. Every KC is held to
+    ``G + S < 1`` -- see the module docstring and :attr:`BKTFit.at_bound`.
 
     :param forget: fit a forgetting probability ``F``. Classical BKT pins it at
         0, which is the default; a model being compared against one with an
         explicit forgetting mechanism should be allowed it.
-    :param bound_degenerate: keep ``G`` and ``S`` at or below 0.5 so that
-        ``G + S < 1`` holds by construction. Off by default because the
-        reference implementations fit unconstrained, and because a bound that
-        binds is more honestly reported as :attr:`BKTFit.degenerate` than
-        hidden inside the fit.
     :param n_restarts: EM runs per KC. Restart 0 always starts from
         :data:`DEFAULT_INIT`, so ``n_restarts=1`` is deterministic and ignores
         ``seed``; further restarts are drawn from ``seed``. BKT's likelihood is
@@ -767,10 +927,13 @@ def fit_bkt(sequences: Sequences, *, forget: bool = False,
         not make the problem unimodal, only unmeasured.
     :param seed: seeds the random restarts. Fixed at 0 rather than ``None`` so
         that a multi-restart fit is reproducible unless you ask otherwise.
+    :param n_jobs: worker processes to run EM batches in, ``-1`` for every
+        core. The result does not depend on it.
     :param warn_not_converged: warn when some KC's EM stops on the iteration cap.
-    :param warn_degenerate: warn when some KC fits ``G + S >= 1``.
+    :param warn_at_bound: warn when some KC is held at ``G + S = 1``.
     """
     n_kcs = len(sequences.kc_names)
+    restarts = max(1, int(n_restarts))
     root = np.random.default_rng(seed)
     streams = root.spawn(n_kcs) if n_kcs else []
 
@@ -779,42 +942,66 @@ def fit_bkt(sequences: Sequences, *, forget: bool = False,
     guess = np.full(n_kcs, np.nan)
     slip = np.full(n_kcs, np.nan)
     forgetting = np.full(n_kcs, np.nan)
-    n_seq_per_kc = np.zeros(n_kcs, dtype=int)
+    n_seq_per_kc = np.bincount(sequences.kc_of_seq, minlength=n_kcs) if n_kcs else np.zeros(0, int)
     n_transitions = np.zeros(n_kcs, dtype=int)
+    if n_kcs:
+        np.add.at(n_transitions, sequences.kc_of_seq, sequences.mask[:, 1:].sum(axis=1))
     converged = np.ones(n_kcs, dtype=bool)
     monotone = np.ones(n_kcs, dtype=bool)
     n_iter = np.zeros(n_kcs, dtype=int)
     final_improvement = np.zeros(n_kcs)
-    restart_lls = np.full((n_kcs, max(1, n_restarts)), np.nan)
-    total_ll = 0.0
+    restart_lls = np.full((n_kcs, restarts), np.nan)
+    bound_active = np.zeros(n_kcs, dtype=bool)
 
+    # Starting points are drawn per KC from its own stream, in KC order, so
+    # they do not depend on how the KCs are later batched.
+    inits = np.full((n_kcs, restarts, 5), np.nan)
     for k in range(n_kcs):
-        y, mask = sequences.for_kc(k)
-        n_seq_per_kc[k] = y.shape[0]
-        if y.shape[0] == 0 or not mask.any():
-            # No data: leave the parameters NaN. A zero here would read as a
-            # fitted probability of zero, which is a claim, not a gap.
-            continue
-        best, scores = _fit_one_kc(y, mask, fit_forget=forget,
-                                   bound_degenerate=bound_degenerate,
-                                   n_restarts=n_restarts, rng=streams[k],
-                                   tol=tol, max_iter=max_iter)
-        prior[k], learn[k] = best.prior, best.learn
-        guess[k], slip[k], forgetting[k] = best.guess, best.slip, best.forget
-        n_transitions[k] = best.n_transitions
-        converged[k], monotone[k], n_iter[k] = best.converged, best.monotone, best.n_iter
-        final_improvement[k] = best.final_improvement
-        restart_lls[k, :len(scores)] = scores
-        total_ll += best.ll
+        if n_seq_per_kc[k] == 0:
+            continue   # no data: parameters stay NaN, a gap rather than a claim
+        inits[k, 0] = DEFAULT_INIT
+        for r in range(1, restarts):
+            inits[k, r] = _feasible_start(streams[k])
 
+    jobs = []
+    batches = _batches(sequences, restarts)
+    for members in batches:
+        local = np.full(n_kcs, -1, dtype=int)
+        local[members] = np.arange(len(members))
+        selected = local[sequences.kc_of_seq] >= 0
+        mask = sequences.mask[selected]
+        width = max(int(mask.sum(axis=1).max(initial=0)), 1)
+        y, mask = sequences.y[selected][:, :width], mask[:, :width]
+        kc_local = local[sequences.kc_of_seq[selected]]
+        # Restart r of KC k is chain k*R + r; its rows are a copy of k's rows.
+        y = np.repeat(y[None], restarts, axis=0).reshape(-1, width)
+        mask = np.repeat(mask[None], restarts, axis=0).reshape(-1, width)
+        chain = (kc_local[None, :] * restarts + np.arange(restarts)[:, None]).reshape(-1)
+        init = inits[members].reshape(-1, 5)
+        jobs.append((y, mask, chain, len(members) * restarts, init, forget, tol, max_iter))
+
+    for members, result in zip(batches, _run_batches(jobs, n_jobs)):
+        for i, k in enumerate(members):
+            chains = np.arange(i * restarts, (i + 1) * restarts)
+            restart_lls[k] = result.ll[chains]
+            best = int(chains[np.argmax(result.ll[chains])])
+            prior[k], learn[k] = result.prior[best], result.learn[best]
+            guess[k], slip[k], forgetting[k] = (result.guess[best], result.slip[best],
+                                                result.forget[best])
+            converged[k], monotone[k] = result.converged[best], result.monotone[best]
+            n_iter[k], final_improvement[k] = result.n_iter[best], result.final_improvement[best]
+            bound_active[k] = result.at_bound[best]
+
+    fitted = n_seq_per_kc > 0
     fit = BKTFit(
         kc_names=list(sequences.kc_names), prior=prior, learn=learn, guess=guess,
-        slip=slip, forget=forgetting, ll=float(total_ll), n_obs=sequences.n_obs,
-        n_seq=len(sequences), n_seq_per_kc=n_seq_per_kc, n_transitions=n_transitions,
-        converged=converged, monotone=monotone, n_iter=n_iter,
-        final_improvement=final_improvement, restart_lls=restart_lls,
-        has_forget=forget, bound_degenerate=bound_degenerate,
-        kc_model=sequences.kc_model,
+        slip=slip, forget=forgetting,
+        ll=float(restart_lls[fitted].max(axis=1).sum()) if fitted.any() else 0.0,
+        n_obs=sequences.n_obs, n_rows=sequences.n_rows, n_seq=len(sequences),
+        n_seq_per_kc=n_seq_per_kc, n_transitions=n_transitions, converged=converged,
+        monotone=monotone, n_iter=n_iter, final_improvement=final_improvement,
+        restart_lls=restart_lls, bound_active=bound_active, has_forget=forget,
+        kc_model=sequences.kc_model, multi_kc=sequences.multi_kc,
     )
 
     if warn_not_converged and not converged.all():
@@ -822,12 +1009,12 @@ def fit_bkt(sequences: Sequences, *, forget: bool = False,
             f"EM hit the {max_iter}-iteration cap on {int((~converged).sum())} of "
             f"{n_kcs} KC(s); their parameters are wherever it stopped. Raise max_iter "
             "or loosen tol.", RuntimeWarning, stacklevel=2)
-    if warn_degenerate and fit.degenerate:
+    if warn_at_bound and fit.at_bound:
         warnings.warn(
-            f"{len(fit.degenerate)} KC(s) fitted G + S >= 1, where 'known' is the state "
-            f"that predicts failure: {', '.join(fit.degenerate[:4])}. The likelihood is "
-            "fine; the parameter names are not. Pass bound_degenerate=True to exclude "
-            "that region.", RuntimeWarning, stacklevel=2)
+            f"{len(fit.at_bound)} KC(s) held at G + S = 1, where the data prefer a fit in "
+            f"which 'known' predicts failure: {', '.join(fit.at_bound[:4])}. For these the "
+            "fitted BKT is the KC's base rate; see BKTFit.at_bound.",
+            RuntimeWarning, stacklevel=2)
     if not monotone.all():
         warnings.warn(
             f"EM decreased the log-likelihood on {int((~monotone).sum())} KC(s). EM is "
@@ -836,14 +1023,15 @@ def fit_bkt(sequences: Sequences, *, forget: bool = False,
     return fit
 
 
-def bkt_from_data(data: StepData, **kwargs) -> tuple[Sequences, BKTFit]:
+def bkt_from_data(data: StepData, *, multi_kc: str = "refuse",
+                  **kwargs) -> tuple[Sequences, BKTFit]:
     """Reshape and fit in one call, returning both halves.
 
     The sequences come back because everything downstream of the fit needs them
     -- :meth:`BKTFit.predict_proba`, :meth:`BKTFit.rmse` and cross-validation
     all take sequences, not a ``StepData``.
     """
-    sequences = extract_sequences(data)
+    sequences = extract_sequences(data, multi_kc=multi_kc)
     return sequences, fit_bkt(sequences, **kwargs)
 
 
@@ -866,39 +1054,64 @@ def _restrict(sequences: Sequences, keep: np.ndarray) -> Sequences:
     scheme, not only ``student_blocked``.
     """
     keep = np.asarray(keep, dtype=bool)
-    live = sequences.mask
-    y_by_row = np.zeros(sequences.n_source_rows, dtype=np.int8)
-    y_by_row[sequences.rows[live]] = sequences.y[live]
-
-    surviving, kept = [], []
-    for s in range(len(sequences)):
-        rows = sequences.rows[s][live[s]]
-        rows = rows[keep[rows]]
-        if rows.size:
-            surviving.append(s)
-            kept.append(rows)
-
-    width = max((len(r) for r in kept), default=1)
+    live = sequences.mask & keep[np.where(sequences.mask, sequences.rows, 0)]
+    lengths = live.sum(axis=1)
+    surviving = np.flatnonzero(lengths > 0)
+    width = max(int(lengths.max(initial=0)), 1)
     n = len(surviving)
+
     y = np.zeros((n, width), dtype=np.int8)
     mask = np.zeros((n, width), dtype=bool)
     rows_out = np.full((n, width), -1, dtype=int)
-    for i, rows in enumerate(kept):
-        y[i, :len(rows)] = y_by_row[rows]
-        mask[i, :len(rows)] = True
-        rows_out[i, :len(rows)] = rows
+    # Kept responses slide left within their row; their order is unchanged.
+    seq, _ = np.nonzero(live[surviving])
+    position = np.arange(len(seq)) - np.repeat(np.cumsum(lengths[surviving]) - lengths[surviving],
+                                               lengths[surviving])
+    y[seq, position] = sequences.y[surviving][live[surviving]]
+    mask[seq, position] = True
+    rows_out[seq, position] = sequences.rows[surviving][live[surviving]]
 
     return Sequences(y=y, mask=mask, rows=rows_out,
                      kc_of_seq=sequences.kc_of_seq[surviving],
                      students=[sequences.students[i] for i in surviving],
                      kc_names=sequences.kc_names, kc_model=sequences.kc_model,
-                     n_source_rows=sequences.n_source_rows)
+                     n_source_rows=sequences.n_source_rows, multi_kc=sequences.multi_kc)
+
+
+_WORKER: dict = {}
+
+
+def _init_fold_worker(full: Sequences, y: np.ndarray, fit_kwargs: dict) -> None:
+    _WORKER.update(full=full, y=y, fit_kwargs=fit_kwargs)
+
+
+def _score_fold(job: tuple) -> dict:
+    """Refit on one training split and score its held-out rows. Runs in a worker."""
+    index, test_idx = job
+    full, y, fit_kwargs = _WORKER["full"], _WORKER["y"], _WORKER["fit_kwargs"]
+    keep = np.ones(full.n_source_rows, dtype=bool)
+    keep[test_idx] = False
+    fit = fit_bkt(_restrict(full, keep), n_jobs=1, warn_not_converged=False,
+                  warn_at_bound=False, **fit_kwargs)
+    predicted = fit.predict_proba(full)[test_idx]
+
+    # A held-out row whose KC never appeared in training has no parameters to
+    # be predicted from. Counted, not quietly imputed — the same role
+    # ``unseen_column_fraction`` plays for a design.
+    unseen = ~np.isfinite(predicted)
+    residual = y[test_idx][~unseen] - predicted[~unseen]
+    return {"fold": index, "n_train": int(keep.sum()), "n_test": len(test_idx),
+            "resid": residual,
+            "rmse": float(np.sqrt(np.mean(residual ** 2))) if residual.size else float("nan"),
+            "unseen_column_fraction": float(unseen.mean()),
+            "converged": bool(np.all(fit.converged))}
 
 
 def cross_validate_bkt(data: StepData, *, scheme: str = "student_blocked",
                        n_folds: int = 3, seed: int | None = None,
                        convention: str = "per_fold", restart_seed: int | None = 0,
-                       **fit_kwargs):
+                       multi_kc: str = "refuse", n_jobs: int | None = 1,
+                       **fit_kwargs) -> CVResult:
     """Refit BKT on each training split and score the held-out rows.
 
     Returns a :class:`~leapfit.crossval.CVResult`, so a BKT row sits in the same
@@ -925,46 +1138,45 @@ def cross_validate_bkt(data: StepData, *, scheme: str = "student_blocked",
         collapsing them would tie a model's held-out score to the partition it
         was scored on through the optimizer, and a change in folds would then
         move the number for two reasons at once.
+    :param multi_kc: passed to :func:`extract_sequences`.
+    :param n_jobs: worker processes to fit folds in, ``-1`` for every core.
+        Folds are drawn in the parent and collected in order, so the result
+        does not depend on it.
     :param fit_kwargs: passed to :func:`fit_bkt` (``forget``, ``n_restarts``, ...).
     """
-    from leapfit.crossval import CONVENTIONS, CVResult, FoldResult, make_folds
-
     if convention not in CONVENTIONS:
         raise ValueError(f"convention must be one of {CONVENTIONS}, got {convention!r}")
 
-    full = extract_sequences(data)
+    full = extract_sequences(data, multi_kc=multi_kc)
     y = np.asarray(data.y, dtype=float)
     folds = make_folds(data, scheme, n_folds, seed, convention)
-
-    results, residuals = [], []
     for index, test_idx in enumerate(folds):
-        keep = np.ones(len(data), dtype=bool)
-        keep[test_idx] = False
-        if not keep.any() or len(test_idx) == 0:
+        if len(test_idx) == 0 or len(test_idx) == len(data):
             raise ValueError(
-                f"Fold {index} is degenerate: {int(keep.sum())} train / {len(test_idx)} test")
+                f"Fold {index} is degenerate: {len(data) - len(test_idx)} train / "
+                f"{len(test_idx)} test")
 
-        fit = fit_bkt(_restrict(full, keep), seed=restart_seed,
-                      warn_not_converged=False, warn_degenerate=False, **fit_kwargs)
-        predicted = fit.predict_proba(full)[test_idx]
-
-        # A held-out row whose KC never appeared in training has no parameters to
-        # be predicted from. Counted, not quietly imputed — the same role
-        # ``unseen_column_fraction`` plays for a design.
-        unseen = ~np.isfinite(predicted)
-        scored = ~unseen
-        residual = y[test_idx][scored] - predicted[scored]
-        residuals.append(residual)
-        results.append(FoldResult(
-            fold=index, n_train=int(keep.sum()), n_test=len(test_idx),
-            rmse=float(np.sqrt(np.mean(residual ** 2))) if residual.size else float("nan"),
-            unseen_column_fraction=float(unseen.mean()),
-            converged=bool(np.all(fit.converged))))
-
-    if convention == "per_fold":
-        rmse = float(np.mean([f.rmse for f in results]))
+    jobs = [(index, np.asarray(test_idx)) for index, test_idx in enumerate(folds)]
+    fit_kwargs = {"seed": restart_seed, **fit_kwargs}
+    workers = _worker_count(n_jobs, len(jobs))
+    if workers == 1:
+        try:
+            _init_fold_worker(full, y, fit_kwargs)
+            scored = [_score_fold(job) for job in jobs]
+        finally:
+            _WORKER.clear()
     else:
-        pooled = np.concatenate(residuals)
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_fold_worker,
+                                 initargs=(full, y, fit_kwargs)) as pool:
+            scored = list(pool.map(_score_fold, jobs))
+
+    results = tuple(FoldResult(fold=s["fold"], n_train=s["n_train"], n_test=s["n_test"],
+                               rmse=s["rmse"], unseen_column_fraction=s["unseen_column_fraction"],
+                               converged=s["converged"]) for s in scored)
+    if convention == "per_fold":
+        rmse = float(np.mean([s["rmse"] for s in scored]))
+    else:
+        pooled = np.concatenate([s["resid"] for s in scored])
         rmse = float(np.sqrt(np.mean(pooled ** 2)))
     return CVResult(scheme=scheme, convention=convention, n_folds=n_folds,
-                    seed=seed, rmse=rmse, folds=tuple(results))
+                    seed=seed, rmse=rmse, folds=results)

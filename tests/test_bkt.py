@@ -1,7 +1,7 @@
 """Tests for Bayesian Knowledge Tracing.
 
 BKT is the first non-logistic family in the package, so it shares none of the
-solver machinery the other tests exercise and has to pin its own. Three groups
+solver machinery the other tests exercise and has to pin its own. Four groups
 carry the weight:
 
 * **the recursion is BKT** — predict / update / transition checked step for step
@@ -10,14 +10,17 @@ carry the weight:
   makes the latent observable; mastery is monotone under correct responses
   when forgetting is off, and can fall when it is on);
 * **EM maximizes what it claims to** — monotone by construction, and landing
-  where a bounded multi-start direct optimizer on the same likelihood lands.
-  ``test_forget_is_not_pinned_at_zero`` is a regression: ``F = 0`` is an
-  absorbing fixed point of its own M-step, so an implementation that starts it
-  there makes ``forget=True`` silently identical to classical BKT while still
-  charging a parameter for it;
+  where a bounded multi-start direct optimizer on the same likelihood lands,
+  under the same ``G + S < 1`` constraint. ``test_forget_is_not_pinned_at_zero``
+  is a regression: ``F = 0`` is an absorbing fixed point of its own M-step, so
+  an implementation that starts it there makes ``forget=True`` silently
+  identical to classical BKT while still charging a parameter for it;
+* **batching changes no number** — a chain's fit is the same whether it runs
+  alone, beside other KCs, beside its own restarts, in one batch or several,
+  in one process or many;
 * **the honest-statistics contract holds** — a parameter with no data behind it
-  is not counted and not printed as a number, degeneracy is flagged rather than
-  hidden, and padding is inert.
+  is not counted and not printed as a number, a KC held at the constraint is
+  named, the multi-KC convention is refused unless chosen, and padding is inert.
 """
 
 from __future__ import annotations
@@ -32,10 +35,14 @@ from scipy.optimize import minimize
 from leapfit import from_frame, load_student_step
 from leapfit.bkt import (
     DEFAULT_INIT,
+    EPS,
     BKTFit,
     Sequences,
+    _identified,
+    _restrict,
     bkt_filter,
     bkt_from_data,
+    cross_validate_bkt,
     extract_sequences,
     fit_bkt,
 )
@@ -89,6 +96,16 @@ def _simulate_bkt(n_students=30, n_reps=12, seed=3, truth=None):
     return from_frame(_rollup(rows), kc_model="M")
 
 
+def _two_kc_rows():
+    """Six students, steps tagged with one KC or two, in practice order."""
+    rows = []
+    for i in range(6):
+        rows.append(_row(f"s{i}", "x", i % 2, "A~~B", "1~~1"))
+        rows.append(_row(f"s{i}", "y", 1, "A", 2))
+        rows.append(_row(f"s{i}", "z", (i + 1) % 2, "B~~A", "2~~3"))
+    return rows
+
+
 @pytest.fixture(scope="module")
 def example():
     return load_student_step("examples/student-step.txt", kc_model="Topics")
@@ -99,26 +116,38 @@ def simulated():
     return _simulate_bkt()
 
 
-def _direct_optimum(y, mask, *, fit_forget, ceiling=1.0 - 1e-9, n_starts=12, seed=0):
+def _direct_optimum(y, mask, *, fit_forget, n_starts=12, seed=0):
     """Best log-likelihood a bounded multi-start L-BFGS-B finds on the same objective.
 
-    Twelve starts on a five-parameter problem: verified against 50 during
-    development, which found nothing better on any KC of the shipped example.
-    The assertion tolerance is 1e-3 against observed gaps of ~1e-5, so the
-    margin absorbs a start that lands badly.
+    The ``G + S < 1`` constraint is a box after reparameterizing
+    ``S = u (1 - EPS - G)`` with ``u`` in ``(0, 1)``, so the quasi-Newton
+    search covers exactly the region EM is held to. Twelve starts on a
+    five-parameter problem: verified against 50 during development, which found
+    nothing better on any KC of the shipped example. The assertion tolerance is
+    1e-3 against observed gaps of ~1e-5, so the margin absorbs a start that
+    lands badly.
     """
     def nll(p):
+        guess = p[2]
+        slip = p[3] * (1.0 - EPS - guess)
         forget = p[4] if fit_forget else 0.0
-        state = bkt_filter(y, mask, p[0], p[1], p[2], p[3], forget)
+        state = bkt_filter(y, mask, p[0], p[1], guess, slip, forget)
         return -float(np.sum(np.log(state["scale"]) * mask))
 
-    bounds = [(1e-9, 1 - 1e-9)] * 2 + [(1e-9, ceiling)] * 2 + [(1e-9, 1 - 1e-9)]
+    bounds = [(1e-9, 1 - 1e-9)] * 5
     rng = np.random.default_rng(seed)
     best = -np.inf
     for _ in range(n_starts):
-        start = rng.uniform(0.05, min(0.95, ceiling), size=5)
+        start = rng.uniform(0.05, 0.95, size=5)
         best = max(best, -minimize(nll, start, method="L-BFGS-B", bounds=bounds).fun)
     return best
+
+
+def _kc_ll(sequences, fit, k):
+    y, mask = sequences.for_kc(k)
+    state = bkt_filter(y, mask, fit.prior[k], fit.learn[k], fit.guess[k], fit.slip[k],
+                       fit.forget[k])
+    return float(np.sum(np.log(state["scale"]) * mask))
 
 
 # ==========================================================================
@@ -139,6 +168,18 @@ def test_recursion_matches_a_direct_implementation(params, forget):
     # `predicted` is mastery *before* each response, i.e. the trajectory without
     # its final post-transition entry.
     assert state["predicted"][0, :, 1] == pytest.approx(expected_known[:-1], abs=1e-12)
+
+
+def test_per_sequence_parameters_run_each_row_as_its_own_model():
+    """One call with a parameter vector equals one call per row with a scalar."""
+    y = np.array([[1, 0, 1, 1], [0, 0, 1, 0], [1, 1, 1, 1]])
+    mask = np.ones_like(y, dtype=bool)
+    params = np.array(PARAM_SETS)                     # one set per row
+    together = bkt_filter(y, mask, params[:, 0], params[:, 1], params[:, 2], params[:, 3])
+    for i, p in enumerate(PARAM_SETS):
+        alone = bkt_filter(y[i:i + 1], mask[i:i + 1], *p)
+        assert together["p_correct"][i] == pytest.approx(alone["p_correct"][0], abs=0)
+        assert together["scale"][i] == pytest.approx(alone["scale"][0], abs=0)
 
 
 def test_the_two_response_classes_are_a_distribution():
@@ -208,7 +249,7 @@ def test_one_sequence_per_student_kc_pair():
             for s in ("s0", "s1") for kc in ("A", "B") for t in range(3)]
     sequences = extract_sequences(from_frame(_rollup(rows), kc_model="M"))
     assert len(sequences) == 4
-    assert sequences.n_obs == 12
+    assert sequences.n_obs == 12 == sequences.n_rows
     assert sorted(sequences.lengths.tolist()) == [3, 3, 3, 3]
 
 
@@ -218,12 +259,26 @@ def test_rows_map_back_to_the_source_positions(example):
     assert sorted(mapped.tolist()) == list(range(len(example)))
 
 
-def test_multi_kc_steps_are_refused_not_guessed():
-    """The convention is undecided, so it raises rather than picking one."""
-    rows = [_row("s", "x", 1, "A~~B", "1~~1"), _row("s", "y", 0, "A", "2")]
-    data = from_frame(_rollup(rows), kc_model="M")
+def test_multi_kc_steps_are_refused_unless_a_convention_is_chosen():
+    data = from_frame(_rollup(_two_kc_rows()), kc_model="M")
     with pytest.raises(ValueError, match="one KC per step"):
         extract_sequences(data)
+    with pytest.raises(ValueError, match="multi_kc must be one of"):
+        extract_sequences(data, multi_kc="average")
+
+
+def test_replicate_puts_a_step_into_every_kc_it_carries():
+    """LearnSphere's convention: one observation per (step, KC) pair."""
+    data = from_frame(_rollup(_two_kc_rows()), kc_model="M")
+    sequences = extract_sequences(data, multi_kc="replicate")
+
+    assert sequences.n_rows == 18 == len(data)
+    assert sequences.n_obs == 30                      # 12 single-KC + 2 * 6 two-KC... per step
+    assert len(sequences) == 12                        # 6 students x 2 KCs
+    # Each two-KC row appears in exactly two sequences, in its practice position.
+    row0 = np.argwhere(sequences.rows == 0)
+    assert len(row0) == 2 and sorted(sequences.kc_of_seq[row0[:, 0]].tolist()) == [0, 1]
+    assert sequences.multi_kc == "replicate"
 
 
 def test_take_subsets_and_retrims():
@@ -248,24 +303,20 @@ def test_em_is_monotone(simulated, forget):
 
 
 @pytest.mark.parametrize("forget", [False, True])
-@pytest.mark.parametrize("bounded", [False, True])
-def test_em_reaches_what_a_direct_optimizer_reaches(example, forget, bounded):
-    """EM against multi-start L-BFGS-B on the same likelihood, KC by KC.
+def test_em_reaches_what_a_direct_optimizer_reaches(example, forget):
+    """EM against multi-start L-BFGS-B on the same constrained likelihood, KC by KC.
 
     Not a tautology: EM and a quasi-Newton method on the raw objective share
     nothing but the objective, so agreement is evidence the E- and M-steps are
-    the right ones.
+    the right ones — including the M-step's boundary solve.
     """
     sequences = extract_sequences(example)
-    fit = fit_bkt(sequences, forget=forget, bound_degenerate=bounded, n_restarts=10)
-    ceiling = 0.5 if bounded else 1.0 - 1e-9
+    fit = fit_bkt(sequences, forget=forget, n_restarts=10)
 
     for k, name in enumerate(sequences.kc_names):
         y, mask = sequences.for_kc(k)
-        direct = _direct_optimum(y, mask, fit_forget=forget, ceiling=ceiling)
-        state = bkt_filter(y, mask, fit.prior[k], fit.learn[k], fit.guess[k],
-                           fit.slip[k], fit.forget[k])
-        theirs = float(np.sum(np.log(state["scale"]) * mask))
+        direct = _direct_optimum(y, mask, fit_forget=forget)
+        theirs = _kc_ll(sequences, fit, k)
         assert direct - theirs < 1e-3, f"EM stopped {direct - theirs:.4g} nats short on {name}"
 
 
@@ -312,13 +363,6 @@ def test_restarts_never_lose_to_a_single_run(simulated):
     assert np.all(many.restart_spread >= 0)
 
 
-def test_bound_degenerate_keeps_guess_and_slip_below_a_half(simulated):
-    fit = fit_bkt(extract_sequences(simulated), bound_degenerate=True, n_restarts=5)
-    assert np.all(np.nan_to_num(fit.guess) <= 0.5 + 1e-9)
-    assert np.all(np.nan_to_num(fit.slip) <= 0.5 + 1e-9)
-    assert fit.degenerate == []
-
-
 def test_em_recovers_planted_parameters():
     """A long simulation from known parameters is fitted back to them."""
     truth = {"A": (0.15, 0.20, 0.10, 0.08)}
@@ -333,15 +377,131 @@ def test_em_recovers_planted_parameters():
 
 
 # ==========================================================================
+# G + S < 1, always
+# ==========================================================================
+
+def test_the_boundary_m_step_maximizes_q_on_the_line():
+    """Where the free update crosses ``G + S = 1``, the replacement is the best point on it."""
+    a, b, c, d = (np.array([v]) for v in (9.0, 1.0, 8.0, 2.0))   # free: G = 0.9, S = 0.8
+    guess, slip = _identified(a / (a + b), c / (c + d), a, b, c, d)
+    assert guess[0] + slip[0] == pytest.approx(1.0 - EPS, abs=1e-12)
+
+    def q(g, s):
+        return a[0] * np.log(g) + b[0] * np.log(1 - g) + c[0] * np.log(s) + d[0] * np.log(1 - s)
+
+    grid = np.linspace(EPS, 1.0 - 2 * EPS, 200_001)
+    best = max(q(g, 1.0 - EPS - g) for g in grid)
+    assert q(guess[0], slip[0]) >= best - 1e-9
+
+    # A feasible free update is left exactly alone.
+    g0, s0 = np.array([0.2]), np.array([0.1])
+    untouched = _identified(g0, s0, a, b, c, d)
+    assert untouched[0] is g0 and untouched[1] is s0
+
+
+def test_guess_plus_slip_never_reaches_one():
+    """Correct-then-incorrect data want the label swap; the fit may not take it."""
+    rows = [_row(f"s{i}", f"t{t}", 1, "Swap", t + 1) for i in range(6) for t in range(4)]
+    rows += [_row(f"s{i}", f"u{t}", 0, "Swap", t + 5) for i in range(6) for t in range(4)]
+    data = from_frame(_rollup(rows), kc_model="M")
+    sequences = extract_sequences(data)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fit = fit_bkt(sequences, n_restarts=12, seed=4)
+
+    assert np.all(fit.guess + fit.slip < 1.0)
+    # Without the swap the best BKT can do here is the base rate, no better.
+    base = len(data) * np.log(0.5)
+    assert fit.ll <= base + 1e-6
+    if fit.at_bound:    # the ridge is flat, so where EM stops on it is data-dependent
+        assert any("G + S = 1" in str(w.message) for w in caught)
+        assert "at bound" in fit.summary()
+
+
+def test_restarts_start_inside_the_identified_region(simulated):
+    """Every restart's starting point satisfies the constraint; none begins on the swap."""
+    from leapfit.bkt import _feasible_start
+
+    rng = np.random.default_rng(0)
+    starts = np.array([_feasible_start(rng) for _ in range(500)])
+    assert np.all(starts[:, 2] + starts[:, 3] < 1.0)
+    assert np.all((starts > 0.05) & (starts < 0.95))
+
+
+# ==========================================================================
+# Batching changes no number
+# ==========================================================================
+
+def _same_fit(a: BKTFit, b: BKTFit) -> bool:
+    return all(np.array_equal(getattr(a, name), getattr(b, name), equal_nan=True)
+               for name in ("prior", "learn", "guess", "slip", "forget", "restart_lls",
+                            "n_iter", "converged", "bound_active")) and a.ll == b.ll
+
+
+def test_restart_zero_is_the_single_restart_fit(simulated):
+    """Chains are independent: adding restarts beside a chain does not touch it."""
+    sequences = extract_sequences(simulated)
+    one = fit_bkt(sequences, n_restarts=1)
+    many = fit_bkt(sequences, n_restarts=4, seed=3)
+    assert np.array_equal(many.restart_lls[:, 0], one.restart_lls[:, 0])
+
+
+def test_a_kc_fits_the_same_alone_or_beside_others(example):
+    sequences = extract_sequences(example)
+    together = fit_bkt(sequences, n_restarts=2, seed=5)
+    for k, name in enumerate(sequences.kc_names):
+        alone = fit_bkt(sequences.take(np.flatnonzero(sequences.kc_of_seq == k)),
+                        n_restarts=2, seed=5)
+        # `alone` keeps the full vocabulary, so the other KCs are unfitted (NaN).
+        assert alone.restart_lls[k].tolist() == together.restart_lls[k].tolist(), name
+        assert alone.guess[k] == together.guess[k] and alone.slip[k] == together.slip[k]
+
+
+def test_batch_size_does_not_change_the_fit(example, monkeypatch):
+    import leapfit.bkt as module
+
+    sequences = extract_sequences(example)
+    whole = fit_bkt(sequences, n_restarts=3, seed=1)
+    monkeypatch.setattr(module, "BATCH_CELLS", 1)     # every KC in a batch of its own
+    pieces = fit_bkt(sequences, n_restarts=3, seed=1)
+    assert len(module._batches(sequences, 3)) == len(sequences.kc_names)
+    assert _same_fit(whole, pieces)
+
+
+def test_worker_processes_do_not_change_the_fit(example, monkeypatch):
+    import leapfit.bkt as module
+
+    sequences = extract_sequences(example)
+    monkeypatch.setattr(module, "BATCH_CELLS", 1)
+    serial = fit_bkt(sequences, n_restarts=2, seed=1, n_jobs=1)
+    parallel = fit_bkt(sequences, n_restarts=2, seed=1, n_jobs=2)
+    assert _same_fit(serial, parallel)
+
+
+# ==========================================================================
 # The honest-statistics contract
 # ==========================================================================
+
+def _hand_fit(**overrides) -> BKTFit:
+    fields = {
+        "kc_names": ["A", "B"], "prior": np.array([0.3, 0.3]), "learn": np.array([0.1, 0.1]),
+        "guess": np.array([0.2, 0.6]), "slip": np.array([0.1, 0.4 - EPS]),
+        "forget": np.zeros(2), "ll": -1.0, "n_obs": 10, "n_rows": 10, "n_seq": 2,
+        "n_seq_per_kc": np.array([1, 1]), "n_transitions": np.array([1, 1]),
+        "converged": np.ones(2, bool), "monotone": np.ones(2, bool),
+        "n_iter": np.array([1, 1]), "final_improvement": np.zeros(2),
+        "restart_lls": np.zeros((2, 1)), "bound_active": np.array([False, True]),
+        "has_forget": False, "kc_model": "M"}
+    fields.update(overrides)
+    return BKTFit(**fields)
+
 
 def test_a_kc_never_practised_twice_has_no_learn_rate():
     """No transition observed means no learn rate to estimate — and none charged."""
     rows = [_row(f"s{i}", "only", i % 2, "Once", 1) for i in range(8)]
     rows += [_row(f"s{i}", f"rep{t}", 1, "Twice", t + 1) for i in range(8) for t in range(3)]
     sequences = extract_sequences(from_frame(_rollup(rows), kc_model="M"))
-    fit = fit_bkt(sequences, n_restarts=2)
+    fit = fit_bkt(sequences, n_restarts=2, warn_at_bound=False)
 
     assert fit.unestimable == ["Once"]
     # 3 parameters for 'Once' (L0, G, S) + 4 for 'Twice'.
@@ -362,32 +522,21 @@ def test_a_kc_with_no_data_is_unfitted_not_zero():
     assert fit.unfitted == ["NeverSeen"]
     assert np.isnan(fit.prior[-1]), "an unfitted KC must not report 0 as an estimate"
     assert fit.n_params == 4 * (len(ghost.kc_names) - 1)
+    assert np.isnan(fit.restart_lls[-1]).all()
 
 
-def test_degeneracy_is_flagged_rather_than_repaired():
-    """G + S >= 1 means 'known' predicts failure; the flag says so."""
-    fit = BKTFit(kc_names=["A", "B"], prior=np.array([0.3, 0.3]),
-                 learn=np.array([0.1, 0.1]), guess=np.array([0.2, 0.7]),
-                 slip=np.array([0.1, 0.4]), forget=np.zeros(2), ll=-1.0, n_obs=10,
-                 n_seq=2, n_seq_per_kc=np.array([1, 1]), n_transitions=np.array([1, 1]),
-                 converged=np.ones(2, bool), monotone=np.ones(2, bool),
-                 n_iter=np.array([1, 1]), final_improvement=np.zeros(2),
-                 restart_lls=np.zeros((2, 1)), has_forget=False,
-                 bound_degenerate=False, kc_model="M")
-    assert fit.degenerate == ["B"]
+def test_a_kc_held_at_the_bound_is_named():
+    fit = _hand_fit()
+    assert fit.at_bound == ["B"]
+    assert "at bound" in fit.summary()
+    assert fit.params().set_index("KC Name").loc["B", "At Bound"]
+
+
+def test_bakers_degeneracy_is_reported_but_not_acted_on():
+    """``G > 0.5`` or ``S > 0.5`` is flagged for the reader; the fit is not touched."""
+    fit = _hand_fit(bound_active=np.zeros(2, bool))
+    assert fit.degenerate == ["B"] and fit.at_bound == []
     assert "degenerate" in fit.summary()
-
-
-def test_degeneracy_warns_when_it_happens():
-    """A KC answered mostly wrong drives the unconstrained fit into the corner."""
-    rows = [_row(f"s{i}", f"t{t}", 0, "Bad", t + 1) for i in range(6) for t in range(4)]
-    rows += [_row(f"s{i}", f"u{t}", 1, "Bad", t + 5) for i in range(6) for t in range(4)]
-    sequences = extract_sequences(from_frame(_rollup(rows), kc_model="M"))
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        fit = fit_bkt(sequences, n_restarts=12, seed=4)
-    if fit.degenerate:  # data-dependent; when it happens it must be announced
-        assert any("G + S >= 1" in str(w.message) for w in caught)
 
 
 def test_there_is_no_optimality_certificate(example):
@@ -424,6 +573,23 @@ def test_mastery_starts_at_the_prior(example):
         assert mastery[row] == pytest.approx(fit.prior[sequences.kc_of_seq[seq]], abs=1e-12)
 
 
+def test_a_replicated_step_is_predicted_by_the_mean_of_its_kcs():
+    data = from_frame(_rollup(_two_kc_rows()), kc_model="M")
+    sequences, fit = bkt_from_data(data, multi_kc="replicate", n_restarts=2,
+                                   warn_at_bound=False)
+    predicted = fit.predict_proba(sequences)
+    assert predicted.shape == (len(data),) and np.all(np.isfinite(predicted))
+    assert fit.n_obs == 30 and fit.n_rows == 18 and fit.multi_kc == "replicate"
+    assert "(step, KC) pairs" in fit.summary()
+
+    # Row 0 is s0's first step, tagged A and B: the first response in both
+    # sequences, so each KC predicts it from its prior alone.
+    by_kc = [fit.prior[k] * (1 - fit.slip[k]) + (1 - fit.prior[k]) * fit.guess[k]
+             for k in range(2)]
+    assert predicted[0] == pytest.approx(np.mean(by_kc), abs=1e-12)
+    assert len(fit.annotate(data)) == len(data)
+
+
 def test_predicting_with_a_different_kc_model_raises(example):
     _, fit = bkt_from_data(example, n_restarts=1)
     other = extract_sequences(load_student_step("examples/student-step.txt",
@@ -451,7 +617,7 @@ def test_annotate_returns_the_source_table_plus_one_column(example):
 
 def test_fit_statistics_are_self_consistent(example):
     sequences, fit = bkt_from_data(example, n_restarts=2)
-    assert fit.n_obs == len(example)
+    assert fit.n_obs == len(example) == fit.n_rows
     assert fit.aic == pytest.approx(-2 * fit.ll + 2 * fit.n_params)
     assert fit.bic == pytest.approx(-2 * fit.ll + fit.n_params * np.log(fit.n_obs))
     # The reported log-likelihood is the one the filter computes.
@@ -466,7 +632,7 @@ def test_params_frame_covers_every_kc(example):
     frame = fit.params()
     assert list(frame["KC Name"]) == sorted(example.kc_names)
     assert set(frame.columns) >= {"Prior (L0)", "Learn (T)", "Guess (G)", "Slip (S)",
-                                  "Forget (F)", "Degenerate", "Restart Spread"}
+                                  "Forget (F)", "At Bound", "Degenerate", "Restart Spread"}
 
 
 # ==========================================================================
@@ -475,8 +641,6 @@ def test_params_frame_covers_every_kc(example):
 
 @pytest.mark.parametrize("scheme", ["student_blocked", "item_blocked", "unstratified"])
 def test_cross_validation_runs_under_every_scheme(example, scheme):
-    from leapfit.bkt import cross_validate_bkt
-
     result = cross_validate_bkt(example, scheme=scheme, n_folds=3, seed=0, n_restarts=2)
     assert result.n_folds == 3 and len(result.folds) == 3
     assert 0.0 < result.rmse < 1.0
@@ -484,12 +648,19 @@ def test_cross_validation_runs_under_every_scheme(example, scheme):
 
 
 def test_cross_validation_beats_the_base_rate(example):
-    from leapfit.bkt import cross_validate_bkt
-
     base = float(np.sqrt(np.mean((example.y - example.y.mean()) ** 2)))
     result = cross_validate_bkt(example, scheme="student_blocked", n_folds=3,
                                 seed=0, n_restarts=3)
     assert result.rmse < base
+
+
+def test_cross_validation_workers_do_not_change_the_score(example):
+    serial = cross_validate_bkt(example, scheme="student_blocked", n_folds=3, seed=0,
+                                n_restarts=2, n_jobs=1)
+    parallel = cross_validate_bkt(example, scheme="student_blocked", n_folds=3, seed=0,
+                                  n_restarts=2, n_jobs=3)
+    assert serial.rmse == parallel.rmse
+    assert [f.rmse for f in serial.folds] == [f.rmse for f in parallel.folds]
 
 
 def test_the_fold_seed_and_the_restart_seed_are_separate(example):
@@ -499,8 +670,6 @@ def test_the_fold_seed_and_the_restart_seed_are_separate(example):
     scored on *through the optimizer*, so a change of folds would move the
     number for two reasons at once.
     """
-    from leapfit.bkt import cross_validate_bkt
-
     def run(seed, restart_seed):
         return cross_validate_bkt(example, scheme="student_blocked", n_folds=3,
                                   seed=seed, restart_seed=restart_seed, n_restarts=2)
@@ -517,8 +686,6 @@ def test_the_fold_seed_and_the_restart_seed_are_separate(example):
 
 
 def test_restricting_to_a_training_split_closes_the_gaps():
-    from leapfit.bkt import _restrict
-
     rows = [_row("s", f"t{t}", t % 2, "A", t + 1) for t in range(6)]
     sequences = extract_sequences(from_frame(_rollup(rows), kc_model="M"))
     keep = np.array([True, False, True, True, False, True])
@@ -531,8 +698,6 @@ def test_restricting_to_a_training_split_closes_the_gaps():
 
 
 def test_a_sequence_emptied_by_the_split_is_dropped():
-    from leapfit.bkt import _restrict
-
     rows = ([_row("s0", f"a{t}", 1, "A", t + 1) for t in range(3)]
             + [_row("s1", "a0", 0, "A", 1)])
     sequences = extract_sequences(from_frame(_rollup(rows), kc_model="M"))
@@ -543,18 +708,30 @@ def test_a_sequence_emptied_by_the_split_is_dropped():
     assert trimmed.kc_names == sequences.kc_names    # vocabulary is not resized
 
 
+def _two_model_export(tmp_path):
+    """The shipped example plus a KC model that tags every step with two KCs."""
+    frame = pd.read_csv("examples/student-step.txt", sep="\t", dtype=str,
+                        keep_default_na=False)
+    frame["KC (Both)"] = frame["KC (Topics)"] + "~~" + frame["KC (Skills)"]
+    frame["Opportunity (Both)"] = (frame["Opportunity (Topics)"] + "~~"
+                                   + frame["Opportunity (Skills)"])
+    export = tmp_path / "two-models.txt"
+    frame.to_csv(export, sep="\t", index=False)
+    return export
+
+
 def test_the_cli_reports_bkt_columns(tmp_path, capsys):
     from leapfit.cli import main_bkt
 
     out = tmp_path / "bkt.csv"
     code = main_bkt(["examples/student-step.txt", "--kc-model", "Topics",
-                     "--restarts", "2", "--cv", "student_blocked",
+                     "--restarts", "2", "--cv", "student_blocked", "-j", "2",
                      "--out", str(out)])
     assert code == 0
     table = pd.read_csv(out)
     assert list(table["kc_model"]) == ["Topics"]
     assert {"n_params", "log_likelihood", "aic", "bic", "restart_spread",
-            "n_degenerate", "n_unestimable", "cv_rmse"} <= set(table.columns)
+            "n_at_bound", "n_unestimable", "cv_rmse"} <= set(table.columns)
     # No design, so no design-shaped columns pretending otherwise.
     assert "n_aliased" not in table.columns and "is_optimal" not in table.columns
 
@@ -563,17 +740,24 @@ def test_the_cli_skips_a_multi_kc_model_rather_than_failing(tmp_path, capsys):
     """A file with one usable KC model and one multi-KC model still produces a table."""
     from leapfit.cli import main_bkt
 
-    frame = pd.read_csv("examples/student-step.txt", sep="\t", dtype=str,
-                        keep_default_na=False)
-    frame["KC (Both)"] = frame["KC (Topics)"] + "~~" + frame["KC (Skills)"]
-    frame["Opportunity (Both)"] = (frame["Opportunity (Topics)"] + "~~"
-                                   + frame["Opportunity (Skills)"])
-    export = tmp_path / "two-models.txt"
-    frame.to_csv(export, sep="\t", index=False)
-
     out = tmp_path / "bkt.csv"
-    code = main_bkt([str(export), "--kc-model", "Topics", "--kc-model", "Both",
-                     "--restarts", "1", "--cv", "none", "--out", str(out)])
+    code = main_bkt([str(_two_model_export(tmp_path)), "--kc-model", "Topics",
+                     "--kc-model", "Both", "--restarts", "1", "--cv", "none",
+                     "--out", str(out)])
     assert code == 0
     assert list(pd.read_csv(out)["kc_model"]) == ["Topics"]
     assert "skipped" in capsys.readouterr().err
+
+
+def test_the_cli_fits_a_multi_kc_model_when_told_to_replicate(tmp_path, capsys):
+    from leapfit.cli import main_bkt
+
+    out = tmp_path / "bkt.csv"
+    code = main_bkt([str(_two_model_export(tmp_path)), "--kc-model", "Topics",
+                     "--kc-model", "Both", "--multi-kc", "replicate", "--restarts", "1",
+                     "--cv", "none", "--out", str(out)])
+    assert code == 0
+    table = pd.read_csv(out).set_index("kc_model")
+    assert list(table.index) == ["Topics", "Both"]
+    assert table.loc["Both", "n_obs"] == 2 * table.loc["Both", "n_rows"]
+    assert table.loc["Topics", "n_obs"] == table.loc["Topics", "n_rows"]

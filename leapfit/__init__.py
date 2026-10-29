@@ -36,6 +36,8 @@ over the KC model a family conditions on:
     leapfit.pfa       Performance Factors Analysis
     leapfit.lkt       Logistic Knowledge Tracing: components x features, of
                       which AFM and PFA are two specifications
+    leapfit.bkt       Bayesian Knowledge Tracing: a two-state HMM per KC,
+                      fitted by EM — not a design, so it brings its own fitter
     leapfit.lfa       Learning Factors Analysis: a search over KC models,
                       scored by AFM
 """
@@ -47,6 +49,16 @@ from leapfit.afm import (
     AFMFit,
     build_afm_design,
     fit_afm,
+)
+from leapfit.bkt import (
+    MULTI_KC,
+    BKTFit,
+    Sequences,
+    bkt_filter,
+    bkt_from_data,
+    cross_validate_bkt,
+    extract_sequences,
+    fit_bkt,
 )
 from leapfit.crossval import (
     CONVENTIONS,
@@ -125,6 +137,7 @@ __all__ = [
     "LOGITDEC_WINDOW",
     "MERGES",
     "MIN_OPPORTUNITIES",
+    "MULTI_KC",
     "OBJECTIVES",
     "PARAMETER_BOUNDS",
     "PARAMETER_TOLERANCE",
@@ -133,6 +146,7 @@ __all__ = [
     "STUDENT_L2",
     "AFMFit",
     "Aliased",
+    "BKTFit",
     "Block",
     "CVResult",
     "Design",
@@ -147,18 +161,24 @@ __all__ = [
     "PFAFit",
     "Rejected",
     "Separated",
+    "Sequences",
     "StepData",
     "Term",
     "__version__",
     "accumulator_block",
+    "bkt_filter",
+    "bkt_from_data",
     "build_afm_design",
     "build_factor_matrix",
     "build_lkt_design",
     "build_pfa_design",
     "component_labels",
     "cross_validate",
+    "cross_validate_bkt",
     "design_terms",
+    "extract_sequences",
     "fit_afm",
+    "fit_bkt",
     "fit_lkt",
     "fit_lkt_pars",
     "fit_logistic",
