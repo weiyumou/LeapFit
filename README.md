@@ -5,8 +5,9 @@ directly from [DataShop](https://pslcdatashop.web.cmu.edu/) student-step
 exports. Today that is the **Additive Factors Model (AFM)**, **Performance
 Factors Analysis (PFA)** and **Logistic Knowledge Tracing (LKT)** — of which
 the first two turn out to be single specifications — plus **Learning Factors
-Analysis (LFA)**, a search for the KC model itself, scored by AFM. Bayesian
-Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
+Analysis (LFA)**, a search for the KC model itself, scored by AFM, and
+**Bayesian Knowledge Tracing (BKT)**, the one model here that is not a logistic
+regression.
 
 - **One input format.** Every model reads the same six columns of a
   student-step file, so switching model families never means reshaping data.
@@ -16,7 +17,10 @@ Knowledge Tracing (BKT) is on the [roadmap](#roadmap).
   components and validated for equivalence against their output, so results
   stay comparable with numbers DataShop already reports. LKT is validated
   against the published output of the CRAN `LKT` package but written
-  clean-room, because that package is GPL-3.
+  clean-room, because that package is GPL-3. BKT is validated against two
+  references, pyBKT and the `hmm-scalable` C++ tool behind LearnSphere's
+  BKT component, by loading each one's fitted parameters into leapfit's
+  recursion and comparing predictions row by row.
 - **Honest statistics.** Parameter counts equal the rank of the design,
   coefficients with no finite estimate are flagged instead of printed as if
   real, and every fit carries a convergence certificate — checked, not assumed.
@@ -390,6 +394,64 @@ ridged = Design((students, *build_pfa_design(data, identify=False).blocks)).iden
 pfa = fit_pfa(ridged, data.y)
 ```
 
+## BKT differs in four ways that matter
+
+BKT reads the same file and reports the same statistics, but it is a different
+kind of model — a latent state carried along a sequence, not a row of a design
+matrix — and four consequences are worth knowing before a BKT column goes into
+a table next to an AFM one.
+
+```python
+from leapfit import bkt_from_data, cross_validate_bkt
+
+sequences, fit = bkt_from_data(data, n_restarts=5, n_jobs=-1)
+print(fit.summary())                          # ll, AIC, BIC, restart spread, KCs at the bound
+print(fit.kc_values())                        # L0, T, G, S per KC, NaN where unestimable
+print(cross_validate_bkt(data, scheme="student_blocked", n_restarts=5, n_jobs=-1).summary())
+```
+
+or `leapfit-bkt examples/student-step.txt --cv student_blocked -j -1`.
+
+**No optimality certificate.** AFM, PFA and LFA all fit a convex objective, so
+`fit.is_optimal` is a *proof*: the KKT conditions hold, therefore this is the
+global optimum. BKT's likelihood is not concave, and `BKTFit` deliberately has
+no `is_optimal` attribute rather than one that means something weaker under the
+same name. What it has instead is `restart_spread` — the range of final
+log-likelihoods across seeded EM restarts — plus `final_improvement`, the last
+step EM actually took. Both are measurements, not guarantees, and on real data
+the spread is routinely non-zero.
+
+**`G + S < 1`, always.** Unconstrained BKT routinely fits a KC with the labels
+swapped — "known" becomes the state that predicts *failure* — and the
+likelihood often prefers it. Neither reference prevents that. leapfit holds
+every KC to `G + S < 1` inside the M-step, so the parameters mean what their
+names say, and reports the KCs where the constraint had to hold the line in
+`fit.at_bound`: there the data wanted the swap, and the constrained fit is one
+in which knowing the KC makes no difference. That is a finding about the KC,
+printed as one, not a repaired estimate.
+
+**Held-out means something narrower.** `cross_validate_bkt` removes held-out
+responses from the sequences EM sees, so they contribute nothing to any
+parameter. But it then predicts them by running the filter over the full
+sequence, which means a mid-sequence held-out response is still predicted from
+its own student's earlier responses. That is not a leak of the response being
+scored — no filter can predict a mid-sequence response without the history
+before it — but it is weaker independence than a design gets from the same
+fold. `student_blocked` is the default for exactly that reason: a held-out
+student contributes no history to anyone, so it is the one scheme where BKT's
+held-out score means what it looks like.
+
+**Multi-KC steps are refused unless you choose a convention.** A DataShop step
+may carry several `~~`-separated KCs, which AFM absorbs additively. BKT is
+defined on one skill and has no additive form. By default `extract_sequences`
+raises and names the offending rows, and `leapfit-bkt` skips the KC model,
+because the available conventions change `N` and therefore AIC/BIC.
+`multi_kc="replicate"` (`--multi-kc replicate`) applies LearnSphere's: each
+(step, KC) pair is one observation in that KC's sequence and a step's
+prediction is the mean of its KCs'. `N` is then the number of pairs, which the
+fit reports as `n_obs` beside `n_rows`, so the inflation is visible wherever
+the statistics are.
+
 ## Roadmap
 
 | model | state | notes |
@@ -399,7 +461,7 @@ pfa = fit_pfa(ridged, data.y)
 | **LFA** | shipped | a search over KC models rather than a model: greedy best-first on AFM's BIC or AIC, reproducing the reference's fit statistics to 1e-9. Every candidate move is screened for estimability and evidence — the reference's own selection contained a KC whose slope has no finite estimate, and that one move then appeared in all 99 states it reported — and the top states are validated out of sample on identical folds |
 | **LKT** | shipped | components x features, of which AFM and PFA are single specifications — both identities are pinned by tests. Thirty-one features over any component the export carries: prior counts, decayed outcome histories, recency, power-law forgetting, and the two four-parameter spacing models (`base4`, `ppe`), each parametric one held at the values you pass or fitted. Validated against the reference's own published output — the CRAN package's precompiled vignette prints the log-likelihood of each model it fits — on **four** of its chunks, spanning the whole implemented surface: **-27347.207** (AFM), **-25474.531** (logitdec + recency), **-24695.586** (PPE) and **-25969.925** (base4), each reproduced within 0.5 nats and each on the better side, from a certified optimum, because the reference's `LiblineaR` stops at `epsilon = 1e-4`. `fit_lkt_pars` fits the decay rates themselves by profile likelihood, counting them in `n_params` and certifying stationarity by measurement; it walks the reference's own published RPFA search to the same optimum. Written clean-room: the reference is GPL-3, so this module is validated against it rather than adapted from it |
 | LKT, a search over terms | planned | the reference's `buildLKTModel` is greedy forward/backward selection over features x components on BIC. That is a *consumer* of the family, the shape `leapfit.lfa` already has, not more of `leapfit.lkt` |
-| BKT | planned | to be validated against the standard `standard-bkt` C++ tool |
+| **BKT** | shipped | a two-state HMM per KC, fitted by Baum-Welch with every (KC, restart) chain run through one vectorized forward-backward pass and batches spread over `n_jobs` processes. Validated by transplantation against **two** references — pyBKT (predictions reproduced to 3e-16 on the shipped example) and Yudelson's `hmm-scalable`, the tool behind LearnSphere's `AnalysisBkt` (to 9e-11) — so agreement is with BKT rather than with one implementation of it. Holds every KC to `G + S < 1` and names the KCs the data would rather fit label-swapped; refuses multi-KC steps unless asked for LearnSphere's replicate-and-average convention |
 
 ## Development
 
