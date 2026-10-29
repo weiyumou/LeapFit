@@ -3,7 +3,7 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 while the major version is 0, a minor bump may change the public API.
 
-## Unreleased
+## 0.9.0 — 2026-10-29
 
 ### Added
 
@@ -57,6 +57,28 @@ while the major version is 0, a minor bump may change the public API.
   recursion carries over, the fitter does not (that one is gradient descent on
   the prequential NLL, deliberately). See `docs/DESIGN.md`.
 
+- **Dependent KC columns, dropped on request.** Identification refuses a
+  design it cannot make full rank exactly, and a Q-matrix can carry a
+  dependency among its KCs that no reference level breaks: a KC that tags
+  exactly the steps two others tag between them has their intercept columns
+  added up for its own. Clusters of solution steps do this all the time. The
+  refusal stays the default, but `Design.identify(dependent="drop")`, and
+  `dependent="drop"` on `build_afm_design` and `build_pfa_design`, or
+  `--drop-dependent` on `leapfit-afm` and `leapfit-pfa`, now drop what the
+  exact passes leave, numerically: the columns are visited in the order they
+  are to be kept, blocks in design order with the students last and within a
+  block the narrowest first, and one in the span of those before it goes, so
+  the broad KC gives up its estimate and the narrow ones keep theirs. The
+  fitted values do not move. It is decided on the same scaled Gram matrix
+  and threshold the rank check reads, exactly as many columns must go as the
+  rank is short, and the result is checked for full rank, so the design is
+  refused as before wherever the two readings disagree; a block that would
+  lose every column is refused as a collinear block is. The reason reads
+  `linear combination of columns kept before it (numerical)`.
+- `StepData.take(rows)`: the observations at some rows, as data of their
+  own, for a search that may see a fold's training rows only. The counts
+  stay as they were counted over all the data, as `Design.take` keeps them.
+
 ### Honest statistics, BKT edition
 
 - **No optimality certificate, and none implied.** BKT's likelihood is not
@@ -84,28 +106,6 @@ while the major version is 0, a minor bump may change the public API.
   arrives; at a relative 1e-8 the shipped example stopped 0.046 nats short on
   one KC while reporting convergence. Defaults are `tol=1e-10` with a
   2000-iteration cap, and `final_improvement` makes the claim auditable.
-
-- **Dependent KC columns, dropped on request.** Identification refuses a
-  design it cannot make full rank exactly, and a Q-matrix can carry a
-  dependency among its KCs that no reference level breaks: a KC that tags
-  exactly the steps two others tag between them has their intercept columns
-  added up for its own. Clusters of solution steps do this all the time. The
-  refusal stays the default, but `Design.identify(dependent="drop")`, and
-  `dependent="drop"` on `build_afm_design` and `build_pfa_design`, or
-  `--drop-dependent` on `leapfit-afm` and `leapfit-pfa`, now drop what the
-  exact passes leave, numerically: the columns are visited in the order they
-  are to be kept, blocks in design order with the students last and within a
-  block the narrowest first, and one in the span of those before it goes, so
-  the broad KC gives up its estimate and the narrow ones keep theirs. The
-  fitted values do not move. It is decided on the same scaled Gram matrix
-  and threshold the rank check reads, exactly as many columns must go as the
-  rank is short, and the result is checked for full rank, so the design is
-  refused as before wherever the two readings disagree; a block that would
-  lose every column is refused as a collinear block is. The reason reads
-  `linear combination of columns kept before it (numerical)`.
-- `StepData.take(rows)`: the observations at some rows, as data of their
-  own, for a search that may see a fold's training rows only. The counts
-  stay as they were counted over all the data, as `Design.take` keeps them.
 
 ## 0.8.0 — 2026-10-03
 

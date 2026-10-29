@@ -29,16 +29,16 @@ regression.
 
 ```bash
 # Not on PyPI — install from a release tag:
-uv pip install "git+https://github.com/weiyumou/LeapFit@v0.8.0"
+uv pip install "git+https://github.com/weiyumou/LeapFit@v0.9.0"
 
 # ...or for development:
 git clone https://github.com/weiyumou/LeapFit && cd LeapFit
 uv sync --extra dev    # or: uv pip install -e ".[dev]"
-uv run pytest          # 352 pass, 44 skip in ~16s; extras need R / reference-run artifacts
+uv run pytest          # 414 pass, 44 skip in ~45s; extras need R / reference-run artifacts
 ```
 
 Another project can depend on leapfit with the same direct reference —
-`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.8.0"` in its
+`"leapfit @ git+https://github.com/weiyumou/LeapFit@v0.9.0"` in its
 `dependencies` or in an extra. Two consequences worth knowing before you do:
 PyPI refuses distributions whose metadata carries a direct URL, so a package
 that is itself published to PyPI cannot declare leapfit this way even in an
@@ -471,7 +471,7 @@ tree. The equivalence tests require LearnSphere run artifacts and skip without
 them, so a bare clone is always green:
 
 ```bash
-uv run pytest                                       # 352 pass, 44 skip, ~16s
+uv run pytest                                       # 414 pass, 44 skip, ~45s
 AFM_WF3990_DIR=/path/to/artifacts uv run pytest     # + 8 AFM equivalence tests
 LFA_BUNDLE_DIR=/path/to/lfa-reference-run uv run pytest   # + 18 LFA equivalence tests
 LKT_VIGNETTE_DIR=/path/to/converted uv run pytest   # + 15 LKT equivalence tests
